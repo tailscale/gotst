@@ -39,7 +39,16 @@ func main() {
 		}
 		go http.Serve(ln, s)
 	}
-	if err := s.Run(); err != nil {
+	var testPattern string
+	switch flag.NArg() {
+	case 0:
+		testPattern = "./..."
+	case 1:
+		testPattern = flag.Arg(0)
+	default:
+		log.Fatalf("usage: gotst [pattern]")
+	}
+	if err := s.Run(testPattern); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -50,19 +59,31 @@ func NewServer() *Server {
 	}
 }
 
-func (s *Server) Run() error {
-	cmd := exec.Command(goCmd(), "list", "-json", "./...")
+func (s *Server) addPackage(glp *goListPackage) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pkgs == nil {
+		s.pkgs = make(map[string]*packageStatus)
+	}
+	st := &packageStatus{
+		glp: glp,
+	}
+	s.pkgs[glp.ImportPath] = st
+}
+
+func (s *Server) Run(testPattern string) error {
+	cmd := exec.Command(goCmd(), "list", "-json", testPattern)
 	err := processCmdOutput(cmd, func(r io.Reader) error {
 		jd := json.NewDecoder(r)
 		for {
-			var pkg goListPackage
-			if err := jd.Decode(&pkg); err != nil {
+			pkg := new(goListPackage)
+			if err := jd.Decode(pkg); err != nil {
 				if errors.Is(err, io.EOF) {
 					return nil
 				}
 				return fmt.Errorf("decoding package: %w", err)
 			}
-			fmt.Printf("%8d %s\n", len(pkg.TestGoFiles), pkg.ImportPath)
+			s.addPackage(pkg)
 		}
 	})
 	if err != nil {
@@ -74,7 +95,41 @@ func (s *Server) Run() error {
 
 type Server struct {
 	start time.Time
+
+	mu   sync.Mutex
+	pkgs map[string]*packageStatus // import path -> status
 }
+
+type packageStatus struct {
+	glp *goListPackage
+
+	// following fields guarded by [Server.mu]
+	pkgState pkgState
+
+	tests map[string]*testStatus
+}
+
+type testStatus struct {
+	running  bool
+	done     bool // if true, then test either passed or reach max failures
+	passed   bool
+	passedIn time.Duration // valid if passed is true
+	fails    []failInfo
+}
+
+type failInfo struct {
+	dur time.Duration
+	out string // failure output
+}
+
+type pkgState int
+
+const (
+	pkgStateDiscovered pkgState = iota
+	pkgStateBuilt
+	pkgStateTesting // tests actively running
+	pkgStateDone    // tests done; might've failed
+)
 
 type goListPackage struct {
 	Dir         string

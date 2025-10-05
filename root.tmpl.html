@@ -10,16 +10,16 @@
     <p>Started at {{ .StartedAt }} ({{ .StartedAgo }})</p>
 
     <h2>Packages</h2>
-    <table>
-        <tr>
+    <table border="1" cellpadding="5" cellspacing="0">
+        <tr style="text-align: left;">
             <th>Package</th>
             <th>Tests</th>
             <th>Status</th>
         </tr>
         {{ range .Packages }}
         <tr>
-            <td>{{ .Path }}</a></td>
-            <td>{{ .Tests }}</td>
+            <td>{{ .ImportPath }}</a></td>
+            <td>{{ .HasTests }}</td>
             <td>{{ .Status }}</td>
         </tr>
         {{ end }}

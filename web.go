@@ -6,7 +6,9 @@ package main
 import (
 	"html/template"
 	"log"
+	"maps"
 	"net/http"
+	"slices"
 	"time"
 
 	_ "embed"
@@ -25,24 +27,40 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// statusData is the data argument type for [rootTmpl].
 type statusData struct {
 	StartedAt  string
 	StartedAgo string
 
-	Packages []packageStatus
+	Packages []packageData
 }
 
-type packageStatus struct {
-	Path   string // import path
-	Tests  int    // number of tests
-	Status string // TODO
+// packageData is the html/template frozen version of a [packageStatus].
+type packageData struct {
+	ImportPath     string // import path
+	HasTests       bool
+	NumTestsKnnown bool   // whether test binary has been listed and tests enumerated
+	NumTests       int    // number of tests
+	Status         string // TODO
 }
 
 func (s *Server) statusData() *statusData {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	now := time.Now()
 	d := &statusData{
-		StartedAt:  now.Format(time.RFC3339),
-		StartedAgo: time.Since(now).Round(time.Second).String(),
+		StartedAt:  s.start.Format(time.RFC3339),
+		StartedAgo: now.Sub(s.start).Round(time.Second).String(),
 	}
+
+	for _, importPath := range slices.Sorted(maps.Keys(s.pkgs)) {
+		ps := s.pkgs[importPath]
+		d.Packages = append(d.Packages, packageData{
+			ImportPath: importPath,
+			HasTests:   len(ps.glp.TestGoFiles) > 0,
+		})
+	}
+
 	return d
 }
