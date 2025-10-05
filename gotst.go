@@ -18,13 +18,19 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
 var (
 	flagListen = flag.String("listen", "127.0.0.1:5525", "if non-empty, run HTTP server on this address and serve status")
+
+	extraSleep = flag.Duration("extra-sleep", 0, "[dev] if non-zero, sleep this long before exiting after all tests complete, to give time to explore the web UI")
 )
 
 func main() {
@@ -32,6 +38,7 @@ func main() {
 	log.SetPrefix("gotst: ")
 
 	s := NewServer()
+	defer s.Cleanup()
 	if *flagListen != "" {
 		ln, err := net.Listen("tcp", *flagListen)
 		if err != nil {
@@ -54,9 +61,89 @@ func main() {
 }
 
 func NewServer() *Server {
-	return &Server{
-		start: time.Now(),
+	ucd, err := os.UserCacheDir()
+	if err != nil {
+		log.Fatalf("getting user cache dir: %v", err)
 	}
+	gotstDir := filepath.Join(ucd, "gotst")
+	if err := os.MkdirAll(gotstDir, 0700); err != nil {
+		log.Fatalf("creating cache dir %q: %v", gotstDir, err)
+	}
+	cleanOldCaches(gotstDir)
+
+	start := time.Now()
+	pid := os.Getpid()
+
+	cacheDir := filepath.Join(gotstDir, fmt.Sprintf("pid%d-t%d", pid, start.UnixNano()))
+	if err := os.Mkdir(cacheDir, 0700); err != nil {
+		log.Fatalf("creating per-run cache dir %q: %v", cacheDir, err)
+	}
+	return &Server{
+		start:    start,
+		cacheDir: cacheDir,
+	}
+}
+
+func (s *Server) Cleanup() {
+	if s.cacheDir != "" {
+		t0 := time.Now()
+		if err := os.RemoveAll(s.cacheDir); err != nil {
+			log.Printf("removing cache dir %q: %v", s.cacheDir, err)
+		}
+		d := time.Since(t0)
+		if d > 2*time.Second {
+			log.Printf("removed cache dir %q in %v", s.cacheDir, d)
+		}
+	}
+}
+
+func cleanOldCaches(d string) {
+	ents, err := os.ReadDir(d)
+	if err != nil {
+		log.Fatalf("error reinad cache dir %q to clean it: %v", d, err)
+		return
+	}
+	dirRx := regexp.MustCompile(`^pid(\d+)-t(\d+)$`)
+	for _, ent := range ents {
+		name := ent.Name()
+		if !ent.IsDir() {
+			continue
+		}
+		m := dirRx.FindStringSubmatch(name)
+		if m == nil {
+			continue
+		}
+		pid, err := strconv.Atoi(m[1])
+		if err != nil {
+			continue
+		}
+		timestamp, err := strconv.ParseInt(m[2], 10, 64)
+		if err != nil {
+			continue
+		}
+		if pidStillrunning(pid) {
+			continue
+		}
+		age := time.Since(time.Unix(0, timestamp)).Round(time.Second)
+		if age > 3*time.Minute {
+			log.Printf("removing old cache dir %q (pid %d, age %v)", name, pid, age)
+			os.RemoveAll(filepath.Join(d, name))
+		}
+	}
+}
+
+func pidStillrunning(pid int) bool {
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	if runtime.GOOS == "windows" {
+		// If we can FindProcess it on Windows, it's running.
+		return true
+	}
+	// On Unix, we can send signal 0 to test if it's running.
+	err = proc.Signal(os.Signal(syscall.Signal(0)))
+	return err == nil
 }
 
 func (s *Server) addPackage(glp *goListPackage) {
@@ -72,8 +159,20 @@ func (s *Server) addPackage(glp *goListPackage) {
 }
 
 func (s *Server) Run(testPattern string) error {
+	if err := s.learnPackagesWithTests(testPattern); err != nil {
+		return fmt.Errorf("learnPackagesWithTests: %w", err)
+	}
+
+	if *extraSleep > 0 {
+		log.Printf("sleeping extra %v before exiting", *extraSleep)
+		time.Sleep(*extraSleep)
+	}
+	return nil
+}
+
+func (s *Server) learnPackagesWithTests(testPattern string) error {
 	cmd := exec.Command(goCmd(), "list", "-json", testPattern)
-	err := processCmdOutput(cmd, func(r io.Reader) error {
+	return processCmdOutput(cmd, func(r io.Reader) error {
 		jd := json.NewDecoder(r)
 		for {
 			pkg := new(goListPackage)
@@ -86,15 +185,11 @@ func (s *Server) Run(testPattern string) error {
 			s.addPackage(pkg)
 		}
 	})
-	if err != nil {
-		log.Fatalf("error listing packages: %v", err)
-	}
-	time.Sleep(30 * time.Second)
-	return nil
 }
 
 type Server struct {
-	start time.Time
+	start    time.Time
+	cacheDir string
 
 	mu   sync.Mutex
 	pkgs map[string]*packageStatus // import path -> status
