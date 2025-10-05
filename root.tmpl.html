@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>gotst</title>
+</head>
+<body>
+    <h1>gotst</h1>
+    <p>Started at {{ .StartedAt }} ({{ .StartedAgo }})</p>
+
+    <h2>Packages</h2>
+    <table>
+        <tr>
+            <th>Package</th>
+            <th>Tests</th>
+            <th>Status</th>
+        </tr>
+        {{ range .Packages }}
+        <tr>
+            <td>{{ .Path }}</a></td>
+            <td>{{ .Tests }}</td>
+            <td>{{ .Status }}</td>
+        </tr>
+        {{ end }}
+    </table>
+</body>
+</html>
