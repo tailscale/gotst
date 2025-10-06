@@ -38,13 +38,13 @@ type statusData struct {
 
 // packageData is the html/template frozen version of a [packageStatus].
 type packageData struct {
-	ImportPath     string // import path
-	HasTests       bool
-	NumTestsKnnown bool   // whether test binary has been listed and tests enumerated
-	NumTests       int    // number of tests
-	Status         string // TODO
-	Passed         bool   // whether all tests passed
-	Failed         bool   // whether any tests failed
+	ImportPath    string // import path
+	HasTests      bool
+	NumTestsKnown bool   // whether test binary has been listed and tests enumerated
+	NumTests      int    // number of tests
+	Status        string // TODO
+	Passed        bool   // whether all tests passed
+	Failed        bool   // whether any tests failed
 }
 
 func (s *Server) statusData() *statusData {
@@ -66,6 +66,9 @@ func (s *Server) statusData() *statusData {
 		switch ps.pkgState {
 		case pkgStateBuilt:
 			pd.Status = "built, " + ps.exeHash[:min(len(ps.exeHash), 8)]
+			if ps.tests != nil {
+				pd.Status += fmt.Sprintf(", %d tests", len(ps.tests))
+			}
 		case pkgStateTesting:
 			pd.Status = "testing"
 		case pkgStateDone:
@@ -76,6 +79,10 @@ func (s *Server) statusData() *statusData {
 				pd.Status = fmt.Sprintf("PASSED %d tests", len(ps.tests))
 				pd.Passed = true
 			}
+		}
+		if ps.tests != nil {
+			pd.NumTestsKnown = true
+			pd.NumTests = len(ps.tests)
 		}
 		d.Packages = append(d.Packages, pd)
 	}

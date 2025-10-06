@@ -8,6 +8,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -20,6 +21,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"time"
 )
@@ -29,7 +32,8 @@ var (
 
 	extraSleep = flag.Duration("extra-sleep", 0, "[dev] if non-zero, sleep this long before exiting after all tests complete, to give time to explore the web UI")
 
-	tags = flag.String("tags", "", "comma-separated list of build tags to pass to 'go test' when building and running tests")
+	tags    = flag.String("tags", "", "comma-separated list of build tags to pass to 'go test' when building and running tests")
+	verbose = flag.Bool("vlog", false, "verbose gotst debug logging")
 )
 
 func main() {
@@ -70,11 +74,17 @@ func main() {
 }
 
 type Server struct {
-	start    time.Time
-	cacheDir string
+	start          time.Time
+	cacheDir       string
+	listTestCtx    context.Context
+	listTestCancel context.CancelFunc
+	testsListed    chan struct{} // sent whenever a -test.list completes
 
-	mu   sync.Mutex
-	pkgs map[string]*packageStatus // test package import path -> status
+	execSem chan bool // buffered chan semaphore to limit subprocesses
+
+	mu            sync.Mutex
+	pkgs          map[string]*packageStatus // test package import path -> status
+	pkgsWithTests int
 }
 
 type packageStatus struct {
@@ -118,9 +128,13 @@ type goListPackage struct {
 }
 
 func NewServer() *Server {
+	listTestCtx, listTestCancel := context.WithCancel(context.Background())
 	return &Server{
-		start:    time.Now(),
-		cacheDir: mustNewCacheDir(),
+		start:          time.Now(),
+		cacheDir:       mustNewCacheDir(),
+		execSem:        make(chan bool, 2*runtime.NumCPU()),
+		listTestCtx:    listTestCtx,
+		listTestCancel: listTestCancel,
 	}
 }
 
@@ -128,12 +142,25 @@ func (s *Server) Run(testPattern string) error {
 	if err := s.learnPackagesWithTests(testPattern); err != nil {
 		return fmt.Errorf("learnPackagesWithTests: %w", err)
 	}
+
+	s.mu.Lock()
+	s.testsListed = make(chan struct{}, s.pkgsWithTests)
+	s.mu.Unlock()
+
 	if err := s.buildAllTestBinaries(); err != nil {
 		return fmt.Errorf("buildAllTestBinaries: %w", err)
 	}
 
+	// Wait to learn the names of all the tests in all the binaries.
+	// TODO(bradfitz): we don't strictly need to wait for this, but it's convenient
+	// for now (2025-10-05) during development. Later we should start running
+	// tests earlier.
+	if err := s.awaitTestList(); err != nil {
+		return fmt.Errorf("awaitTestList: %w", err)
+	}
+
 	if *extraSleep > 0 {
-		log.Printf("sleeping extra %v before exiting", *extraSleep)
+		log.Printf("sleeping extra %v before exiting; cacheDir is %v", *extraSleep, s.cacheDir)
 		time.Sleep(*extraSleep)
 	}
 	return nil
@@ -162,6 +189,9 @@ func (s *Server) addPackage(glp *goListPackage) {
 		glp: glp,
 	}
 	s.pkgs[glp.ImportPath] = st
+	if len(glp.TestGoFiles) > 0 {
+		s.pkgsWithTests++
+	}
 }
 
 func (s *Server) learnPackagesWithTests(testPattern string) error {
@@ -350,6 +380,11 @@ func (s *Server) buildAllTestBinaries() error {
 				case "fail":
 					if ev.FailedBuild != "" {
 						errs = append(errs, fmt.Errorf("failed to compile tests for %q; failure building %q:\n\n%s\n", ev.Package, ev.FailedBuild, buildOut.Get(ev.FailedBuild)))
+
+						// Stop processing further test-names-in-binaries
+						// discovery, as we won't need to run any tests if
+						// builds are failing.
+						s.listTestCancel()
 					}
 				case "output":
 					testOut.Add(ev.Package, ev.Output)
@@ -413,17 +448,103 @@ func (s *Server) addTestBinary(pkg string, es ExecSnarf) {
 	ps.pkgState = pkgStateBuilt
 	ps.exeHash = es.ExeHash
 
-	fi, err := os.Stat(filepath.Join(s.cacheDir, es.ExeHash))
+	absBin := filepath.Join(s.cacheDir, es.ExeHash)
+	fi, err := os.Stat(absBin)
 	if err != nil {
 		log.Fatalf("statting test binary for package %q: %v", pkg, err)
 	}
 	size := fi.Size()
 	mB := float64(size) / (1 << 20)
 
-	log.Printf("test binary for package %q is %0.1f MB, hash %s", pkg, mB, es.ExeHash)
+	if *verbose {
+		log.Printf("test binary for package %q is %0.1f MB, hash %s", pkg, mB, es.ExeHash)
+	}
 
 	if es.WorkingDir != ps.glp.Dir {
 		log.Fatalf("unexpected pkg %q wd=%q vs golist=%q", pkg, es.WorkingDir, ps.glp.Dir)
+	}
+	go s.listTestsInBnary(pkg, absBin)
+}
+
+func (s *Server) awaitExecSem(ctx context.Context) bool {
+	t0 := time.Now()
+	select {
+	case s.execSem <- true:
+		d := time.Since(t0).Round(time.Millisecond)
+		if *verbose {
+			log.Printf("acquired exec semaphore after %v", d)
+		}
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (s *Server) releaseExecSem() { <-s.execSem }
+
+func (s *Server) listTestsInBnary(pkg, absBin string) {
+	if !s.awaitExecSem(s.listTestCtx) {
+		return
+	}
+	defer s.releaseExecSem()
+
+	t0 := time.Now()
+	out, err := exec.Command(absBin, "-test.list=.").CombinedOutput()
+	if err != nil {
+		log.Fatalf("error listing tests in %q: %v\noutput:\n%s", pkg, err, out)
+	}
+	d := time.Since(t0).Round(time.Millisecond)
+	if *verbose {
+		log.Printf("Listed tests in package %q in %v (%s)", pkg, d, absBin)
+	}
+	tests := strings.Fields(string(out))
+	s.setPackageTests(pkg, tests)
+}
+
+func (s *Server) setPackageTests(pkg string, tests []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ps, ok := s.pkgs[pkg]
+	if !ok {
+		log.Fatalf("internal error: setPackageTests: unknown package %q", pkg)
+	}
+	ps.tests = make(map[string]*testStatus)
+	for _, test := range tests {
+		ps.tests[test] = &testStatus{}
+	}
+	select {
+	case s.testsListed <- struct{}{}:
+	default:
+		panic("unexpected testsListed channel full")
+	}
+}
+
+func (s *Server) awaitTestList() error {
+	t0 := time.Now()
+
+	s.mu.Lock()
+	ch := s.testsListed
+	n := s.pkgsWithTests
+	s.mu.Unlock()
+
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	remain := n
+
+	for {
+		select {
+		case <-ch:
+			remain--
+			if remain == 0 {
+				d := time.Since(t0).Round(time.Millisecond)
+				log.Printf("Listed tests in %d packages in %v", n, d)
+				return nil
+			}
+		case <-ticker.C:
+			log.Printf("Waiting for test listing; did %d/%d ...", n-remain, n)
+		}
 	}
 }
 
