@@ -8,6 +8,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -18,6 +19,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sync"
 	"time"
 )
@@ -31,10 +33,20 @@ var (
 )
 
 func main() {
+	if dir := os.Getenv("GOTST_EXEC_DEST"); dir != "" {
+		// We're running as a test binary under "go test -exec".
+		// Just capture our output to the given directory and exit.
+		storeTestExecBinary(dir)
+		return
+	}
 	flag.Parse()
 	log.SetPrefix("gotst: ")
+	log.SetFlags(log.Flags() | log.Lmsgprefix)
 
 	s := NewServer()
+	if *extraSleep > 0 {
+		log.Printf("# cacheDir is %v", s.cacheDir)
+	}
 	defer s.Cleanup()
 	if *flagListen != "" {
 		ln, err := net.Listen("tcp", *flagListen)
@@ -61,9 +73,8 @@ type Server struct {
 	start    time.Time
 	cacheDir string
 
-	mu       sync.Mutex
-	pkgs     map[string]*packageStatus // test package import path -> status
-	buildOut map[string]*bytes.Buffer  // [BuildEvent.ImportPath] (not TestEvent.Package!) -> build output
+	mu   sync.Mutex
+	pkgs map[string]*packageStatus // test package import path -> status
 }
 
 type packageStatus struct {
@@ -71,9 +82,9 @@ type packageStatus struct {
 
 	// following fields guarded by [Server.mu]
 	pkgState pkgState
-	buildBuf bytes.Buffer // output from building the test binary, not running it
-
-	tests map[string]*testStatus
+	exeHash  string // once known, the sha256 hex of test binary in Server.cacheDir
+	tests    map[string]*testStatus
+	numFails int // number of tests in tests that failed
 }
 
 type testStatus struct {
@@ -305,20 +316,21 @@ func (s *Server) buildAllTestBinaries() error {
 	if err != nil {
 		return fmt.Errorf("getting self executable path: %w", err)
 	}
-	_ = selfExe
 	pkgs := s.packagesWithTests()
 	args := []string{
 		"test",
 		"--tags=" + *tags,
 		"--json",
-		"--exec=true", // + selfExe,
+		"--exec=" + selfExe,
 	}
 	args = append(args, pkgs...)
 	cmd := exec.Command(goCmd(), args...)
+	cmd.Env = append(os.Environ(), "GOTST_EXEC_DEST="+s.cacheDir)
 	return processCmdOutput(cmd, func(r io.Reader) error {
 
 		var errs []error
-
+		var testOut outputMap
+		var buildOut outputMap
 		bs := bufio.NewScanner(r)
 		for bs.Scan() {
 			ev, err := parseTestOrBuildEvent(bs.Bytes())
@@ -328,13 +340,29 @@ func (s *Server) buildAllTestBinaries() error {
 			switch ev := ev.(type) {
 			case *BuildEvent:
 				if ev.Action == "build-output" {
-					s.addBuildOutput(ev.ImportPath, ev.Output)
+					buildOut.Add(ev.ImportPath, ev.Output)
 				}
 			case *TestEvent:
-				if ev.Action == "fail" {
+				switch ev.Action {
+				case "fail":
 					if ev.FailedBuild != "" {
-						errs = append(errs, fmt.Errorf("failed to compile tests for %q; failure building %q:\n\n%s\n", ev.Package, ev.FailedBuild, s.buildOutput(ev.FailedBuild)))
+						errs = append(errs, fmt.Errorf("failed to compile tests for %q; failure building %q:\n\n%s\n", ev.Package, ev.FailedBuild, buildOut.Get(ev.FailedBuild)))
 					}
+				case "output":
+					testOut.Add(ev.Package, ev.Output)
+				case "pass":
+					ej, ok := bytes.CutPrefix(testOut.Get(ev.Package), []byte("ExecSnarf:"))
+					if !ok {
+						errs = append(errs, fmt.Errorf("test package %q built but test wrapper did not emit ExecSnarf line", ev.Package))
+						continue
+					}
+					ej, _, _ = bytes.Cut(ej, []byte{'\n'})
+					var es ExecSnarf
+					if err := json.Unmarshal(ej, &es); err != nil {
+						errs = append(errs, fmt.Errorf("unmarshal ExecSnarf JSON from package %q: %w", ev.Package, err))
+						continue
+					}
+					s.addTestBinary(ev.Package, es)
 				}
 			}
 		}
@@ -349,26 +377,126 @@ func (s *Server) buildAllTestBinaries() error {
 	})
 }
 
-func (s *Server) addBuildOutput(buildPkg, out string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	buf, ok := s.buildOut[buildPkg]
+type outputMap map[string]*bytes.Buffer
+
+func (m *outputMap) Add(pkg, out string) {
+	if *m == nil {
+		*m = make(map[string]*bytes.Buffer)
+	}
+	buf, ok := (*m)[pkg]
 	if !ok {
 		buf = new(bytes.Buffer)
-		if s.buildOut == nil {
-			s.buildOut = make(map[string]*bytes.Buffer)
-		}
-		s.buildOut[buildPkg] = buf
+		(*m)[pkg] = buf
 	}
 	buf.WriteString(out)
 }
 
-func (s *Server) buildOutput(pkg string) string {
+func (m *outputMap) Get(pkg string) []byte {
+	buf, ok := (*m)[pkg]
+	if !ok {
+		return nil
+	}
+	return buf.Bytes()
+}
+
+func (s *Server) addTestBinary(pkg string, es ExecSnarf) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	buf, ok := s.buildOut[pkg]
+	ps, ok := s.pkgs[pkg]
 	if !ok {
-		return ""
+		log.Printf("internal error: addTestBinary: unknown package %q", pkg)
+		return
 	}
-	return buf.String()
+	ps.pkgState = pkgStateBuilt
+	ps.exeHash = es.ExeHash
+
+	fi, err := os.Stat(filepath.Join(s.cacheDir, es.ExeHash))
+	if err != nil {
+		log.Fatalf("statting test binary for package %q: %v", pkg, err)
+	}
+	size := fi.Size()
+	mB := float64(size) / (1 << 20)
+
+	log.Printf("test binary for package %q is %0.1f MB, hash %s", pkg, mB, es.ExeHash)
+
+	if es.WorkingDir != ps.glp.Dir {
+		log.Fatalf("unexpected pkg %q wd=%q vs golist=%q", pkg, es.WorkingDir, ps.glp.Dir)
+	}
+}
+
+// ExecSnarf is metadata about a test binary as seen when we're running
+// as a wrapper in "go test -exec" mode.
+type ExecSnarf struct {
+	WorkingDir string
+	ExeHash    string   // hex sha256 of os.Args[1] executable
+	Args       []string // go.test args after the binary name
+}
+
+// storeTestExecBinary runs when our binary is in child process mode, under "go
+// test -exec", and copies (or hardlinks) the test binary it's wrapping into a
+// content-addressable directory, as given by dir (the gotst parent's
+// [Server.cacheDir]). It then prints a line to stdout beginning with
+// "ExecSnarf:" followed by a JSON blob of [ExecSnarf] metadata about the
+// captured binary, which the parent process can parse out of the test output.
+func storeTestExecBinary(dir string) {
+	fi, err := os.Stat(dir)
+	if err != nil {
+		log.Fatalf("invalid capture directory: %v", err)
+	}
+	if !fi.IsDir() {
+		log.Fatalf("capture path %q is not a directory", dir)
+	}
+	if len(os.Args) < 2 {
+		log.Fatal("missing argument(s); need path to test binary and its args")
+	}
+	pwd, err := os.Getwd()
+	if err != nil {
+		log.Fatalf("getting working directory: %v", err)
+	}
+	f, err := os.Open(os.Args[1])
+	if err != nil {
+		log.Fatalf("opening test binary: %v", err)
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		log.Fatalf("hashing test binary: %v", err)
+	}
+
+	co := &ExecSnarf{
+		WorkingDir: pwd,
+		ExeHash:    fmt.Sprintf("%x", h.Sum(nil)),
+		Args:       os.Args[2:],
+	}
+	coj, err := json.Marshal(co)
+	if err != nil {
+		log.Fatalf("marshaling capture metadata: %v", err)
+	}
+
+	target := filepath.Join(dir, co.ExeHash)
+	if err := os.Link(os.Args[1], target); err != nil {
+		// Hardlinked failed. Maybe we're on Windows, or maybe we're going
+		// across filesystems. Just copy instead.
+		of, err := os.CreateTemp(dir, co.ExeHash+"*")
+		if err != nil {
+			log.Fatalf("creating temp file in capture dir: %v", err)
+		}
+		if _, err := f.Seek(0, 0); err != nil {
+			log.Fatalf("seeking to beginning of test binary: %v", err)
+		}
+		if _, err := io.Copy(of, f); err != nil {
+			log.Fatalf("copying test binary to capture dir: %v", err)
+		}
+		if err := of.Close(); err != nil {
+			log.Fatalf("closing copied test binary: %v", err)
+		}
+		if err := os.Chmod(of.Name(), 0700); err != nil {
+			log.Fatalf("chmod +x copied test binary: %v", err)
+		}
+		if err := os.Rename(of.Name(), target); err != nil {
+			log.Fatalf("renaming copied test binary to final name: %v", err)
+		}
+	}
+	fmt.Printf("ExecSnarf:%s\n", coj)
 }

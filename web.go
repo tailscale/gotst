@@ -4,6 +4,7 @@
 package main
 
 import (
+	"fmt"
 	"html/template"
 	"log"
 	"maps"
@@ -42,6 +43,8 @@ type packageData struct {
 	NumTestsKnnown bool   // whether test binary has been listed and tests enumerated
 	NumTests       int    // number of tests
 	Status         string // TODO
+	Passed         bool   // whether all tests passed
+	Failed         bool   // whether any tests failed
 }
 
 func (s *Server) statusData() *statusData {
@@ -56,10 +59,25 @@ func (s *Server) statusData() *statusData {
 
 	for _, importPath := range slices.Sorted(maps.Keys(s.pkgs)) {
 		ps := s.pkgs[importPath]
-		d.Packages = append(d.Packages, packageData{
+		pd := packageData{
 			ImportPath: importPath,
 			HasTests:   len(ps.glp.TestGoFiles) > 0,
-		})
+		}
+		switch ps.pkgState {
+		case pkgStateBuilt:
+			pd.Status = "built, " + ps.exeHash[:min(len(ps.exeHash), 8)]
+		case pkgStateTesting:
+			pd.Status = "testing"
+		case pkgStateDone:
+			if ps.numFails > 0 {
+				pd.Status = fmt.Sprintf("FAILED %d/%d tests", ps.numFails, len(ps.tests))
+				pd.Failed = true
+			} else {
+				pd.Status = fmt.Sprintf("PASSED %d tests", len(ps.tests))
+				pd.Passed = true
+			}
+		}
+		d.Packages = append(d.Packages, pd)
 	}
 
 	return d
