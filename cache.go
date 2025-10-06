@@ -67,7 +67,7 @@ func cleanOldCaches(cacheRoot string) {
 			continue
 		}
 		age := time.Since(time.Unix(0, timestamp)).Round(time.Second)
-		log.Printf("removing old cache dir %q (pid %d, age %v)", name, pid, age)
+		log.Printf("removing old cache dir %q (age %v)", name, age)
 		os.RemoveAll(filepath.Join(cacheRoot, name))
 	}
 }
