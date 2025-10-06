@@ -259,6 +259,8 @@ type TestEvent struct {
 
 // BuildEvent is an event representing a build process. Field
 // docs below are copied from $GO/src/cmd/go/alldocs.go.
+//
+// See `go help buildjson`.
 type BuildEvent struct {
 	// The ImportPath field gives the package ID of the package being built.
 	// This matches the Package.ImportPath field of go list -json and the
@@ -319,6 +321,7 @@ func (s *Server) buildAllTestBinaries() error {
 	pkgs := s.packagesWithTests()
 	args := []string{
 		"test",
+		"--trimpath",
 		"--tags=" + *tags,
 		"--json",
 		"--exec=" + selfExe,
