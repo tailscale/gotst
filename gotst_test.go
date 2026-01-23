@@ -9,7 +9,12 @@ import (
 )
 
 func Test(t *testing.T) {
-	// TODO. For now, just
+	// TODO: write actual tests. For now this file
+	// exists just for manual testing.
+}
+
+func TestAttr(t *testing.T) {
+	t.Attr("attr-foo", "value-bar")
 }
 
 // TestReadFile exists for testing -test.testlogfile.
