@@ -68,6 +68,10 @@ immediately. `-vlog` restores per-test success/cache-hit lines and internal
 diagnostics. Use `-progress=DURATION` to change the update interval or
 `-progress=0` to print only the final summary.
 
+Use `-failfast` to stop after the first test failure. gotst stops dispatching
+queued tests, cancels currently running test binaries, and also passes
+`-test.failfast=true` to each binary so subtest scheduling stops promptly.
+
 Its goals are:
 
 * keep the CPU busy

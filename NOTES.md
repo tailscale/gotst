@@ -167,6 +167,12 @@ Scheduler, retries, and distribution:
   flakes, timeouts, or outliers poison estimates.
 - [ ] Define retry limits and the distinction between a failed run, a flaky
   test, and an infrastructure failure.
+- [ ] Add a `gotst -retry` mode that persists the previous run's test outcomes
+  and quickly selects only tests that failed on that run, skipping packages and
+  tests that passed. Define the scope/identity of “previous run” across profiles,
+  build tags, binary changes, working trees, interrupted runs, and multiple
+  concurrent gotst invocations. This is failure-set selection, not a cache hit:
+  it must work for failed and otherwise non-cacheable tests.
 - [ ] Record attempt outcomes and enough context to compute flake rates and
   trends over time, including fail-then-pass retries, without allowing
   output/history to grow without bounds.

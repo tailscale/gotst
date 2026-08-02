@@ -43,6 +43,7 @@ var (
 	useCache      = flag.Bool("cache", true, "reuse successful tests whose recorded inputs are unchanged")
 	cacheRoot     = flag.String("cache-dir", "", "cache root (default: user cache directory/gotst)")
 	progressEvery = flag.Duration("progress", time.Second, "interval between aggregate progress updates (0 disables periodic updates)")
+	failFast      = flag.Bool("failfast", false, "stop queued and running tests after the first failure")
 )
 
 func main() {
@@ -106,19 +107,21 @@ type Server struct {
 	start     time.Time
 	cacheDir  string
 	ctx       context.Context
+	cancel    context.CancelFunc
 	profile   runProfile
 	testCache testResultCache
 
 	execSem chan bool // buffered chan semaphore to limit subprocesses
 	outMu   sync.Mutex
 
-	mu            sync.Mutex
-	pkgs          map[string]*packageStatus // test package import path -> status
-	pkgsWithTests int
-	phase         runPhase
-	testsTotal    int
-	cacheChecks   int
-	cacheHits     int
+	mu                sync.Mutex
+	pkgs              map[string]*packageStatus // test package import path -> status
+	pkgsWithTests     int
+	phase             runPhase
+	testsTotal        int
+	cacheChecks       int
+	cacheHits         int
+	failFastTriggered bool
 }
 
 type packageStatus struct {
@@ -167,6 +170,7 @@ type goListPackage struct {
 }
 
 func NewServer(profile runProfile) *Server {
+	ctx, cancel := context.WithCancel(context.Background())
 	var cache testResultCache
 	if *useCache {
 		var err error
@@ -178,7 +182,8 @@ func NewServer(profile runProfile) *Server {
 	return &Server{
 		start:     time.Now(),
 		cacheDir:  mustNewCacheDir(),
-		ctx:       context.Background(),
+		ctx:       ctx,
+		cancel:    cancel,
 		profile:   profile,
 		testCache: cache,
 		execSem:   make(chan bool, *jobs),
@@ -225,6 +230,7 @@ func (s *Server) Run() (retErr error) {
 }
 
 func (s *Server) Cleanup() {
+	s.cancel()
 	if s.cacheDir != "" {
 		t0 := time.Now()
 		if err := os.RemoveAll(s.cacheDir); err != nil {
@@ -751,26 +757,60 @@ func (s *Server) runAllTests() error {
 	if *verbose {
 		log.Printf("Running %d tests in %d packages with up to %d concurrent processes...", len(tasks), len(bins), *jobs)
 	}
-	errs := make(chan error, len(tasks))
+	type testRunResult struct {
+		err            error
+		primaryFailure bool
+	}
+	results := make(chan testRunResult, len(tasks))
 	work := make(chan testTask)
 	workers := min(*jobs, len(tasks))
+	var workerWG sync.WaitGroup
+	workerWG.Add(workers)
 	for range workers {
 		go func() {
-			for task := range work {
-				errs <- s.runTest(task)
+			defer workerWG.Done()
+			for {
+				select {
+				case <-s.ctx.Done():
+					return
+				case task, ok := <-work:
+					if !ok {
+						return
+					}
+					err := s.runTest(task)
+					primary := false
+					var ee *exec.ExitError
+					if *failFast && errors.As(err, &ee) {
+						primary = s.triggerFailFast()
+					}
+					results <- testRunResult{err: err, primaryFailure: primary}
+				}
 			}
 		}()
 	}
 	go func() {
+		defer close(work)
 		for _, task := range tasks {
-			work <- task
+			select {
+			case work <- task:
+			case <-s.ctx.Done():
+				return
+			}
 		}
-		close(work)
+	}()
+	go func() {
+		workerWG.Wait()
+		close(results)
 	}()
 	failed := 0
 	var infraErrs []error
-	for range tasks {
-		if err := <-errs; err != nil {
+	for result := range results {
+		err := result.err
+		if err != nil {
+			if *failFast && s.failFastWasTriggered() && !result.primaryFailure {
+				// Expected cancellation of sibling work after the first failure.
+				continue
+			}
 			var ee *exec.ExitError
 			if errors.As(err, &ee) {
 				failed++
@@ -788,6 +828,24 @@ func (s *Server) runAllTests() error {
 	return nil
 }
 
+func (s *Server) triggerFailFast() bool {
+	s.mu.Lock()
+	if s.failFastTriggered {
+		s.mu.Unlock()
+		return false
+	}
+	s.failFastTriggered = true
+	s.mu.Unlock()
+	s.cancel()
+	return true
+}
+
+func (s *Server) failFastWasTriggered() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.failFastTriggered
+}
+
 type testTask struct {
 	bin  capturedTestBinary
 	test string
@@ -798,8 +856,14 @@ func isRunnableTopLevelTest(name string) bool {
 }
 
 func (s *Server) runTest(task testTask) error {
+	if err := s.ctx.Err(); err != nil {
+		return err
+	}
 	bin := task.bin
 	baseArgs := profileTestArgs(bin.args, s.profile)
+	if *failFast {
+		baseArgs = setTestArg(baseArgs, "-test.failfast", "true")
+	}
 	key := testCacheKey{
 		BinarySHA256: binHash(bin.absBin),
 		Package:      bin.pkg,
@@ -852,6 +916,15 @@ func (s *Server) runTest(task testTask) error {
 	cmd.Stderr = &out
 	err := cmd.Run()
 	d := time.Since(t0).Round(time.Millisecond)
+	if *failFast && s.ctx.Err() != nil {
+		if s.testCache != nil {
+			os.Remove(logPath)
+		}
+		s.mu.Lock()
+		ps.tests[task.test].running = false
+		s.mu.Unlock()
+		return context.Canceled
+	}
 	if err == nil && s.testCache != nil {
 		deps, depErr := parseTestLog(logPath, bin.workDir)
 		if depErr != nil {
