@@ -22,6 +22,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -29,11 +31,14 @@ import (
 
 var (
 	flagListen = flag.String("listen", "127.0.0.1:5525", "if non-empty, run HTTP server on this address and serve status")
+	configFile = flag.String("config", "", "path to .gotst.yml (default: search parent directories)")
 
 	extraSleep = flag.Duration("extra-sleep", 0, "[dev] if non-zero, sleep this long before exiting after all tests complete, to give time to explore the web UI")
 
-	tags    = flag.String("tags", "", "comma-separated list of build tags to pass to 'go test' when building and running tests")
-	verbose = flag.Bool("vlog", false, "verbose gotst debug logging")
+	tags      = flag.String("tags", "", "comma-separated list of build tags to pass to 'go test' when building and running tests")
+	verbose   = flag.Bool("vlog", false, "verbose gotst debug logging")
+	jobs      = flag.Int("j", min(runtime.NumCPU(), 4), "maximum concurrent build or test processes")
+	maxOutput = flag.Int64("max-output", 4<<20, "maximum bytes of failure output retained per package")
 )
 
 func main() {
@@ -44,10 +49,34 @@ func main() {
 		return
 	}
 	flag.Parse()
+	if *jobs < 1 {
+		log.Fatal("-j must be at least 1")
+	}
+	if *maxOutput < 0 {
+		log.Fatal("-max-output must not be negative")
+	}
 	log.SetPrefix("gotst: ")
 	log.SetFlags(log.Flags() | log.Lmsgprefix)
 
-	s := NewServer()
+	var profileName string
+	switch flag.NArg() {
+	case 0:
+		profileName = "default"
+	case 1:
+		profileName = flag.Arg(0)
+	default:
+		log.Fatalf("usage: gotst [PROFILE]")
+	}
+	profile, err := loadRunProfile(*configFile, profileName)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if *tags != "" {
+		profile.Tags = appendUnique(profile.Tags, splitCommaList(*tags)...)
+	}
+	log.Printf("Using profile %q from %s", profile.Name, profile.Root)
+
+	s := NewServer(profile)
 	if *extraSleep > 0 {
 		log.Printf("# cacheDir is %v", s.cacheDir)
 	}
@@ -59,28 +88,19 @@ func main() {
 		}
 		go http.Serve(ln, s)
 	}
-	var testPattern string
-	switch flag.NArg() {
-	case 0:
-		testPattern = "./..."
-	case 1:
-		testPattern = flag.Arg(0)
-	default:
-		log.Fatalf("usage: gotst [pattern]")
-	}
-	if err := s.Run(testPattern); err != nil {
+	if err := s.Run(); err != nil {
 		log.Fatal(err)
 	}
 }
 
 type Server struct {
-	start          time.Time
-	cacheDir       string
-	listTestCtx    context.Context
-	listTestCancel context.CancelFunc
-	testsListed    chan struct{} // sent whenever a -test.list completes
+	start    time.Time
+	cacheDir string
+	ctx      context.Context
+	profile  runProfile
 
 	execSem chan bool // buffered chan semaphore to limit subprocesses
+	outMu   sync.Mutex
 
 	mu            sync.Mutex
 	pkgs          map[string]*packageStatus // test package import path -> status
@@ -93,8 +113,12 @@ type packageStatus struct {
 	// following fields guarded by [Server.mu]
 	pkgState pkgState
 	exeHash  string // once known, the sha256 hex of test binary in Server.cacheDir
+	workDir  string
+	exeArgs  []string
 	tests    map[string]*testStatus
 	numFails int // number of tests in tests that failed
+	runErr   string
+	runIn    time.Duration
 }
 
 type testStatus struct {
@@ -120,43 +144,39 @@ const (
 )
 
 type goListPackage struct {
-	Dir         string
-	ImportPath  string
-	Name        string
-	TestGoFiles []string
-	Root        string
+	Dir          string
+	ImportPath   string
+	Name         string
+	TestGoFiles  []string
+	XTestGoFiles []string
+	Root         string
 }
 
-func NewServer() *Server {
-	listTestCtx, listTestCancel := context.WithCancel(context.Background())
+func NewServer(profile runProfile) *Server {
 	return &Server{
-		start:          time.Now(),
-		cacheDir:       mustNewCacheDir(),
-		execSem:        make(chan bool, 2*runtime.NumCPU()),
-		listTestCtx:    listTestCtx,
-		listTestCancel: listTestCancel,
+		start:    time.Now(),
+		cacheDir: mustNewCacheDir(),
+		ctx:      context.Background(),
+		profile:  profile,
+		execSem:  make(chan bool, *jobs),
 	}
 }
 
-func (s *Server) Run(testPattern string) error {
-	if err := s.learnPackagesWithTests(testPattern); err != nil {
+func (s *Server) Run() error {
+	if err := s.learnPackagesWithTests(); err != nil {
 		return fmt.Errorf("learnPackagesWithTests: %w", err)
 	}
-
-	s.mu.Lock()
-	s.testsListed = make(chan struct{}, s.pkgsWithTests)
-	s.mu.Unlock()
 
 	if err := s.buildAllTestBinaries(); err != nil {
 		return fmt.Errorf("buildAllTestBinaries: %w", err)
 	}
 
-	// Wait to learn the names of all the tests in all the binaries.
-	// TODO(bradfitz): we don't strictly need to wait for this, but it's convenient
-	// for now (2025-10-05) during development. Later we should start running
-	// tests earlier.
-	if err := s.awaitTestList(); err != nil {
-		return fmt.Errorf("awaitTestList: %w", err)
+	if err := s.listAllTests(); err != nil {
+		return fmt.Errorf("listAllTests: %w", err)
+	}
+
+	if err := s.runAllTests(); err != nil {
+		return err
 	}
 
 	if *extraSleep > 0 {
@@ -189,16 +209,27 @@ func (s *Server) addPackage(glp *goListPackage) {
 		glp: glp,
 	}
 	s.pkgs[glp.ImportPath] = st
-	if len(glp.TestGoFiles) > 0 {
+	if glp.hasTests() {
 		s.pkgsWithTests++
 	}
 }
 
-func (s *Server) learnPackagesWithTests(testPattern string) error {
+func (p *goListPackage) hasTests() bool {
+	return len(p.TestGoFiles) > 0 || len(p.XTestGoFiles) > 0
+}
+
+func (s *Server) learnPackagesWithTests() error {
 	log.Printf("Discovering packages with tests...")
 	t0 := time.Now()
 
-	cmd := exec.Command(goCmd(), "list", "--tags="+*tags, "--json", testPattern)
+	excluded, err := s.resolveExcludedPackages()
+	if err != nil {
+		return err
+	}
+	args := []string{"list", "--tags=" + strings.Join(s.profile.Tags, ","), "--json"}
+	args = append(args, s.profile.Packages...)
+	cmd := exec.Command(goCmd(), args...)
+	cmd.Dir = s.profile.Root
 	return processCmdOutput(cmd, func(r io.Reader) error {
 		jd := json.NewDecoder(r)
 		for {
@@ -210,9 +241,33 @@ func (s *Server) learnPackagesWithTests(testPattern string) error {
 				}
 				return fmt.Errorf("decoding package: %w", err)
 			}
-			s.addPackage(pkg)
+			if !excluded[pkg.ImportPath] {
+				s.addPackage(pkg)
+			}
 		}
 	})
+}
+
+func (s *Server) resolveExcludedPackages() (map[string]bool, error) {
+	ret := make(map[string]bool)
+	if len(s.profile.ExcludePackages) == 0 {
+		return ret, nil
+	}
+	args := []string{"list", "--tags=" + strings.Join(s.profile.Tags, ","), "-f={{.ImportPath}}"}
+	args = append(args, s.profile.ExcludePackages...)
+	cmd := exec.Command(goCmd(), args...)
+	cmd.Dir = s.profile.Root
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("resolving excluded packages: %w: %s", err, stderr.String())
+	}
+	for _, pkg := range strings.Fields(out.String()) {
+		ret[pkg] = true
+	}
+	return ret, nil
 }
 
 func (s *Server) packagesWithTests() []string {
@@ -220,10 +275,11 @@ func (s *Server) packagesWithTests() []string {
 	defer s.mu.Unlock()
 	var ret []string
 	for imp, ps := range s.pkgs {
-		if len(ps.glp.TestGoFiles) > 0 {
+		if ps.glp.hasTests() {
 			ret = append(ret, imp)
 		}
 	}
+	sort.Strings(ret)
 	return ret
 }
 
@@ -349,21 +405,29 @@ func (s *Server) buildAllTestBinaries() error {
 		return fmt.Errorf("getting self executable path: %w", err)
 	}
 	pkgs := s.packagesWithTests()
+	if len(pkgs) == 0 {
+		log.Printf("No packages with tests")
+		return nil
+	}
 	args := []string{
 		"test",
+		"-p=" + fmt.Sprint(*jobs),
 		"--trimpath",
-		"--tags=" + *tags,
+		"--tags=" + strings.Join(s.profile.Tags, ","),
 		"--json",
 		"--exec=" + selfExe,
 	}
 	args = append(args, pkgs...)
 	cmd := exec.Command(goCmd(), args...)
+	cmd.Dir = s.profile.Root
 	cmd.Env = append(os.Environ(), "GOTST_EXEC_DEST="+s.cacheDir)
 	return processCmdOutput(cmd, func(r io.Reader) error {
 
 		var errs []error
-		var testOut outputMap
-		var buildOut outputMap
+		// This contains gotst's own small ExecSnarf record, not user test
+		// output, so it must remain available even when -max-output=0.
+		testOut := outputMap{max: 1 << 20}
+		buildOut := outputMap{max: *maxOutput}
 		bs := bufio.NewScanner(r)
 		for bs.Scan() {
 			ev, err := parseTestOrBuildEvent(bs.Bytes())
@@ -381,15 +445,11 @@ func (s *Server) buildAllTestBinaries() error {
 					if ev.FailedBuild != "" {
 						errs = append(errs, fmt.Errorf("failed to compile tests for %q; failure building %q:\n\n%s\n", ev.Package, ev.FailedBuild, buildOut.Get(ev.FailedBuild)))
 
-						// Stop processing further test-names-in-binaries
-						// discovery, as we won't need to run any tests if
-						// builds are failing.
-						s.listTestCancel()
 					}
 				case "output":
 					testOut.Add(ev.Package, ev.Output)
 				case "pass":
-					ej, ok := bytes.CutPrefix(testOut.Get(ev.Package), []byte("ExecSnarf:"))
+					ej, ok := bytes.CutPrefix([]byte(testOut.Get(ev.Package)), []byte("ExecSnarf:"))
 					if !ok {
 						errs = append(errs, fmt.Errorf("test package %q built but test wrapper did not emit ExecSnarf line", ev.Package))
 						continue
@@ -415,26 +475,29 @@ func (s *Server) buildAllTestBinaries() error {
 	})
 }
 
-type outputMap map[string]*bytes.Buffer
-
-func (m *outputMap) Add(pkg, out string) {
-	if *m == nil {
-		*m = make(map[string]*bytes.Buffer)
-	}
-	buf, ok := (*m)[pkg]
-	if !ok {
-		buf = new(bytes.Buffer)
-		(*m)[pkg] = buf
-	}
-	buf.WriteString(out)
+type outputMap struct {
+	max int64
+	m   map[string]*cappedBuffer
 }
 
-func (m *outputMap) Get(pkg string) []byte {
-	buf, ok := (*m)[pkg]
-	if !ok {
-		return nil
+func (m *outputMap) Add(pkg, out string) {
+	if m.m == nil {
+		m.m = make(map[string]*cappedBuffer)
 	}
-	return buf.Bytes()
+	buf, ok := m.m[pkg]
+	if !ok {
+		buf = &cappedBuffer{max: m.max}
+		m.m[pkg] = buf
+	}
+	_, _ = buf.Write([]byte(out))
+}
+
+func (m *outputMap) Get(pkg string) string {
+	buf, ok := m.m[pkg]
+	if !ok {
+		return ""
+	}
+	return buf.String()
 }
 
 func (s *Server) addTestBinary(pkg string, es ExecSnarf) {
@@ -447,6 +510,8 @@ func (s *Server) addTestBinary(pkg string, es ExecSnarf) {
 	}
 	ps.pkgState = pkgStateBuilt
 	ps.exeHash = es.ExeHash
+	ps.workDir = es.WorkingDir
+	ps.exeArgs = slices.Clone(es.Args)
 
 	absBin := filepath.Join(s.cacheDir, es.ExeHash)
 	fi, err := os.Stat(absBin)
@@ -463,7 +528,6 @@ func (s *Server) addTestBinary(pkg string, es ExecSnarf) {
 	if es.WorkingDir != ps.glp.Dir {
 		log.Fatalf("unexpected pkg %q wd=%q vs golist=%q", pkg, es.WorkingDir, ps.glp.Dir)
 	}
-	go s.listTestsInBnary(pkg, absBin)
 }
 
 func (s *Server) awaitExecSem(ctx context.Context) bool {
@@ -482,16 +546,18 @@ func (s *Server) awaitExecSem(ctx context.Context) bool {
 
 func (s *Server) releaseExecSem() { <-s.execSem }
 
-func (s *Server) listTestsInBnary(pkg, absBin string) {
-	if !s.awaitExecSem(s.listTestCtx) {
-		return
+func (s *Server) listTestsInBinary(pkg, absBin, workDir string) error {
+	if !s.awaitExecSem(s.ctx) {
+		return s.ctx.Err()
 	}
 	defer s.releaseExecSem()
 
 	t0 := time.Now()
-	out, err := exec.Command(absBin, "-test.list=.").CombinedOutput()
+	cmd := exec.CommandContext(s.ctx, absBin, "-test.list=.")
+	cmd.Dir = workDir
+	out, err := cmd.CombinedOutput()
 	if err != nil {
-		log.Fatalf("error listing tests in %q: %v\noutput:\n%s", pkg, err, out)
+		return fmt.Errorf("listing tests in %q: %w\noutput:\n%s", pkg, err, out)
 	}
 	d := time.Since(t0).Round(time.Millisecond)
 	if *verbose {
@@ -499,6 +565,7 @@ func (s *Server) listTestsInBnary(pkg, absBin string) {
 	}
 	tests := strings.Fields(string(out))
 	s.setPackageTests(pkg, tests)
+	return nil
 }
 
 func (s *Server) setPackageTests(pkg string, tests []string) {
@@ -513,39 +580,220 @@ func (s *Server) setPackageTests(pkg string, tests []string) {
 	for _, test := range tests {
 		ps.tests[test] = &testStatus{}
 	}
-	select {
-	case s.testsListed <- struct{}{}:
-	default:
-		panic("unexpected testsListed channel full")
-	}
 }
 
-func (s *Server) awaitTestList() error {
-	t0 := time.Now()
+type capturedTestBinary struct {
+	pkg     string
+	absBin  string
+	workDir string
+	args    []string
+}
 
+func (s *Server) capturedTestBinaries() []capturedTestBinary {
 	s.mu.Lock()
-	ch := s.testsListed
-	n := s.pkgsWithTests
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	ret := make([]capturedTestBinary, 0, s.pkgsWithTests)
+	for pkg, ps := range s.pkgs {
+		if ps.exeHash == "" {
+			continue
+		}
+		ret = append(ret, capturedTestBinary{
+			pkg:     pkg,
+			absBin:  filepath.Join(s.cacheDir, ps.exeHash),
+			workDir: ps.workDir,
+			args:    slices.Clone(ps.exeArgs),
+		})
+	}
+	sort.Slice(ret, func(i, j int) bool { return ret[i].pkg < ret[j].pkg })
+	return ret
+}
 
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-
-	remain := n
-
-	for {
-		select {
-		case <-ch:
-			remain--
-			if remain == 0 {
-				d := time.Since(t0).Round(time.Millisecond)
-				log.Printf("Listed tests in %d packages in %v", n, d)
-				return nil
-			}
-		case <-ticker.C:
-			log.Printf("Waiting for test listing; did %d/%d ...", n-remain, n)
+func (s *Server) listAllTests() error {
+	t0 := time.Now()
+	bins := s.capturedTestBinaries()
+	if len(bins) == 0 {
+		return nil
+	}
+	errs := make(chan error, len(bins))
+	for _, bin := range bins {
+		bin := bin
+		go func() {
+			errs <- s.listTestsInBinary(bin.pkg, bin.absBin, bin.workDir)
+		}()
+	}
+	var all []error
+	for range bins {
+		if err := <-errs; err != nil {
+			all = append(all, err)
 		}
 	}
+	if err := errors.Join(all...); err != nil {
+		return err
+	}
+	log.Printf("Listed tests in %d packages in %v", len(bins), time.Since(t0).Round(time.Millisecond))
+	return nil
+}
+
+type cappedBuffer struct {
+	mu        sync.Mutex
+	buf       bytes.Buffer
+	max       int64
+	truncated bool
+}
+
+func (b *cappedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	n := len(p)
+	remain := b.max - int64(b.buf.Len())
+	if remain > 0 {
+		if int64(len(p)) > remain {
+			p = p[:remain]
+		}
+		_, _ = b.buf.Write(p)
+	}
+	if int64(n) > remain {
+		b.truncated = true
+	}
+	return n, nil
+}
+
+func (b *cappedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s := b.buf.String()
+	if b.truncated {
+		s += fmt.Sprintf("\n[gotst: output truncated after %d bytes]\n", b.max)
+	}
+	return s
+}
+
+func (s *Server) runAllTests() error {
+	bins := s.capturedTestBinaries()
+	if len(bins) == 0 {
+		return nil
+	}
+	log.Printf("Running tests in %d packages with up to %d concurrent processes...", len(bins), *jobs)
+	errs := make(chan error, len(bins))
+	for _, bin := range bins {
+		bin := bin
+		go func() { errs <- s.runTestBinary(bin) }()
+	}
+	failed := 0
+	var infraErrs []error
+	for range bins {
+		if err := <-errs; err != nil {
+			var ee *exec.ExitError
+			if errors.As(err, &ee) {
+				failed++
+			} else {
+				infraErrs = append(infraErrs, err)
+			}
+		}
+	}
+	if err := errors.Join(infraErrs...); err != nil {
+		return fmt.Errorf("running tests: %w", err)
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d test package(s) failed", failed)
+	}
+	return nil
+}
+
+func (s *Server) runTestBinary(bin capturedTestBinary) error {
+	if !s.awaitExecSem(s.ctx) {
+		return s.ctx.Err()
+	}
+	defer s.releaseExecSem()
+
+	s.mu.Lock()
+	ps := s.pkgs[bin.pkg]
+	ps.pkgState = pkgStateTesting
+	s.mu.Unlock()
+
+	t0 := time.Now()
+	var out cappedBuffer
+	out.max = *maxOutput
+	cmd := exec.CommandContext(s.ctx, bin.absBin, profileTestArgs(bin.args, s.profile)...)
+	cmd.Dir = bin.workDir
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	err := cmd.Run()
+	d := time.Since(t0).Round(time.Millisecond)
+
+	s.mu.Lock()
+	ps.pkgState = pkgStateDone
+	ps.runIn = d
+	if err != nil {
+		ps.numFails = 1
+		ps.runErr = err.Error()
+	}
+	s.mu.Unlock()
+
+	s.outMu.Lock()
+	defer s.outMu.Unlock()
+	if err != nil {
+		fmt.Fprintf(os.Stdout, "%s", out.String())
+		fmt.Fprintf(os.Stdout, "FAIL\t%s\t%s\n", bin.pkg, d)
+	} else {
+		fmt.Fprintf(os.Stdout, "ok  \t%s\t%s\n", bin.pkg, d)
+	}
+	return err
+}
+
+// directTestArgs converts arguments emitted by "go test -json" into arguments
+// suitable for running the captured test binary directly. The Go command's
+// private test2json verbosity mode emits framing bytes intended for cmd/test2json,
+// not terminals or gotst's package-level output collector.
+func directTestArgs(args []string) []string {
+	ret := make([]string, 0, len(args))
+	for _, arg := range args {
+		if arg == "-test.v=test2json" {
+			continue
+		}
+		ret = append(ret, arg)
+	}
+	return ret
+}
+
+func profileTestArgs(args []string, profile runProfile) []string {
+	ret := directTestArgs(args)
+	if profile.shortSet {
+		ret = setTestArg(ret, "-test.short", fmt.Sprint(profile.Short))
+	}
+	if profile.Timeout != 0 {
+		ret = setTestArg(ret, "-test.timeout", profile.Timeout.String())
+	}
+	for _, arg := range profile.TestFlags {
+		ret = append(ret, normalizeTestFlag(arg))
+	}
+	return ret
+}
+
+func normalizeTestFlag(arg string) string {
+	switch arg {
+	case "-short", "-testing.short", "-test.short":
+		return "-test.short=true"
+	}
+	if rest, ok := strings.CutPrefix(arg, "-testing."); ok {
+		return "-test." + rest
+	}
+	return arg
+}
+
+func setTestArg(args []string, name, value string) []string {
+	prefix := name + "="
+	ret := make([]string, 0, len(args)+1)
+	for _, arg := range args {
+		if arg != name && !strings.HasPrefix(arg, prefix) {
+			ret = append(ret, arg)
+		}
+	}
+	return append(ret, prefix+value)
+}
+
+func splitCommaList(v string) []string {
+	return strings.FieldsFunc(v, func(r rune) bool { return r == ',' })
 }
 
 // ExecSnarf is metadata about a test binary as seen when we're running

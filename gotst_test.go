@@ -5,8 +5,72 @@ package main
 
 import (
 	"os"
+	"strings"
 	"testing"
+	"time"
 )
+
+func TestGoListPackageHasTests(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		pkg  goListPackage
+		want bool
+	}{
+		{name: "none"},
+		{name: "internal", pkg: goListPackage{TestGoFiles: []string{"x_test.go"}}, want: true},
+		{name: "external", pkg: goListPackage{XTestGoFiles: []string{"x_test.go"}}, want: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.pkg.hasTests(); got != tt.want {
+				t.Fatalf("hasTests() = %v; want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDirectTestArgs(t *testing.T) {
+	in := []string{"-test.paniconexit0", "-test.v=test2json", "-test.timeout=10m0s"}
+	want := []string{"-test.paniconexit0", "-test.timeout=10m0s"}
+	got := directTestArgs(in)
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("directTestArgs(%q) = %q; want %q", in, got, want)
+	}
+}
+
+func TestProfileTestArgs(t *testing.T) {
+	in := []string{"-test.timeout=10m0s", "-test.paniconexit0"}
+	p := runProfile{
+		Short:     true,
+		shortSet:  true,
+		Timeout:   30 * time.Second,
+		TestFlags: []string{"-testing.v=true", "-custom-flag"},
+	}
+	got := profileTestArgs(in, p)
+	want := []string{
+		"-test.paniconexit0",
+		"-test.short=true",
+		"-test.timeout=30s",
+		"-test.v=true",
+		"-custom-flag",
+	}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("profileTestArgs(%q) = %q; want %q", in, got, want)
+	}
+}
+
+func TestCappedBuffer(t *testing.T) {
+	b := &cappedBuffer{max: 5}
+	for _, s := range []string{"abc", "def"} {
+		n, err := b.Write([]byte(s))
+		if n != len(s) || err != nil {
+			t.Fatalf("Write(%q) = %d, %v", s, n, err)
+		}
+	}
+	got := b.String()
+	if !strings.HasPrefix(got, "abcde\n") || !strings.Contains(got, "output truncated after 5 bytes") {
+		t.Fatalf("String() = %q", got)
+	}
+}
 
 func Test(t *testing.T) {
 	// TODO: write actual tests. For now this file

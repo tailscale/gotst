@@ -63,6 +63,9 @@ func findGo() (string, error) {
 		"/usr/local/bin/go",
 		"/usr/bin/go",
 	)
+	if path, err := exec.LookPath("go"); err == nil {
+		cands = append(cands, path)
+	}
 	for _, cand := range cands {
 		if _, err := os.Stat(cand); err == nil {
 			return cand, nil

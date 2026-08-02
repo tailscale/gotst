@@ -61,7 +61,7 @@ func (s *Server) statusData() *statusData {
 		ps := s.pkgs[importPath]
 		pd := packageData{
 			ImportPath: importPath,
-			HasTests:   len(ps.glp.TestGoFiles) > 0,
+			HasTests:   ps.glp.hasTests(),
 		}
 		switch ps.pkgState {
 		case pkgStateBuilt:
@@ -73,10 +73,10 @@ func (s *Server) statusData() *statusData {
 			pd.Status = "testing"
 		case pkgStateDone:
 			if ps.numFails > 0 {
-				pd.Status = fmt.Sprintf("FAILED %d/%d tests", ps.numFails, len(ps.tests))
+				pd.Status = fmt.Sprintf("FAILED in %v", ps.runIn)
 				pd.Failed = true
 			} else {
-				pd.Status = fmt.Sprintf("PASSED %d tests", len(ps.tests))
+				pd.Status = fmt.Sprintf("PASSED %d tests in %v", len(ps.tests), ps.runIn)
 				pd.Passed = true
 			}
 		}
