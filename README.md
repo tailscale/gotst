@@ -36,6 +36,38 @@ and compilation. `test_flags` are passed to captured test binaries; common
 `-testing.*` spellings are normalized to the test binary's `-test.*` flags.
 `-config=PATH` selects an explicit configuration file.
 
+## Test result caching
+
+gotst disables cmd/go's package test-result cache with `go test -count=1` and
+maintains its own per-top-level-test cache. Successful results are stored below
+`~/.cache/gotst/test-results/v1` by test-binary SHA-256 and test name. Use
+`-cache=false` to bypass result caching or `-cache-dir=PATH` to select a
+different cache root.
+
+Each entry is readable JSON and records the test identity, arguments, passing
+duration, and dependencies learned through `-test.testlogfile`. Environment
+dependencies include presence and a SHA-256 of the value (not the plaintext
+value). Opened regular files include a full content SHA-256 as well as
+stat/lstat metadata; directory opens include a deterministic directory-listing
+fingerprint. `stat` and `chdir` operations record filesystem metadata. A result
+is reused only if all recorded dependency fingerprints still match.
+
+The current scheduler executes each top-level test in its own process. This
+makes cache entries and invalidation attributable to individual tests, but it
+also repeats package initialization and `TestMain` and does not retain
+in-process `t.Parallel` scheduling across top-level tests. Hybrid batching is
+planned.
+
+## Progress output
+
+By default gotst prints one aggregate status line per second and a final
+summary. During execution it reports completed packages and tests, currently
+running tests, and cache hits/checks with a hit percentage. Successful
+individual tests are suppressed; failures and their output are printed
+immediately. `-vlog` restores per-test success/cache-hit lines and internal
+diagnostics. Use `-progress=DURATION` to change the update interval or
+`-progress=0` to print only the final summary.
+
 Its goals are:
 
 * keep the CPU busy

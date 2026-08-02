@@ -204,14 +204,20 @@ Build tags and caching:
 - [ ] Accept multiple build-tag sets in one logical run.
 - [ ] Detect when tag sets produce identical test binaries and run those tests
   only once while attributing the result to each applicable configuration.
-- [ ] Decide cache keys and lifetime for binaries and results; the current
-  per-run cache is deleted at exit and provides organization, not reuse.
-- [ ] Implement `-test.testlogfile` collection to learn runtime test inputs such
+- [x] Implement an initial persistent local test-result cache keyed by test
+  binary SHA-256, package, top-level test, working directory, and test arguments.
+  Successful entries live as inspectable JSON under
+  `~/.cache/gotst/test-results/v1`; transient captured binaries remain per-run.
+- [x] Implement `-test.testlogfile` collection to learn runtime test inputs such
   as opened files and consulted environment variables. Understand cmd/go's
   testlog format and cache rules, including path normalization and environment
   hashing.
-- [ ] Reproduce cmd/go's test-result cache invalidation semantics for those
-  learned inputs: a cached result is reusable only when the binary/configuration
+- [x] Implement initial cache invalidation for those learned inputs. Environment
+  presence/value hashes, file contents and metadata, directory listings, stat,
+  and chdir dependencies are recorded and revalidated before reuse. gotst uses
+  full regular-file content hashes rather than cmd/go's mtime/size shortcut.
+- [ ] Finish auditing cmd/go's test-result cache semantics and edge cases for
+  those learned inputs: a cached result is reusable only when the binary/configuration
   and every recorded file/environment dependency still match. Define behavior
   for inputs that cannot be tracked, tests that escape the supported sandbox or
   module roots, and dependency sets that differ between attempts.
@@ -219,9 +225,20 @@ Build tags and caching:
   invocation, a scheduled batch, or an individual top-level test. Per-test
   precision may require isolated executions, while batching naturally produces
   a union of dependencies.
+- [ ] Handle packages that define `TestMain` but have no runnable top-level
+  tests, and decide how package-level `TestMain` behavior participates in cache
+  identity and batching. The current per-test execution repeats `TestMain` for
+  every top-level test and does not execute a package containing only
+  `TestMain`.
 - [ ] Design test annotations for cacheability, isolation, resource needs, and
   other scheduling properties.
 - [ ] Verify integration requirements for gomodfs and gocached.
+- [ ] Define a versioned cache-service protocol behind the existing internal
+  `testResultCache` interface. Support a long-lived child process in the style
+  of `GOCACHEPROG`, then a network/database implementation, without exposing
+  disk-layout details to the scheduler. Include batched lookup/write,
+  cancellation, capability negotiation, cache-miss/error distinctions,
+  dependency inspection, authentication, and backpressure.
 
 Web UI and usability:
 

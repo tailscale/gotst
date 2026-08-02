@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"slices"
 	"sort"
@@ -35,10 +36,13 @@ var (
 
 	extraSleep = flag.Duration("extra-sleep", 0, "[dev] if non-zero, sleep this long before exiting after all tests complete, to give time to explore the web UI")
 
-	tags      = flag.String("tags", "", "comma-separated list of build tags to pass to 'go test' when building and running tests")
-	verbose   = flag.Bool("vlog", false, "verbose gotst debug logging")
-	jobs      = flag.Int("j", min(runtime.NumCPU(), 4), "maximum concurrent build or test processes")
-	maxOutput = flag.Int64("max-output", 4<<20, "maximum bytes of failure output retained per package")
+	tags          = flag.String("tags", "", "comma-separated list of build tags to pass to 'go test' when building and running tests")
+	verbose       = flag.Bool("vlog", false, "verbose gotst debug logging")
+	jobs          = flag.Int("j", min(runtime.NumCPU(), 4), "maximum concurrent build or test processes")
+	maxOutput     = flag.Int64("max-output", 4<<20, "maximum bytes of failure output retained per package")
+	useCache      = flag.Bool("cache", true, "reuse successful tests whose recorded inputs are unchanged")
+	cacheRoot     = flag.String("cache-dir", "", "cache root (default: user cache directory/gotst)")
+	progressEvery = flag.Duration("progress", time.Second, "interval between aggregate progress updates (0 disables periodic updates)")
 )
 
 func main() {
@@ -54,6 +58,9 @@ func main() {
 	}
 	if *maxOutput < 0 {
 		log.Fatal("-max-output must not be negative")
+	}
+	if *progressEvery < 0 {
+		log.Fatal("-progress must not be negative")
 	}
 	log.SetPrefix("gotst: ")
 	log.SetFlags(log.Flags() | log.Lmsgprefix)
@@ -74,7 +81,9 @@ func main() {
 	if *tags != "" {
 		profile.Tags = appendUnique(profile.Tags, splitCommaList(*tags)...)
 	}
-	log.Printf("Using profile %q from %s", profile.Name, profile.Root)
+	if *verbose {
+		log.Printf("Using profile %q from %s", profile.Name, profile.Root)
+	}
 
 	s := NewServer(profile)
 	if *extraSleep > 0 {
@@ -94,10 +103,11 @@ func main() {
 }
 
 type Server struct {
-	start    time.Time
-	cacheDir string
-	ctx      context.Context
-	profile  runProfile
+	start     time.Time
+	cacheDir  string
+	ctx       context.Context
+	profile   runProfile
+	testCache testResultCache
 
 	execSem chan bool // buffered chan semaphore to limit subprocesses
 	outMu   sync.Mutex
@@ -105,6 +115,10 @@ type Server struct {
 	mu            sync.Mutex
 	pkgs          map[string]*packageStatus // test package import path -> status
 	pkgsWithTests int
+	phase         runPhase
+	testsTotal    int
+	cacheChecks   int
+	cacheHits     int
 }
 
 type packageStatus struct {
@@ -153,28 +167,52 @@ type goListPackage struct {
 }
 
 func NewServer(profile runProfile) *Server {
+	var cache testResultCache
+	if *useCache {
+		var err error
+		cache, err = newDiskTestCache(mustCacheRoot())
+		if err != nil {
+			log.Fatalf("initializing test result cache: %v", err)
+		}
+	}
 	return &Server{
-		start:    time.Now(),
-		cacheDir: mustNewCacheDir(),
-		ctx:      context.Background(),
-		profile:  profile,
-		execSem:  make(chan bool, *jobs),
+		start:     time.Now(),
+		cacheDir:  mustNewCacheDir(),
+		ctx:       context.Background(),
+		profile:   profile,
+		testCache: cache,
+		execSem:   make(chan bool, *jobs),
 	}
 }
 
-func (s *Server) Run() error {
+func (s *Server) Run() (retErr error) {
+	s.setPhase(phaseDiscovering)
+	stopProgress := s.startProgressReporter()
+	defer func() {
+		stopProgress()
+		if retErr != nil {
+			s.setPhase(phaseFailed)
+		} else {
+			s.setPhase(phaseDone)
+		}
+		s.printProgress()
+	}()
+
 	if err := s.learnPackagesWithTests(); err != nil {
 		return fmt.Errorf("learnPackagesWithTests: %w", err)
 	}
 
+	s.setPhase(phaseBuilding)
 	if err := s.buildAllTestBinaries(); err != nil {
 		return fmt.Errorf("buildAllTestBinaries: %w", err)
 	}
 
+	s.setPhase(phaseListing)
 	if err := s.listAllTests(); err != nil {
 		return fmt.Errorf("listAllTests: %w", err)
 	}
 
+	s.setPhase(phaseTesting)
 	if err := s.runAllTests(); err != nil {
 		return err
 	}
@@ -219,7 +257,9 @@ func (p *goListPackage) hasTests() bool {
 }
 
 func (s *Server) learnPackagesWithTests() error {
-	log.Printf("Discovering packages with tests...")
+	if *verbose {
+		log.Printf("Discovering packages with tests...")
+	}
 	t0 := time.Now()
 
 	excluded, err := s.resolveExcludedPackages()
@@ -236,7 +276,9 @@ func (s *Server) learnPackagesWithTests() error {
 			pkg := new(goListPackage)
 			if err := jd.Decode(pkg); err != nil {
 				if errors.Is(err, io.EOF) {
-					log.Printf("Discovered packages with tests in %v", time.Since(t0).Round(time.Millisecond))
+					if *verbose {
+						log.Printf("Discovered packages with tests in %v", time.Since(t0).Round(time.Millisecond))
+					}
 					return nil
 				}
 				return fmt.Errorf("decoding package: %w", err)
@@ -397,7 +439,9 @@ func parseTestOrBuildEvent(line []byte) (any, error) {
 }
 
 func (s *Server) buildAllTestBinaries() error {
-	log.Printf("Building test binaries...")
+	if *verbose {
+		log.Printf("Building test binaries...")
+	}
 	t0 := time.Now()
 
 	selfExe, err := os.Executable()
@@ -406,11 +450,14 @@ func (s *Server) buildAllTestBinaries() error {
 	}
 	pkgs := s.packagesWithTests()
 	if len(pkgs) == 0 {
-		log.Printf("No packages with tests")
+		if *verbose {
+			log.Printf("No packages with tests")
+		}
 		return nil
 	}
 	args := []string{
 		"test",
+		"-count=1", // disable cmd/go test-result caching; gotst owns this layer
 		"-p=" + fmt.Sprint(*jobs),
 		"--trimpath",
 		"--tags=" + strings.Join(s.profile.Tags, ","),
@@ -470,7 +517,9 @@ func (s *Server) buildAllTestBinaries() error {
 		if err := errors.Join(errs...); err != nil {
 			return err
 		}
-		log.Printf("Built %d test binaries in %v", len(pkgs), time.Since(t0).Round(time.Millisecond))
+		if *verbose {
+			log.Printf("Built %d test binaries in %v", len(pkgs), time.Since(t0).Round(time.Millisecond))
+		}
 		return nil
 	})
 }
@@ -579,6 +628,9 @@ func (s *Server) setPackageTests(pkg string, tests []string) {
 	ps.tests = make(map[string]*testStatus)
 	for _, test := range tests {
 		ps.tests[test] = &testStatus{}
+		if isRunnableTopLevelTest(test) {
+			s.testsTotal++
+		}
 	}
 }
 
@@ -630,7 +682,9 @@ func (s *Server) listAllTests() error {
 	if err := errors.Join(all...); err != nil {
 		return err
 	}
-	log.Printf("Listed tests in %d packages in %v", len(bins), time.Since(t0).Round(time.Millisecond))
+	if *verbose {
+		log.Printf("Listed tests in %d packages in %v", len(bins), time.Since(t0).Round(time.Millisecond))
+	}
 	return nil
 }
 
@@ -673,15 +727,49 @@ func (s *Server) runAllTests() error {
 	if len(bins) == 0 {
 		return nil
 	}
-	log.Printf("Running tests in %d packages with up to %d concurrent processes...", len(bins), *jobs)
-	errs := make(chan error, len(bins))
+	var tasks []testTask
 	for _, bin := range bins {
-		bin := bin
-		go func() { errs <- s.runTestBinary(bin) }()
+		s.mu.Lock()
+		ps := s.pkgs[bin.pkg]
+		tests := make([]string, 0, len(ps.tests))
+		for test := range ps.tests {
+			if isRunnableTopLevelTest(test) {
+				tests = append(tests, test)
+			}
+		}
+		s.mu.Unlock()
+		sort.Strings(tests)
+		for _, test := range tests {
+			tasks = append(tasks, testTask{bin: bin, test: test})
+		}
+		if len(tests) == 0 {
+			s.mu.Lock()
+			ps.pkgState = pkgStateDone
+			s.mu.Unlock()
+		}
 	}
+	if *verbose {
+		log.Printf("Running %d tests in %d packages with up to %d concurrent processes...", len(tasks), len(bins), *jobs)
+	}
+	errs := make(chan error, len(tasks))
+	work := make(chan testTask)
+	workers := min(*jobs, len(tasks))
+	for range workers {
+		go func() {
+			for task := range work {
+				errs <- s.runTest(task)
+			}
+		}()
+	}
+	go func() {
+		for _, task := range tasks {
+			work <- task
+		}
+		close(work)
+	}()
 	failed := 0
 	var infraErrs []error
-	for range bins {
+	for range tasks {
 		if err := <-errs; err != nil {
 			var ee *exec.ExitError
 			if errors.As(err, &ee) {
@@ -695,12 +783,50 @@ func (s *Server) runAllTests() error {
 		return fmt.Errorf("running tests: %w", err)
 	}
 	if failed > 0 {
-		return fmt.Errorf("%d test package(s) failed", failed)
+		return fmt.Errorf("%d test(s) failed", failed)
 	}
 	return nil
 }
 
-func (s *Server) runTestBinary(bin capturedTestBinary) error {
+type testTask struct {
+	bin  capturedTestBinary
+	test string
+}
+
+func isRunnableTopLevelTest(name string) bool {
+	return strings.HasPrefix(name, "Test") || strings.HasPrefix(name, "Fuzz") || strings.HasPrefix(name, "Example")
+}
+
+func (s *Server) runTest(task testTask) error {
+	bin := task.bin
+	baseArgs := profileTestArgs(bin.args, s.profile)
+	key := testCacheKey{
+		BinarySHA256: binHash(bin.absBin),
+		Package:      bin.pkg,
+		Test:         task.test,
+		WorkingDir:   bin.workDir,
+		Args:         slices.Clone(baseArgs),
+	}
+	if s.testCache != nil {
+		s.mu.Lock()
+		s.cacheChecks++
+		s.mu.Unlock()
+		entry, err := s.testCache.Get(s.ctx, key)
+		if err == nil {
+			valid, validateErr := validateDependencies(entry.Dependencies)
+			if validateErr == nil && valid {
+				s.mu.Lock()
+				s.cacheHits++
+				s.mu.Unlock()
+				s.finishTest(task, true, entry.PassedIn, nil)
+				s.printTestResult(task, entry.PassedIn, true, true, "")
+				return nil
+			}
+		} else if !errors.Is(err, errTestCacheMiss) && *verbose {
+			log.Printf("cache lookup for %s/%s: %v", bin.pkg, task.test, err)
+		}
+	}
+
 	if !s.awaitExecSem(s.ctx) {
 		return s.ctx.Err()
 	}
@@ -709,37 +835,94 @@ func (s *Server) runTestBinary(bin capturedTestBinary) error {
 	s.mu.Lock()
 	ps := s.pkgs[bin.pkg]
 	ps.pkgState = pkgStateTesting
+	ps.tests[task.test].running = true
 	s.mu.Unlock()
 
 	t0 := time.Now()
 	var out cappedBuffer
 	out.max = *maxOutput
-	cmd := exec.CommandContext(s.ctx, bin.absBin, profileTestArgs(bin.args, s.profile)...)
+	logPath := filepath.Join(s.cacheDir, "testlog-"+key.id())
+	args := setTestArg(baseArgs, "-test.run", "^"+regexp.QuoteMeta(task.test)+"$")
+	if s.testCache != nil {
+		args = setTestArg(args, "-test.testlogfile", logPath)
+	}
+	cmd := exec.CommandContext(s.ctx, bin.absBin, args...)
 	cmd.Dir = bin.workDir
 	cmd.Stdout = &out
 	cmd.Stderr = &out
 	err := cmd.Run()
 	d := time.Since(t0).Round(time.Millisecond)
-
-	s.mu.Lock()
-	ps.pkgState = pkgStateDone
-	ps.runIn = d
-	if err != nil {
-		ps.numFails = 1
-		ps.runErr = err.Error()
+	if err == nil && s.testCache != nil {
+		deps, depErr := parseTestLog(logPath, bin.workDir)
+		if depErr != nil {
+			if *verbose {
+				log.Printf("not caching %s/%s: %v", bin.pkg, task.test, depErr)
+			}
+		} else {
+			entry := &testCacheEntry{
+				Version:      testCacheVersion,
+				Key:          key,
+				Created:      time.Now().UTC(),
+				PassedIn:     d,
+				Dependencies: deps,
+			}
+			if putErr := s.testCache.Put(s.ctx, entry); putErr != nil && *verbose {
+				log.Printf("caching %s/%s: %v", bin.pkg, task.test, putErr)
+			}
+		}
 	}
-	s.mu.Unlock()
-
-	s.outMu.Lock()
-	defer s.outMu.Unlock()
-	if err != nil {
-		fmt.Fprintf(os.Stdout, "%s", out.String())
-		fmt.Fprintf(os.Stdout, "FAIL\t%s\t%s\n", bin.pkg, d)
-	} else {
-		fmt.Fprintf(os.Stdout, "ok  \t%s\t%s\n", bin.pkg, d)
+	if s.testCache != nil {
+		os.Remove(logPath)
 	}
+	s.finishTest(task, err == nil, d, err)
+	s.printTestResult(task, d, false, err == nil, out.String())
 	return err
 }
+
+func (s *Server) finishTest(task testTask, passed bool, d time.Duration, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ps := s.pkgs[task.bin.pkg]
+	ts := ps.tests[task.test]
+	ts.running = false
+	ts.done = true
+	ts.passed = passed
+	if passed {
+		ts.passedIn = d
+	} else {
+		ps.numFails++
+		ps.runErr = err.Error()
+	}
+	ps.runIn += d
+	allDone := true
+	for name, status := range ps.tests {
+		if isRunnableTopLevelTest(name) && !status.done {
+			allDone = false
+			break
+		}
+	}
+	if allDone {
+		ps.pkgState = pkgStateDone
+	}
+}
+
+func (s *Server) printTestResult(task testTask, d time.Duration, cached, passed bool, output string) {
+	if passed && !*verbose {
+		return
+	}
+	s.outMu.Lock()
+	defer s.outMu.Unlock()
+	if !passed {
+		fmt.Fprintf(os.Stdout, "%s", output)
+		fmt.Fprintf(os.Stdout, "FAIL\t%s\t%s\t%s\n", task.bin.pkg, task.test, d)
+	} else if cached {
+		fmt.Fprintf(os.Stdout, "ok  \t%s\t%s\t(cached)\n", task.bin.pkg, task.test)
+	} else {
+		fmt.Fprintf(os.Stdout, "ok  \t%s\t%s\t%s\n", task.bin.pkg, task.test, d)
+	}
+}
+
+func binHash(absBin string) string { return filepath.Base(absBin) }
 
 // directTestArgs converts arguments emitted by "go test -json" into arguments
 // suitable for running the captured test binary directly. The Go command's

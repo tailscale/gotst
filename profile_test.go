@@ -200,7 +200,7 @@ profiles:
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("building gotst: %v\n%s", err, out)
 	}
-	cmd := exec.Command(exe, "-listen=")
+	cmd := exec.Command(exe, "-listen=", "-cache=false")
 	cmd.Dir = dir
 	var out bytes.Buffer
 	cmd.Stdout = &out
@@ -208,7 +208,7 @@ profiles:
 	if err := cmd.Run(); err != nil {
 		t.Fatalf("running profile: %v\n%s", err, &out)
 	}
-	if !strings.Contains(out.String(), "ok  \tprofiletest") {
-		t.Fatalf("output does not contain package success:\n%s", &out)
+	if !strings.Contains(out.String(), "gotst: done: 1/1 test pkgs, 1/1 tests") {
+		t.Fatalf("output does not contain final success progress:\n%s", &out)
 	}
 }

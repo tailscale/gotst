@@ -25,6 +25,16 @@ func mustNewCacheDir() string {
 }
 
 func mustCacheRoot() string {
+	if *cacheRoot != "" {
+		s, err := filepath.Abs(*cacheRoot)
+		if err != nil {
+			log.Fatalf("resolving cache dir %q: %v", *cacheRoot, err)
+		}
+		if err := os.MkdirAll(s, 0700); err != nil {
+			log.Fatalf("creating cache dir %q: %v", s, err)
+		}
+		return s
+	}
 	ucd, err := os.UserCacheDir()
 	if err != nil {
 		log.Fatalf("getting user cache dir: %v", err)
@@ -67,7 +77,9 @@ func cleanOldCaches(cacheRoot string) {
 			continue
 		}
 		age := time.Since(time.Unix(0, timestamp)).Round(time.Second)
-		log.Printf("removing old cache dir %q (age %v)", name, age)
+		if *verbose {
+			log.Printf("removing old cache dir %q (age %v)", name, age)
+		}
 		os.RemoveAll(filepath.Join(cacheRoot, name))
 	}
 }
