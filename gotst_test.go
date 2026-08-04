@@ -4,6 +4,7 @@
 package main
 
 import (
+	"maps"
 	"os"
 	"strings"
 	"testing"
@@ -34,6 +35,22 @@ func TestDirectTestArgs(t *testing.T) {
 	got := directTestArgs(in)
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("directTestArgs(%q) = %q; want %q", in, got, want)
+	}
+}
+
+func TestTestAttrs(t *testing.T) {
+	got := testAttrs(strings.Join([]string{
+		"=== RUN   TestFlake",
+		"=== ATTR  TestFlake issue-url https://example.com/issues/123",
+		"\x16=== ATTR  TestFlake note value with spaces",
+		"not an attribute",
+	}, "\n"))
+	want := map[string]string{
+		"issue-url": "https://example.com/issues/123",
+		"note":      "value with spaces",
+	}
+	if !maps.Equal(got, want) {
+		t.Fatalf("testAttrs() = %v; want %v", got, want)
 	}
 }
 

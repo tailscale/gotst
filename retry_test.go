@@ -47,6 +47,42 @@ func TestRetryAndCountEndToEnd(t *testing.T) {
 		}
 	})
 
+	t.Run("JSON summary includes test attributes", func(t *testing.T) {
+		dir := makeAttemptModule(t, 1)
+		out, err := runGotstFixture(exe, dir, "-json-summary", "-max-output=0", "-max-retries=1")
+		if err != nil {
+			t.Fatalf("gotst failed: %v\n%s", err, out)
+		}
+		for _, want := range []string{
+			`gotst flaky tests JSON:`,
+			`"Package":"attempttest"`,
+			`"Test":"TestAttempts"`,
+			`"Attrs":{"issue-url":"https://example.com/issues/123"}`,
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("output missing %q:\n%s", want, out)
+			}
+		}
+	})
+
+	t.Run("JSON summary includes failed attempt diagnostics", func(t *testing.T) {
+		dir := makeAttemptModule(t, 1)
+		out, err := runGotstFixture(exe, dir, "-json-summary", "-max-retries=1")
+		if err != nil {
+			t.Fatalf("gotst failed: %v\n%s", err, out)
+		}
+		for _, want := range []string{
+			"FLAKY TEST DIAGNOSTICS:",
+			"[gotst: attempttest TestAttempts failed attempt 1/1",
+			"intentional failure 1",
+			"--- FAIL: TestAttempts",
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("output missing %q:\n%s", want, out)
+			}
+		}
+	})
+
 	t.Run("retry limit exhausted", func(t *testing.T) {
 		dir := makeAttemptModule(t, 2)
 		out, err := runGotstFixture(exe, dir, "-max-retries=1")
@@ -181,6 +217,7 @@ import (
 )
 
 func TestAttempts(t *testing.T) {
+	t.Attr("issue-url", "https://example.com/issues/123")
 	n := 0
 	if data, err := os.ReadFile("attempt-count"); err == nil {
 		n, _ = strconv.Atoi(string(data))

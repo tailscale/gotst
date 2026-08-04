@@ -48,6 +48,7 @@ var (
 	maxRetries    = flag.Int("max-retries", 3, "maximum additional attempts after a test failure")
 	buildOnly     = flag.Bool("build-only", false, "build and capture selected test binaries without listing or running tests")
 	debugUncached = flag.Bool("debug-uncached", false, "run a cache-seeding pass, then diagnose tests that do not reuse it")
+	jsonSummary   = flag.Bool("json-summary", false, "emit a machine-readable flaky-test summary including testing.T attributes")
 	testCountSet  bool
 )
 
@@ -188,6 +189,7 @@ type testStatus struct {
 	passedIn time.Duration // valid if passed is true
 	fails    []failInfo
 	attempts int
+	attrs    map[string]string
 }
 
 type failInfo struct {
@@ -1158,6 +1160,9 @@ func (s *Server) cacheKeyForTask(task testTask) testCacheKey {
 	if *failFast {
 		baseArgs = setTestArg(baseArgs, "-test.failfast", "true")
 	}
+	if *jsonSummary {
+		baseArgs = setTestArg(baseArgs, "-test.v", "true")
+	}
 	return testCacheKey{
 		BinarySHA256: binHash(task.bin.absBin),
 		Package:      task.bin.pkg,
@@ -1178,6 +1183,9 @@ func (s *Server) runTest(task testTask) error {
 	baseArgs = setTestArg(baseArgs, "-test.count", "1")
 	if *failFast {
 		baseArgs = setTestArg(baseArgs, "-test.failfast", "true")
+	}
+	if *jsonSummary {
+		baseArgs = setTestArg(baseArgs, "-test.v", "true")
 	}
 	key := s.cacheKeyForTask(task)
 	debugPass := s.currentDebugPass()
@@ -1217,8 +1225,9 @@ func (s *Server) runTest(task testTask) error {
 	var cacheDeps []cacheDependency
 	for repetition := range *testCount {
 		for retry := 0; ; retry++ {
-			d, output, deps, err := s.runTestAttempt(task, key, baseArgs, repetition, retry)
+			d, output, attrs, deps, err := s.runTestAttempt(task, key, baseArgs, repetition, retry)
 			total += d
+			s.recordTestAttrs(task, attrs)
 			s.recordTestAttempt(task)
 			if err == nil {
 				if len(failures) == 0 && *testCount == 1 {
@@ -1269,9 +1278,11 @@ func (s *Server) runTest(task testTask) error {
 	return nil
 }
 
-func (s *Server) runTestAttempt(task testTask, key testCacheKey, baseArgs []string, repetition, retry int) (time.Duration, string, []cacheDependency, error) {
+func (s *Server) runTestAttempt(task testTask, key testCacheKey, baseArgs []string, repetition, retry int) (time.Duration, string, map[string]string, []cacheDependency, error) {
 	var out cappedBuffer
 	out.max = *maxOutput
+	var attrOut cappedBuffer
+	attrOut.max = 1 << 20
 	logPath := filepath.Join(s.cacheDir, fmt.Sprintf("testlog-%s-%d-%d", key.id(), repetition, retry))
 	args := setTestArg(baseArgs, "-test.run", "^"+regexp.QuoteMeta(task.test)+"$")
 	if s.testCache != nil {
@@ -1280,15 +1291,20 @@ func (s *Server) runTestAttempt(task testTask, key testCacheKey, baseArgs []stri
 	t0 := time.Now()
 	cmd := exec.CommandContext(s.ctx, task.bin.absBin, args...)
 	cmd.Dir = task.bin.workDir
-	cmd.Stdout = &out
-	cmd.Stderr = &out
+	var outputWriter io.Writer = &out
+	if *jsonSummary {
+		outputWriter = io.MultiWriter(&out, &attrOut)
+	}
+	cmd.Stdout = outputWriter
+	cmd.Stderr = outputWriter
 	err := cmd.Run()
 	d := time.Since(t0).Round(time.Millisecond)
+	attrs := testAttrs(attrOut.String())
 	if s.ctx.Err() != nil {
 		if s.testCache != nil {
 			os.Remove(logPath)
 		}
-		return d, out.String(), nil, context.Canceled
+		return d, out.String(), attrs, nil, context.Canceled
 	}
 	var deps []cacheDependency
 	if err == nil && s.testCache != nil {
@@ -1307,7 +1323,7 @@ func (s *Server) runTestAttempt(task testTask, key testCacheKey, baseArgs []stri
 	if s.testCache != nil {
 		os.Remove(logPath)
 	}
-	return d, out.String(), deps, err
+	return d, out.String(), attrs, deps, err
 }
 
 func (s *Server) currentDebugPass() int {
@@ -1342,6 +1358,45 @@ func (s *Server) recordTestAttempt(task testTask) {
 	s.mu.Lock()
 	s.pkgs[task.bin.pkg].tests[task.test].attempts++
 	s.mu.Unlock()
+}
+
+func testAttrs(output string) map[string]string {
+	var ret map[string]string
+	for line := range strings.SplitSeq(output, "\n") {
+		line = strings.TrimPrefix(line, "\x16") // -test.v=test2json framing marker
+		line, ok := strings.CutPrefix(line, "=== ATTR  ")
+		if !ok {
+			continue
+		}
+		_, rest, ok := strings.Cut(line, " ") // test name
+		if !ok {
+			continue
+		}
+		key, value, ok := strings.Cut(rest, " ")
+		if !ok || key == "" {
+			continue
+		}
+		if ret == nil {
+			ret = make(map[string]string)
+		}
+		ret[key] = value
+	}
+	return ret
+}
+
+func (s *Server) recordTestAttrs(task testTask, attrs map[string]string) {
+	if len(attrs) == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ts := s.pkgs[task.bin.pkg].tests[task.test]
+	if ts.attrs == nil {
+		ts.attrs = make(map[string]string)
+	}
+	for key, value := range attrs {
+		ts.attrs[key] = value
+	}
 }
 
 func (s *Server) stopRunningTest(task testTask) {

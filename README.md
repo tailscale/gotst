@@ -111,6 +111,14 @@ exhausted. Automatic flake detection only observes tests that execute; a valid
 cache hit is skipped, so use explicit `-count=1` when actively investigating
 nondeterministic behavior.
 
+Use `-json-summary` when another tool needs structured flaky-test results.
+Gotst then emits a `gotst flaky tests JSON:` record after the human-readable
+summary. The record includes arbitrary attributes set with `testing.T.Attr`;
+capturing those attributes requires verbose test-binary mode, so tests observe
+`testing.Verbose()` as true when this flag is enabled. Before the summary,
+gotst also prints the retained output from every failed attempt of a test that
+subsequently passed, preserving diagnostics for CI log analysis.
+
 Use `-debug-uncached` to investigate unexpectedly low result-cache hit rates.
 Gotst first runs every selected test while bypassing existing result entries and
 seeds successful results, then performs a read-only verification pass. For each

@@ -4,6 +4,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"slices"
@@ -145,10 +146,12 @@ func (p progressSnapshot) writeBuildProgress(b *strings.Builder) {
 }
 
 type flakyTestSummary struct {
-	Package  string
-	Test     string
-	Attempts int
-	Failures int
+	Package        string
+	Test           string
+	Attempts       int
+	Failures       int
+	Attrs          map[string]string `json:",omitempty"`
+	FailedAttempts []failInfo        `json:"-"`
 }
 
 func (s *Server) flakyTests() []flakyTestSummary {
@@ -158,7 +161,10 @@ func (s *Server) flakyTests() []flakyTestSummary {
 	for pkg, ps := range s.pkgs {
 		for test, ts := range ps.tests {
 			if ts.passed && len(ts.fails) > 0 {
-				ret = append(ret, flakyTestSummary{pkg, test, ts.attempts, len(ts.fails)})
+				ret = append(ret, flakyTestSummary{
+					Package: pkg, Test: test, Attempts: ts.attempts, Failures: len(ts.fails),
+					Attrs: ts.attrs, FailedAttempts: slices.Clone(ts.fails),
+				})
 			}
 		}
 	}
@@ -178,9 +184,26 @@ func (s *Server) printFlakySummary() {
 	}
 	s.outMu.Lock()
 	defer s.outMu.Unlock()
+	if *jsonSummary {
+		fmt.Fprintf(os.Stdout, "\nFLAKY TEST DIAGNOSTICS:\n")
+		for _, f := range flakes {
+			for i, failure := range f.FailedAttempts {
+				fmt.Fprintf(os.Stdout, "\n[gotst: %s %s failed attempt %d/%d, %s]\n",
+					f.Package, f.Test, i+1, f.Failures, failure.dur)
+				fmt.Fprint(os.Stdout, failure.out)
+				if !strings.HasSuffix(failure.out, "\n") {
+					fmt.Fprintln(os.Stdout)
+				}
+			}
+		}
+	}
 	fmt.Fprintf(os.Stdout, "\nFLAKY TESTS (%d):\n", len(flakes))
 	for _, f := range flakes {
 		fmt.Fprintf(os.Stdout, "  %s %s: passed after %d attempts (%d failed)\n", f.Package, f.Test, f.Attempts, f.Failures)
+	}
+	if *jsonSummary {
+		j, _ := json.Marshal(flakes)
+		fmt.Fprintf(os.Stdout, "gotst flaky tests JSON: %s\n", j)
 	}
 }
 

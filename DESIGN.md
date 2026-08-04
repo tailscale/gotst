@@ -225,6 +225,14 @@ Test output is captured in a concurrency-safe `cappedBuffer`. Failures are
 printed immediately under `Server.outMu`; successful tests are quiet unless
 `-vlog` is enabled.
 
+With `-json-summary`, child binaries run in verbose mode so standard
+`testing.T.Attr` lines are available. Gotst retains the attributes without
+interpreting their keys and includes them in its final `gotst flaky tests JSON:`
+record. Consumers can attach domain-specific meaning to attributes while gotst
+remains independent of any CI or issue tracker. This mode also prints each
+flaky test's retained failed-attempt output before the summary, allowing a CI
+consumer to analyze the original failure even though the overall run passed.
+
 ### State and locking
 
 `Server.mu` protects package/test status, phase, counters, and fail-fast state.
