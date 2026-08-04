@@ -245,7 +245,7 @@ Build tags and caching:
 - [x] Implement an initial persistent local test-result cache keyed by test
   binary SHA-256, package, top-level test, working directory, and test arguments.
   Successful entries live as inspectable JSON under
-  `~/.cache/gotst/test-results/v1`; transient captured binaries remain per-run.
+  `~/.cache/gotst/test-results/vN`; transient captured binaries remain per-run.
 - [x] Implement `-test.testlogfile` collection to learn runtime test inputs such
   as opened files and consulted environment variables. Understand cmd/go's
   testlog format and cache rules, including path normalization and environment

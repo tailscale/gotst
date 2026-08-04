@@ -254,10 +254,20 @@ The versioned cache key contains:
 - package working directory; and
 - effective test arguments, excluding the per-task `-test.run` value.
 
-Entries are JSON below `test-results/v1` in the cache root and are installed by
+Entries are JSON below a versioned `test-results/vN` directory in the cache root and are installed by
 atomic rename. Only a clean, single-repetition pass is written. Explicitly
 supplying `-count`, even `-count=1`, disables result-cache reuse so it preserves
 the familiar `go test -count=1` intent.
+
+`-debug-uncached` diagnoses result-cache instability with two phases. The seed
+phase bypasses all existing entries, runs every selected top-level test, and
+writes successful cache entries normally. The verification phase does not run
+test binaries: it reads each just-written entry and fingerprints its recorded
+inputs against the settled filesystem and environment after the seed phase.
+This read-only second phase avoids cascading false misses from one diagnostic
+rerun mutating another test's inputs. Missing entries, capture/write errors,
+validation errors, and changed dependencies are reported per test; any miss
+makes the command unsuccessful.
 
 For an executed test, gotst asks the test binary to write the standard
 `-test.testlogfile`. `parseTestLog` snapshots dependencies reported by the Go
@@ -268,6 +278,13 @@ runtime:
 - `open` on a directory: metadata and a deterministic entry fingerprint; and
 - `stat` and `chdir`: filesystem metadata, resolving relative paths against the
   working directory as it changes.
+
+As in cmd/go's native test cache, `open` and `stat` paths outside the package's
+module, GOPATH, or GOROOT root are not rechecked. This prevents incidental
+runtime bookkeeping such as `t.TempDir` opening the shared temporary directory,
+and volatile pseudo-files such as `/proc/net/route`, from invalidating results.
+`chdir` remains tracked regardless of its destination because it changes how
+subsequent relative paths are interpreted.
 
 `GODEBUG` is added explicitly because the runtime reads it without reporting it
 in the test log. Environment values are not stored in plaintext.
@@ -357,8 +374,9 @@ for older helper names are accepted where practical.
 
 The progress reporter periodically obtains a `progressSnapshot` derived from
 the synchronized package/test state. It reports phase, package and test counts,
-running tests, flakes, and test-result-cache hit rates. The final snapshot is
-always printed, even when periodic progress is disabled.
+linked-executable cache hits, running tests, flakes, and test-result-cache hit
+rates. The final snapshot is always printed, even when periodic progress is
+disabled.
 
 The optional HTTP server calls the same `Server` state through `statusData` and
 renders `root.tmpl.html`. It is currently a polling snapshot view, not an API or

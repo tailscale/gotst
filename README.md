@@ -67,7 +67,7 @@ and compilation. `test_flags` are passed to captured test binaries; common
 
 gotst disables cmd/go's package test-result cache with `go test -count=1` and
 maintains its own per-top-level-test cache. Successful results are stored below
-`~/.cache/gotst/test-results/v1` by test-binary SHA-256 and test name. Use
+`~/.cache/gotst/test-results/vN` by test-binary SHA-256 and test name. Use
 `-cache=false` to bypass result caching or `-cache-dir=PATH` to select a
 different cache root.
 
@@ -83,8 +83,10 @@ cost of repeating package initialization and `TestMain`.
 ## Progress output
 
 By default gotst prints one aggregate status line per second and a final
-summary. During execution it reports completed packages and tests, currently
-running tests, and cache hits/checks with a hit percentage. Successful
+summary. During the build it distinguishes test binaries restored from the
+linked-executable cache from newly built binaries. During execution it reports
+completed packages and tests, currently running tests, and result-cache
+hits/checks with a hit percentage. Successful
 individual tests are suppressed; failures and their output are printed
 immediately. `-vlog` restores per-test success/cache-hit lines and internal
 diagnostics. Use `-progress=DURATION` to change the update interval or
@@ -108,6 +110,14 @@ after all retries fails the run. `-failfast` takes effect after retries are
 exhausted. Automatic flake detection only observes tests that execute; a valid
 cache hit is skipped, so use explicit `-count=1` when actively investigating
 nondeterministic behavior.
+
+Use `-debug-uncached` to investigate unexpectedly low result-cache hit rates.
+Gotst first runs every selected test while bypassing existing result entries and
+seeds successful results, then performs a read-only verification pass. For each
+miss it reports whether the entry was absent or invalid, could not be created,
+or which recorded environment or filesystem inputs changed. The command fails
+if any seeded result cannot be reused. It cannot be combined with `-count`,
+`-cache=false`, `-build-only`, or `-failfast`.
 
 ## External build caching
 
