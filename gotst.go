@@ -50,6 +50,12 @@ var (
 )
 
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == cacheShimArg {
+		if err := runCacheShim(); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	if dir := os.Getenv("GOTST_EXEC_DEST"); dir != "" {
 		// We're running as a test binary under "go test -exec".
 		// Just capture our output to the given directory and exit.
@@ -545,8 +551,20 @@ func (s *Server) buildAllTestBinaries() error {
 	args = append(args, pkgs...)
 	cmd := exec.Command(goCmd(), args...)
 	cmd.Dir = s.profile.Root
-	cmd.Env = append(os.Environ(), "GOTST_EXEC_DEST="+s.cacheDir)
-	return processCmdOutput(cmd, func(r io.Reader) error {
+	cmd.Env = append(envWithout(os.Environ(), "GOTST_EXEC_DEST"), "GOTST_EXEC_DEST="+s.cacheDir)
+	var shim *cacheShim
+	if realCacheProg := os.Getenv("GOCACHEPROG"); realCacheProg != "" {
+		socket := filepath.Join(s.cacheDir, "cache-shim.sock")
+		shim, err = startCacheShim(realCacheProg, socket)
+		if err != nil {
+			return fmt.Errorf("starting GOCACHEPROG shim: %w", err)
+		}
+		cmd.Env = append(envWithout(cmd.Env, "GOCACHEPROG", cacheShimSocketEnv),
+			"GOCACHEPROG="+quoteCacheProgArg(selfExe)+" "+cacheShimArg,
+			cacheShimSocketEnv+"="+socket,
+		)
+	}
+	err = processCmdOutput(cmd, func(r io.Reader) error {
 
 		var errs []error
 		// This contains gotst's own small ExecSnarf record, not user test
@@ -599,6 +617,10 @@ func (s *Server) buildAllTestBinaries() error {
 		}
 		return nil
 	})
+	if shim != nil {
+		err = errors.Join(err, shim.close())
+	}
+	return err
 }
 
 func findExecSnarf(output string) (es ExecSnarf, found bool, err error) {
@@ -1285,6 +1307,15 @@ func storeTestExecBinary(dir string) {
 		}
 		if err := os.Rename(of.Name(), target); err != nil {
 			log.Fatalf("renaming copied test binary to final name: %v", err)
+		}
+	}
+	if socket := os.Getenv(cacheShimSocketEnv); socket != "" {
+		fi, err := os.Stat(target)
+		if err != nil {
+			log.Fatalf("statting captured test binary: %v", err)
+		}
+		if err := registerTestExecutable(socket, target, co.ExeHash, fi.Size()); err != nil {
+			log.Printf("not caching test executable: %v", err)
 		}
 	}
 	fmt.Printf("ExecSnarf:%s\n", coj)
