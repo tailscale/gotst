@@ -46,32 +46,39 @@ type runProfile struct {
 	shortSet        bool
 }
 
-func loadRunProfile(configPath, name string) (runProfile, error) {
-	if name == "" {
-		name = "default"
-	}
+type profileDefinitions struct {
+	path     string
+	root     string
+	profiles map[string]rawProfile
+	implicit bool
+}
+
+func loadProfileDefinitions(configPath string) (*profileDefinitions, error) {
 	if configPath == "" {
 		var err error
 		configPath, err = findProfileConfig()
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) && name == "default" {
+			if errors.Is(err, os.ErrNotExist) {
 				wd, wdErr := os.Getwd()
 				if wdErr != nil {
-					return runProfile{}, wdErr
+					return nil, wdErr
 				}
-				return runProfile{Name: name, Root: wd, Packages: []string{"./..."}}, nil
+				return &profileDefinitions{
+					root: wd, implicit: true,
+					profiles: map[string]rawProfile{"default": {Packages: []string{"./..."}}},
+				}, nil
 			}
-			return runProfile{}, err
+			return nil, err
 		}
 	}
 
 	absConfig, err := filepath.Abs(configPath)
 	if err != nil {
-		return runProfile{}, fmt.Errorf("resolving config path: %w", err)
+		return nil, fmt.Errorf("resolving config path: %w", err)
 	}
 	f, err := os.Open(absConfig)
 	if err != nil {
-		return runProfile{}, fmt.Errorf("opening profile config %q: %w", absConfig, err)
+		return nil, fmt.Errorf("opening profile config %q: %w", absConfig, err)
 	}
 	defer f.Close()
 
@@ -79,32 +86,49 @@ func loadRunProfile(configPath, name string) (runProfile, error) {
 	dec := yaml.NewDecoder(f)
 	dec.KnownFields(true)
 	if err := dec.Decode(&pf); err != nil {
-		return runProfile{}, fmt.Errorf("parsing profile config %q: %w", absConfig, err)
+		return nil, fmt.Errorf("parsing profile config %q: %w", absConfig, err)
 	}
 	var extra any
 	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
 		if err == nil {
-			return runProfile{}, fmt.Errorf("parsing profile config %q: multiple YAML documents are not supported", absConfig)
+			return nil, fmt.Errorf("parsing profile config %q: multiple YAML documents are not supported", absConfig)
 		}
-		return runProfile{}, fmt.Errorf("parsing profile config %q: %w", absConfig, err)
+		return nil, fmt.Errorf("parsing profile config %q: %w", absConfig, err)
 	}
 	if pf.Version != 1 {
-		return runProfile{}, fmt.Errorf("profile config %q has version %d; only version 1 is supported", absConfig, pf.Version)
+		return nil, fmt.Errorf("profile config %q has version %d; only version 1 is supported", absConfig, pf.Version)
 	}
 	if len(pf.Profiles) == 0 {
-		return runProfile{}, fmt.Errorf("profile config %q defines no profiles", absConfig)
+		return nil, fmt.Errorf("profile config %q defines no profiles", absConfig)
 	}
+	return &profileDefinitions{path: absConfig, root: filepath.Dir(absConfig), profiles: pf.Profiles}, nil
+}
 
-	resolved, err := resolveProfile(pf.Profiles, name)
+func (d *profileDefinitions) resolve(name string) (runProfile, error) {
+	if name == "" {
+		name = "default"
+	}
+	resolved, err := resolveProfile(d.profiles, name)
 	if err != nil {
-		return runProfile{}, fmt.Errorf("profile config %q: %w", absConfig, err)
+		if d.path != "" {
+			return runProfile{}, fmt.Errorf("profile config %q: %w", d.path, err)
+		}
+		return runProfile{}, err
 	}
 	resolved.Name = name
-	resolved.Root = filepath.Dir(absConfig)
+	resolved.Root = d.root
 	if len(resolved.Packages) == 0 {
 		resolved.Packages = []string{"./..."}
 	}
 	return resolved, nil
+}
+
+func loadRunProfile(configPath, name string) (runProfile, error) {
+	d, err := loadProfileDefinitions(configPath)
+	if err != nil {
+		return runProfile{}, err
+	}
+	return d.resolve(name)
 }
 
 func findProfileConfig() (string, error) {

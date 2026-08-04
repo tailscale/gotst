@@ -165,8 +165,12 @@ Scheduler, retries, and distribution:
 - [ ] Record duration observations on passes (including retry passes) and use
   robust historical estimates for longest-first scheduling rather than letting
   flakes, timeouts, or outliers poison estimates.
-- [ ] Define retry limits and the distinction between a failed run, a flaky
-  test, and an infrastructure failure.
+- [x] Add an initial retry policy: `-max-retries=N` permits N additional
+  attempts, fail-then-pass tests are reported as flaky and not cached as clean
+  passes, exhausted retries fail the run, and `-failfast` cancels other work
+  after retries are exhausted.
+- [ ] Further distinguish test failures from timeouts, signals, malformed test
+  protocol, and other infrastructure failures; define which are retryable.
 - [ ] Add a `gotst -retry` mode that persists the previous run's test outcomes
   and quickly selects only tests that failed on that run, skipping packages and
   tests that passed. Define the scope/identity of “previous run” across profiles,

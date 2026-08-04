@@ -44,6 +44,9 @@ var (
 	cacheRoot     = flag.String("cache-dir", "", "cache root (default: user cache directory/gotst)")
 	progressEvery = flag.Duration("progress", time.Second, "interval between aggregate progress updates (0 disables periodic updates)")
 	failFast      = flag.Bool("failfast", false, "stop queued and running tests after the first failure")
+	testCount     = flag.Int("count", 1, "run each test n times; explicitly setting this disables result caching")
+	maxRetries    = flag.Int("max-retries", 3, "maximum additional attempts after a test failure")
+	testCountSet  bool
 )
 
 func main() {
@@ -54,6 +57,11 @@ func main() {
 		return
 	}
 	flag.Parse()
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "count" {
+			testCountSet = true
+		}
+	})
 	if *jobs < 1 {
 		log.Fatal("-j must be at least 1")
 	}
@@ -63,22 +71,24 @@ func main() {
 	if *progressEvery < 0 {
 		log.Fatal("-progress must not be negative")
 	}
+	if *testCount < 1 {
+		log.Fatal("-count must be at least 1")
+	}
+	if *maxRetries < 0 {
+		log.Fatal("-max-retries must not be negative")
+	}
 	log.SetPrefix("gotst: ")
 	log.SetFlags(log.Flags() | log.Lmsgprefix)
 
-	var profileName string
-	switch flag.NArg() {
-	case 0:
-		profileName = "default"
-	case 1:
-		profileName = flag.Arg(0)
-	default:
-		log.Fatalf("usage: gotst [PROFILE]")
-	}
-	profile, err := loadRunProfile(*configFile, profileName)
+	defs, err := loadProfileDefinitions(*configFile)
 	if err != nil {
 		log.Fatal(err)
 	}
+	inv, err := parseInvocation(defs, flag.Args())
+	if err != nil {
+		log.Fatal(err)
+	}
+	profile := inv.profile
 	if *tags != "" {
 		profile.Tags = appendUnique(profile.Tags, splitCommaList(*tags)...)
 	}
@@ -86,7 +96,7 @@ func main() {
 		log.Printf("Using profile %q from %s", profile.Name, profile.Root)
 	}
 
-	s := NewServer(profile)
+	s := NewServer(profile, inv.tests)
 	if *extraSleep > 0 {
 		log.Printf("# cacheDir is %v", s.cacheDir)
 	}
@@ -109,6 +119,7 @@ type Server struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
 	profile   runProfile
+	tests     testSelection
 	testCache testResultCache
 
 	execSem chan bool // buffered chan semaphore to limit subprocesses
@@ -144,6 +155,7 @@ type testStatus struct {
 	passed   bool
 	passedIn time.Duration // valid if passed is true
 	fails    []failInfo
+	attempts int
 }
 
 type failInfo struct {
@@ -169,10 +181,10 @@ type goListPackage struct {
 	Root         string
 }
 
-func NewServer(profile runProfile) *Server {
+func NewServer(profile runProfile, tests testSelection) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	var cache testResultCache
-	if *useCache {
+	if *useCache && !testCountSet {
 		var err error
 		cache, err = newDiskTestCache(mustCacheRoot())
 		if err != nil {
@@ -185,6 +197,7 @@ func NewServer(profile runProfile) *Server {
 		ctx:       ctx,
 		cancel:    cancel,
 		profile:   profile,
+		tests:     tests,
 		testCache: cache,
 		execSem:   make(chan bool, *jobs),
 	}
@@ -201,8 +214,12 @@ func (s *Server) Run() (retErr error) {
 			s.setPhase(phaseDone)
 		}
 		s.printProgress()
+		s.printFlakySummary()
 	}()
 
+	if err := s.resolveQualifiedTests(); err != nil {
+		return fmt.Errorf("resolving test packages: %w", err)
+	}
 	if err := s.learnPackagesWithTests(); err != nil {
 		return fmt.Errorf("learnPackagesWithTests: %w", err)
 	}
@@ -262,6 +279,28 @@ func (p *goListPackage) hasTests() bool {
 	return len(p.TestGoFiles) > 0 || len(p.XTestGoFiles) > 0
 }
 
+func (s *Server) resolveQualifiedTests() error {
+	for i := range s.tests.qualified {
+		q := &s.tests.qualified[i]
+		args := []string{"list", "--tags=" + strings.Join(s.profile.Tags, ","), "-f={{.ImportPath}}", q.packageSpec}
+		cmd := exec.Command(goCmd(), args...)
+		cmd.Dir = s.profile.Root
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("resolving package %q: %w: %s", q.packageSpec, err, strings.TrimSpace(string(out)))
+		}
+		paths := strings.Fields(string(out))
+		if len(paths) != 1 {
+			return fmt.Errorf("package %q resolved to %d packages; want exactly one", q.packageSpec, len(paths))
+		}
+		q.packagePath = paths[0]
+		if !slices.Contains(s.profile.Packages, q.packageSpec) {
+			s.profile.Packages = append(s.profile.Packages, q.packageSpec)
+		}
+	}
+	return nil
+}
+
 func (s *Server) learnPackagesWithTests() error {
 	if *verbose {
 		log.Printf("Discovering packages with tests...")
@@ -289,11 +328,44 @@ func (s *Server) learnPackagesWithTests() error {
 				}
 				return fmt.Errorf("decoding package: %w", err)
 			}
-			if !excluded[pkg.ImportPath] {
+			if !excluded[pkg.ImportPath] && s.packageMayContainSelectedTest(pkg) {
 				s.addPackage(pkg)
 			}
 		}
 	})
+}
+
+func (s *Server) packageMayContainSelectedTest(pkg *goListPackage) bool {
+	if !s.tests.active() {
+		return true
+	}
+	if len(s.tests.packageTests(pkg.ImportPath)) > 0 {
+		return true
+	}
+	if len(s.tests.unqualified) == 0 {
+		return false
+	}
+	entries, err := os.ReadDir(pkg.Dir)
+	if err != nil {
+		return true
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), "_test.go") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(pkg.Dir, entry.Name()))
+		if err != nil {
+			// The source tree might be changing under us. Keep the package as a
+			// candidate and let compilation and -test.list be authoritative.
+			return true
+		}
+		for _, name := range s.tests.unqualified {
+			if bytes.Contains(data, []byte(name)) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (s *Server) resolveExcludedPackages() (map[string]bool, error) {
@@ -502,14 +574,13 @@ func (s *Server) buildAllTestBinaries() error {
 				case "output":
 					testOut.Add(ev.Package, ev.Output)
 				case "pass":
-					ej, ok := bytes.CutPrefix([]byte(testOut.Get(ev.Package)), []byte("ExecSnarf:"))
+					pkgOutput := testOut.Get(ev.Package)
+					es, ok, err := findExecSnarf(pkgOutput)
 					if !ok {
-						errs = append(errs, fmt.Errorf("test package %q built but test wrapper did not emit ExecSnarf line", ev.Package))
+						errs = append(errs, fmt.Errorf("test package %q built but test wrapper did not emit ExecSnarf line; wrapper output:\n%s", ev.Package, pkgOutput))
 						continue
 					}
-					ej, _, _ = bytes.Cut(ej, []byte{'\n'})
-					var es ExecSnarf
-					if err := json.Unmarshal(ej, &es); err != nil {
+					if err != nil {
 						errs = append(errs, fmt.Errorf("unmarshal ExecSnarf JSON from package %q: %w", ev.Package, err))
 						continue
 					}
@@ -528,6 +599,18 @@ func (s *Server) buildAllTestBinaries() error {
 		}
 		return nil
 	})
+}
+
+func findExecSnarf(output string) (es ExecSnarf, found bool, err error) {
+	for line := range strings.SplitSeq(output, "\n") {
+		jsonText, ok := strings.CutPrefix(line, "ExecSnarf:")
+		if !ok {
+			continue
+		}
+		err := json.Unmarshal([]byte(jsonText), &es)
+		return es, true, err
+	}
+	return ExecSnarf{}, false, nil
 }
 
 type outputMap struct {
@@ -633,6 +716,9 @@ func (s *Server) setPackageTests(pkg string, tests []string) {
 	}
 	ps.tests = make(map[string]*testStatus)
 	for _, test := range tests {
+		if !s.tests.wants(pkg, test) {
+			continue
+		}
 		ps.tests[test] = &testStatus{}
 		if isRunnableTopLevelTest(test) {
 			s.testsTotal++
@@ -670,7 +756,7 @@ func (s *Server) listAllTests() error {
 	t0 := time.Now()
 	bins := s.capturedTestBinaries()
 	if len(bins) == 0 {
-		return nil
+		return s.validateSelectedTests()
 	}
 	errs := make(chan error, len(bins))
 	for _, bin := range bins {
@@ -688,10 +774,35 @@ func (s *Server) listAllTests() error {
 	if err := errors.Join(all...); err != nil {
 		return err
 	}
+	if err := s.validateSelectedTests(); err != nil {
+		return err
+	}
 	if *verbose {
 		log.Printf("Listed tests in %d packages in %v", len(bins), time.Since(t0).Round(time.Millisecond))
 	}
 	return nil
+}
+
+func (s *Server) validateSelectedTests() error {
+	if !s.tests.active() {
+		return nil
+	}
+	found := make(map[string]bool)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for pkg, ps := range s.pkgs {
+		for test := range ps.tests {
+			if slices.Contains(s.tests.unqualified, test) {
+				found[test] = true
+			}
+			for _, q := range s.tests.qualified {
+				if q.packagePath == pkg && q.name == test {
+					found[q.packageSpec+"."+q.name] = true
+				}
+			}
+		}
+	}
+	return s.tests.describeMissing(found)
 }
 
 type cappedBuffer struct {
@@ -861,6 +972,9 @@ func (s *Server) runTest(task testTask) error {
 	}
 	bin := task.bin
 	baseArgs := profileTestArgs(bin.args, s.profile)
+	// gotst owns repetition and retries. Each child process is exactly one
+	// attempt even if captured/profile arguments contained another count.
+	baseArgs = setTestArg(baseArgs, "-test.count", "1")
 	if *failFast {
 		baseArgs = setTestArg(baseArgs, "-test.failfast", "true")
 	}
@@ -882,7 +996,7 @@ func (s *Server) runTest(task testTask) error {
 				s.mu.Lock()
 				s.cacheHits++
 				s.mu.Unlock()
-				s.finishTest(task, true, entry.PassedIn, nil)
+				s.finishTest(task, true, entry.PassedIn, nil, nil)
 				s.printTestResult(task, entry.PassedIn, true, true, "")
 				return nil
 			}
@@ -902,57 +1016,101 @@ func (s *Server) runTest(task testTask) error {
 	ps.tests[task.test].running = true
 	s.mu.Unlock()
 
-	t0 := time.Now()
+	var total time.Duration
+	var failures []failInfo
+	var cacheDeps []cacheDependency
+	for repetition := range *testCount {
+		for retry := 0; ; retry++ {
+			d, output, deps, err := s.runTestAttempt(task, key, baseArgs, repetition, retry)
+			total += d
+			s.recordTestAttempt(task)
+			if err == nil {
+				if len(failures) == 0 && *testCount == 1 {
+					cacheDeps = deps
+				}
+				break
+			}
+			if errors.Is(err, context.Canceled) {
+				s.stopRunningTest(task)
+				return err
+			}
+			failures = append(failures, failInfo{dur: d, out: output})
+			if retry == *maxRetries {
+				s.finishTest(task, false, total, failures, err)
+				s.printTestResult(task, d, false, false, output)
+				return err
+			}
+			if *verbose {
+				log.Printf("retrying %s/%s after attempt %d failed", bin.pkg, task.test, retry+1)
+			}
+		}
+	}
+
+	if len(failures) == 0 && s.testCache != nil && cacheDeps != nil {
+		entry := &testCacheEntry{
+			Version: testCacheVersion, Key: key, Created: time.Now().UTC(),
+			PassedIn: total, Dependencies: cacheDeps,
+		}
+		if putErr := s.testCache.Put(s.ctx, entry); putErr != nil && *verbose {
+			log.Printf("caching %s/%s: %v", bin.pkg, task.test, putErr)
+		}
+	}
+	s.finishTest(task, true, total, failures, nil)
+	s.printTestResult(task, total, false, true, "")
+	return nil
+}
+
+func (s *Server) runTestAttempt(task testTask, key testCacheKey, baseArgs []string, repetition, retry int) (time.Duration, string, []cacheDependency, error) {
 	var out cappedBuffer
 	out.max = *maxOutput
-	logPath := filepath.Join(s.cacheDir, "testlog-"+key.id())
+	logPath := filepath.Join(s.cacheDir, fmt.Sprintf("testlog-%s-%d-%d", key.id(), repetition, retry))
 	args := setTestArg(baseArgs, "-test.run", "^"+regexp.QuoteMeta(task.test)+"$")
 	if s.testCache != nil {
 		args = setTestArg(args, "-test.testlogfile", logPath)
 	}
-	cmd := exec.CommandContext(s.ctx, bin.absBin, args...)
-	cmd.Dir = bin.workDir
+	t0 := time.Now()
+	cmd := exec.CommandContext(s.ctx, task.bin.absBin, args...)
+	cmd.Dir = task.bin.workDir
 	cmd.Stdout = &out
 	cmd.Stderr = &out
 	err := cmd.Run()
 	d := time.Since(t0).Round(time.Millisecond)
-	if *failFast && s.ctx.Err() != nil {
+	if s.ctx.Err() != nil {
 		if s.testCache != nil {
 			os.Remove(logPath)
 		}
-		s.mu.Lock()
-		ps.tests[task.test].running = false
-		s.mu.Unlock()
-		return context.Canceled
+		return d, out.String(), nil, context.Canceled
 	}
+	var deps []cacheDependency
 	if err == nil && s.testCache != nil {
-		deps, depErr := parseTestLog(logPath, bin.workDir)
+		var depErr error
+		deps, depErr = parseTestLog(logPath, task.bin.workDir)
 		if depErr != nil {
+			deps = nil
 			if *verbose {
-				log.Printf("not caching %s/%s: %v", bin.pkg, task.test, depErr)
-			}
-		} else {
-			entry := &testCacheEntry{
-				Version:      testCacheVersion,
-				Key:          key,
-				Created:      time.Now().UTC(),
-				PassedIn:     d,
-				Dependencies: deps,
-			}
-			if putErr := s.testCache.Put(s.ctx, entry); putErr != nil && *verbose {
-				log.Printf("caching %s/%s: %v", bin.pkg, task.test, putErr)
+				log.Printf("not caching %s/%s: %v", task.bin.pkg, task.test, depErr)
 			}
 		}
 	}
 	if s.testCache != nil {
 		os.Remove(logPath)
 	}
-	s.finishTest(task, err == nil, d, err)
-	s.printTestResult(task, d, false, err == nil, out.String())
-	return err
+	return d, out.String(), deps, err
 }
 
-func (s *Server) finishTest(task testTask, passed bool, d time.Duration, err error) {
+func (s *Server) recordTestAttempt(task testTask) {
+	s.mu.Lock()
+	s.pkgs[task.bin.pkg].tests[task.test].attempts++
+	s.mu.Unlock()
+}
+
+func (s *Server) stopRunningTest(task testTask) {
+	s.mu.Lock()
+	s.pkgs[task.bin.pkg].tests[task.test].running = false
+	s.mu.Unlock()
+}
+
+func (s *Server) finishTest(task testTask, passed bool, d time.Duration, failures []failInfo, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	ps := s.pkgs[task.bin.pkg]
@@ -960,11 +1118,14 @@ func (s *Server) finishTest(task testTask, passed bool, d time.Duration, err err
 	ts.running = false
 	ts.done = true
 	ts.passed = passed
+	ts.fails = append(ts.fails, failures...)
 	if passed {
 		ts.passedIn = d
 	} else {
 		ps.numFails++
-		ps.runErr = err.Error()
+		if err != nil {
+			ps.runErr = err.Error()
+		}
 	}
 	ps.runIn += d
 	allDone := true

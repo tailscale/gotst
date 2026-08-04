@@ -6,6 +6,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"time"
 )
@@ -34,6 +35,7 @@ type progressSnapshot struct {
 	TestsTotal   int
 	TestsDone    int
 	TestsRunning int
+	TestsFlaky   int
 
 	CacheEnabled bool
 	CacheChecks  int
@@ -82,6 +84,9 @@ func (s *Server) progressSnapshot() progressSnapshot {
 			if ts.running {
 				p.TestsRunning++
 			}
+			if ts.passed && len(ts.fails) > 0 {
+				p.TestsFlaky++
+			}
 		}
 	}
 	return p
@@ -101,6 +106,9 @@ func (p progressSnapshot) line() string {
 		fmt.Fprintf(&b, "%d/%d test pkgs, %d/%d tests; %d running", p.PackagesDone, p.PackagesTotal, p.TestsDone, p.TestsTotal, p.TestsRunning)
 	}
 	if p.Phase == phaseTesting || p.Phase == phaseDone || p.Phase == phaseFailed {
+		if p.TestsFlaky > 0 {
+			fmt.Fprintf(&b, "; %d flaky", p.TestsFlaky)
+		}
 		if !p.CacheEnabled {
 			b.WriteString("; cache off")
 		} else if p.CacheChecks == 0 {
@@ -112,6 +120,46 @@ func (p progressSnapshot) line() string {
 	}
 	fmt.Fprintf(&b, "; %s", p.Elapsed)
 	return b.String()
+}
+
+type flakyTestSummary struct {
+	Package  string
+	Test     string
+	Attempts int
+	Failures int
+}
+
+func (s *Server) flakyTests() []flakyTestSummary {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var ret []flakyTestSummary
+	for pkg, ps := range s.pkgs {
+		for test, ts := range ps.tests {
+			if ts.passed && len(ts.fails) > 0 {
+				ret = append(ret, flakyTestSummary{pkg, test, ts.attempts, len(ts.fails)})
+			}
+		}
+	}
+	slices.SortFunc(ret, func(a, b flakyTestSummary) int {
+		if c := strings.Compare(a.Package, b.Package); c != 0 {
+			return c
+		}
+		return strings.Compare(a.Test, b.Test)
+	})
+	return ret
+}
+
+func (s *Server) printFlakySummary() {
+	flakes := s.flakyTests()
+	if len(flakes) == 0 {
+		return
+	}
+	s.outMu.Lock()
+	defer s.outMu.Unlock()
+	fmt.Fprintf(os.Stdout, "\nFLAKY TESTS (%d):\n", len(flakes))
+	for _, f := range flakes {
+		fmt.Fprintf(os.Stdout, "  %s %s: passed after %d attempts (%d failed)\n", f.Package, f.Test, f.Attempts, f.Failures)
+	}
 }
 
 func (s *Server) startProgressReporter() func() {

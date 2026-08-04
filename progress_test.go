@@ -35,9 +35,9 @@ func TestProgressLine(t *testing.T) {
 			p: progressSnapshot{
 				Phase: phaseTesting, PackagesDone: 12, PackagesTotal: 80,
 				TestsDone: 345, TestsTotal: 1000, TestsRunning: 4,
-				CacheEnabled: true, CacheChecks: 400, CacheHits: 300,
+				TestsFlaky: 2, CacheEnabled: true, CacheChecks: 400, CacheHits: 300,
 			},
-			want: []string{"testing", "12/80 test pkgs", "345/1000 tests", "4 running", "cache hits 300/400 (75.0%)"},
+			want: []string{"testing", "12/80 test pkgs", "345/1000 tests", "4 running", "2 flaky", "cache hits 300/400 (75.0%)"},
 		},
 		{
 			name: "done cache off",
