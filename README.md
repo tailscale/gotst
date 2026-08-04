@@ -2,10 +2,31 @@
 
 `gotst` is a wrapper around `go test` designed for both humans and CI.
 
+This README covers usage and behavior. See [DESIGN.md](DESIGN.md) for the
+execution architecture, subprocess protocols, scheduler, and cache internals.
+
 Running `gotst` selects the `default` profile from the nearest `.gotst.yml` in
 the current directory or one of its parents. Running `gotst NAME` selects a
 named profile. If no configuration exists, the implicit `default` profile runs
 `./...` from the current directory.
+
+Package and test arguments can further select what to run:
+
+```
+gotst ./foo/...                    # packages, using the default profile
+gotst TestFoo TestBar              # named tests in the default package set
+gotst tailscale.io/foo/bar.TestBaz # one fully qualified test
+gotst ./foo/bar.TestBaz            # the same with a relative package
+gotst full TestFreeBSDSubnetRouter # a named profile and test subset
+```
+
+An exact profile name in the first position selects that profile. Other
+non-test arguments are package patterns and replace the profile's configured
+package set. Test names begin with `Test`, `Fuzz`, or `Example`. For
+unqualified names, gotst scans test source files to avoid compiling
+unrelated test binaries, then always uses each compiled binary's `-test.list`
+output as the authoritative check after build-tag evaluation. The command
+fails if any requested test is not found.
 
 Example configuration:
 
@@ -44,19 +65,14 @@ maintains its own per-top-level-test cache. Successful results are stored below
 `-cache=false` to bypass result caching or `-cache-dir=PATH` to select a
 different cache root.
 
-Each entry is readable JSON and records the test identity, arguments, passing
-duration, and dependencies learned through `-test.testlogfile`. Environment
-dependencies include presence and a SHA-256 of the value (not the plaintext
-value). Opened regular files include a full content SHA-256 as well as
-stat/lstat metadata; directory opens include a deterministic directory-listing
-fingerprint. `stat` and `chdir` operations record filesystem metadata. A result
-is reused only if all recorded dependency fingerprints still match.
+Cache entries include dependencies observed by Go's test-log support. A result
+is reused only while those environment and filesystem inputs still match.
+Unreported inputs such as network services, time, and randomness cannot
+invalidate an entry automatically.
 
 The current scheduler executes each top-level test in its own process. This
-makes cache entries and invalidation attributable to individual tests, but it
-also repeats package initialization and `TestMain` and does not retain
-in-process `t.Parallel` scheduling across top-level tests. Hybrid batching is
-planned.
+makes cache entries and invalidation attributable to individual tests, at the
+cost of repeating package initialization and `TestMain`.
 
 ## Progress output
 
@@ -68,9 +84,33 @@ immediately. `-vlog` restores per-test success/cache-hit lines and internal
 diagnostics. Use `-progress=DURATION` to change the update interval or
 `-progress=0` to print only the final summary.
 
-Use `-failfast` to stop after the first test failure. gotst stops dispatching
-queued tests, cancels currently running test binaries, and also passes
-`-test.failfast=true` to each binary so subtest scheduling stops promptly.
+Use `-failfast` to stop after the first test exhausts its retries. gotst stops
+dispatching queued tests, cancels currently running test binaries, and also
+passes `-test.failfast=true` to each binary so subtest scheduling stops
+promptly.
+
+Omitting `-count` runs each top-level test once and permits result-cache reuse.
+Explicitly setting `-count=N` disables gotst result caching and runs each test
+N times; in particular, `-count=1` means one uncached run, matching the usual
+`go test -count=1` intent.
+
+Failed tests are retried up to `-max-retries` additional times (default 3). A
+test that fails one or more attempts and ultimately passes is considered flaky:
+the run succeeds, the test is not stored as a clean cache result, and gotst
+prints a `FLAKY TESTS` section in the final output. A test that still fails
+after all retries fails the run. `-failfast` takes effect after retries are
+exhausted. Automatic flake detection only observes tests that execute; a valid
+cache hit is skipped, so use explicit `-count=1` when actively investigating
+nondeterministic behavior.
+
+## External build caching
+
+On platforms with Unix-domain sockets, setting `GOCACHEPROG` makes gotst place
+a broker in front of the configured helper. Stock cmd/go can read linked test
+executables from an external cache but does not write newly linked executables
+to it. Gotst's broker supplies that missing write. This allows a later machine
+with an empty local `GOCACHE` to reuse the executable without linking it again.
+Cached executables are verified before execution.
 
 Its goals are:
 

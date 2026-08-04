@@ -1,0 +1,368 @@
+# gotst design
+
+This document describes gotst's current architecture and the implementation
+choices behind it. It is intended for contributors and for readers debugging a
+run. User-facing behavior and configuration belong in [README.md](README.md);
+future ideas and unfinished work belong in [NOTES.md](NOTES.md).
+
+## Goals and boundaries
+
+Gotst is a test runner built on the standard Go toolchain. It deliberately uses
+`go list`, `go test`, and ordinary test-binary flags instead of reimplementing
+package loading or `testing` package behavior.
+
+The core choices are:
+
+- discover and compile every selected package before running any test;
+- capture the compiled test executables, then invoke them directly;
+- schedule top-level tests independently with a process-wide concurrency
+  limit;
+- cache successful top-level tests using the executable and observed runtime
+  dependencies as the identity;
+- expose one synchronized state model to terminal progress and the web UI; and
+- augment, but remain compatible with, stock Go's `GOCACHEPROG` support.
+
+Gotst does not currently distribute work between machines, batch multiple
+top-level tests into one process, or provide a remote test-result cache. Those
+are possible extensions, not properties of the current architecture.
+
+## Process roles
+
+The gotst executable has three entry modes. `main` selects the two child modes
+before parsing normal command-line flags.
+
+1. **Runner.** The normal command owns configuration, discovery, compilation,
+   scheduling, result caching, progress, and the optional HTTP server.
+2. **Test-executable capture wrapper.** If `GOTST_EXEC_DEST` is present, gotst
+   is running under `go test -exec`. It captures the executable named by
+   `os.Args[1]`, emits an `ExecSnarf:` JSON record, and exits without running
+   the test.
+3. **Build-cache frontend.** With the private `-gotst-cache-shim` argument,
+   gotst bridges cmd/go's `GOCACHEPROG` connection to the broker owned by the
+   runner process.
+
+Using one binary for all three roles means `go test -exec` and `GOCACHEPROG`
+do not require separately installed helper programs.
+
+## Run pipeline
+
+`Server.Run` is a strict phase pipeline:
+
+```text
+invocation + profile
+        |
+        v
+  discover packages  -- go list
+        |
+        v
+  build and capture  -- go test -exec=<gotst>
+        |
+        v
+ enumerate tests     -- captured binary -test.list=.
+        |
+        v
+ cache check / run   -- one task per selected top-level test
+        |
+        v
+ final progress + flaky summary
+```
+
+The corresponding `runPhase` values are `discovering`, `building`, `listing`,
+`testing`, and then `done` or `failed`. A compilation failure stops the run
+before any test executes. This is intentional: build errors should be reported
+as build errors, rather than appearing after unrelated tests have run.
+
+Each run gets a private directory named `pid<PID>-t<TIMESTAMP>` below the gotst
+cache root. It holds captured executables, test logs, the broker socket, and
+materialized external-cache executables. `Server.Cleanup` removes it. At
+startup, gotst removes abandoned per-run directories whose recorded process is
+no longer alive. Persistent test results live outside this directory.
+
+## Invocation and profiles
+
+`loadProfileDefinitions` searches upward from the working directory for
+`.gotst.yml`, unless `-config` specifies a file. The configuration directory is
+the root for relative package patterns and subprocess working directories. If
+there is no configuration, gotst creates an implicit `default` profile rooted
+at the current directory with package pattern `./...`.
+
+Profiles may include other profiles. Resolution is a depth-first merge with
+cycle detection:
+
+- list fields append in include order and deduplicate;
+- explicitly set scalar values override included values; and
+- an empty final package list defaults to `./...`.
+
+`parseInvocation` then interprets positional arguments:
+
+- an exact profile name in the first position selects that profile;
+- identifiers beginning with `Test`, `Fuzz`, or `Example` select unqualified
+  tests;
+- an argument whose final dotted component is such a name selects a qualified
+  package/test pair; and
+- remaining arguments are package patterns and replace the profile package
+  list.
+
+Qualified package specifications are resolved to exactly one import path with
+`go list` and added to package discovery. The original specification is kept
+for useful not-found errors.
+
+## Package discovery and selection
+
+Discovery uses `go list -json` with the resolved profile's tags and package
+patterns. Exclusion patterns are separately resolved to import paths, so
+exclusions are compared canonically rather than as strings supplied by the
+user.
+
+When unqualified test names were requested, gotst scans `_test.go` files for
+those names and drops packages that cannot contain any requested test. This is
+only a link-time optimization. A read error conservatively keeps the package,
+qualified selections always keep their resolved package, and the captured
+binary's `-test.list` output remains authoritative after build constraints and
+code generation have taken effect.
+
+The reduced `goListPackage` type contains only fields gotst needs. Package and
+test status is stored by canonical import path in `Server.pkgs`.
+
+## Building and capturing test executables
+
+Gotst builds all packages in one command shaped like:
+
+```text
+go test -count=1 -p=<jobs> -trimpath -tags=<tags> -json \
+    -exec=<path-to-gotst> <import-paths...>
+```
+
+`-count=1` disables cmd/go's package-level test-result cache. Gotst owns result
+caching at top-level-test granularity. The command still compiles and links
+normal test executables, but cmd/go invokes gotst as the `-exec` wrapper instead
+of executing each one.
+
+The wrapper:
+
+1. hashes the executable with SHA-256;
+2. hard-links it into the run directory under that hash, or copies it if a
+   hard link is unavailable;
+3. records its working directory and cmd/go-provided test arguments; and
+4. prints one `ExecSnarf:<json>` line.
+
+The runner consumes cmd/go's JSON stream. Build output is retained separately
+from wrapper output so compile failures can identify the failing package. A
+successful wrapper record becomes `packageStatus.exeHash`, `workDir`, and
+`exeArgs`. Wrapper diagnostics may precede the record, so parsing searches for
+a complete line beginning with `ExecSnarf:` rather than assuming it is the
+first output.
+
+Captured files are content-addressed. Later code derives the executable hash
+from its basename; renaming that layout requires changing the test-cache key
+construction too.
+
+## Test enumeration
+
+After every selected package has built, gotst runs each captured executable
+with `-test.list=.`. Enumeration is concurrent but bounded by the shared
+`execSem`. The list is filtered through `testSelection`, and gotst then verifies
+that every explicitly requested test was found.
+
+Only names beginning with `Test`, `Fuzz`, or `Example` become scheduler tasks.
+This mirrors invocation selection but is intentionally a lexical check rather
+than an attempt to reproduce all internals of the `testing` package.
+
+One consequence of direct enumeration is that package initialization and
+`TestMain` execute once while listing and again for every scheduled test.
+Packages containing `TestMain` but no runnable top-level name currently produce
+no test task.
+
+## Scheduling and execution
+
+`runAllTests` creates one `testTask` for each selected `(package, test)` pair.
+A fixed worker pool of size `min(-j, number of tasks)` consumes those tasks.
+The `execSem`, also sized by `-j`, is the process-wide subprocess limit used by
+listing and test execution.
+
+Each task invokes its captured executable directly with an anchored
+`-test.run=^<quoted-name>$`. Arguments captured from cmd/go are normalized for
+direct execution: the private `-test.v=test2json` framing mode is removed, and
+profile short/timeout/test flags are applied. Gotst forces each child attempt
+to `-test.count=1`; repetition and retries are controlled by the parent.
+
+For `-count=N`, every requested repetition must eventually pass. Each failed
+attempt may be retried up to `-max-retries`. A task that fails and later passes
+is successful but flaky, and its result is not cached as a clean pass. An
+exhausted retry budget records a test failure.
+
+`-failfast` takes effect only after retries for a test are exhausted. The first
+such failure cancels `Server.ctx`, which stops dispatching queued tasks and
+kills running `exec.CommandContext` children. Cancellation errors from sibling
+tasks are suppressed; the primary test failure is retained.
+
+Test output is captured in a concurrency-safe `cappedBuffer`. Failures are
+printed immediately under `Server.outMu`; successful tests are quiet unless
+`-vlog` is enabled.
+
+### State and locking
+
+`Server.mu` protects package/test status, phase, counters, and fail-fast state.
+Code must not hold it while waiting for a subprocess or performing cache I/O.
+`Server.outMu` prevents progress and test output from interleaving.
+
+The principal state transitions are:
+
+```text
+package: discovered -> built -> testing -> done
+test:    pending -> running -> done(pass or fail)
+```
+
+Readers such as terminal progress and the HTTP handler freeze a view while
+holding `Server.mu`; they do not maintain separate execution state.
+
+## Test-result cache
+
+The test-result cache is independent of Go's build cache. Its narrow
+`testResultCache` interface has `Get` and `Put` operations so another storage
+backend can be added without coupling the scheduler to the disk layout.
+
+The versioned cache key contains:
+
+- captured test-binary SHA-256;
+- package import path and top-level test name;
+- package working directory; and
+- effective test arguments, excluding the per-task `-test.run` value.
+
+Entries are JSON below `test-results/v1` in the cache root and are installed by
+atomic rename. Only a clean, single-repetition pass is written. Explicitly
+supplying `-count`, even `-count=1`, disables result-cache reuse so it preserves
+the familiar `go test -count=1` intent.
+
+For an executed test, gotst asks the test binary to write the standard
+`-test.testlogfile`. `parseTestLog` snapshots dependencies reported by the Go
+runtime:
+
+- `getenv`: presence plus a SHA-256 of the value;
+- `open` on a regular file: stat/lstat metadata and full content hash;
+- `open` on a directory: metadata and a deterministic entry fingerprint; and
+- `stat` and `chdir`: filesystem metadata, resolving relative paths against the
+  working directory as it changes.
+
+`GODEBUG` is added explicitly because the runtime reads it without reporting it
+in the test log. Environment values are not stored in plaintext.
+
+On lookup, gotst recomputes every dependency fingerprint. A changed or
+unreadable dependency makes the entry unusable and the test runs normally.
+Cache errors are generally soft failures: with `-vlog` they are diagnosed, but
+they do not replace test execution.
+
+This mechanism can only invalidate on dependencies reported by Go's test-log
+hooks. Network services, subprocess behavior, time, randomness, and unreported
+system state are outside its current model.
+
+## External Go build-cache broker
+
+This subsystem is separate from the test-result cache. It is active only when
+the runner inherits `GOCACHEPROG`. The current broker transport is a Unix-domain
+socket, so this integration is currently limited to platforms that support
+that transport.
+
+Stock cmd/go asks an external cache for linker outputs but does not upload a
+newly linked executable to it. Gotst fills that gap without patching Go. The
+runner starts the configured helper itself and listens on a private Unix socket.
+The cmd/go child is given `GOCACHEPROG=<gotst> -gotst-cache-shim`; that shim is a
+byte bridge to the parent. Capture wrappers use a second connection type on the
+same socket to register linked executables.
+
+```text
+                         private Unix socket
+cmd/go <-> gotst shim  --------------------------+
+                                                   |
+capture wrapper --------------------------------> broker <-> real GOCACHEPROG
+                                                   |
+gotst runner owns lifecycle -----------------------+
+```
+
+The parent must own the real helper. Cmd/go can close its cache frontend before
+the final `-exec` wrapper registers its executable. Treating cmd/go's `close` as
+only the end of that frontend connection lets late registrations finish; the
+runner sends the real helper's `close` after the complete `go test` command has
+exited.
+
+### Cold executable path
+
+For a linker `get` miss, the broker records cmd/go's full 32-byte action ID,
+indexed by its first 15 bytes. Go embeds those same 120 bits as the first
+component of the executable build ID. When the capture wrapper registers the
+finished executable, the broker reads its build ID, recovers the full action
+ID, verifies the wrapper-provided hash and size, and sends a synthetic `put` to
+the real helper.
+
+Gotst never attempts to calculate the action ID. Cmd/go's value already covers
+the toolchain and all link inputs. If no matching miss was observed, the
+executable is simply not uploaded.
+
+### Warm executable path
+
+On a cache hit, ordinary non-executable objects pass through unchanged. For an
+executable-looking object, the broker verifies:
+
+- the object SHA-256 equals the helper's output ID; and
+- the first Go build-ID component equals the requested action-ID prefix.
+
+It then copies the object to a private executable path, applies executable
+permissions, and returns that path to cmd/go. A failed verification is converted
+to a cache miss, so an unverified cache artifact is never executed.
+
+The broker translates request IDs because concurrent cmd/go requests and
+synthetic puts share one downstream helper. JSON request bodies follow the
+standard base64-on-a-separate-line `GOCACHEPROG` framing. Compatibility fields
+for older helper names are accepted where practical.
+
+## Progress and HTTP status
+
+The progress reporter periodically obtains a `progressSnapshot` derived from
+the synchronized package/test state. It reports phase, package and test counts,
+running tests, flakes, and test-result-cache hit rates. The final snapshot is
+always printed, even when periodic progress is disabled.
+
+The optional HTTP server calls the same `Server` state through `statusData` and
+renders `root.tmpl.html`. It is currently a polling snapshot view, not an API or
+event stream, and its presentation state is intentionally secondary to the
+runner state.
+
+## Source map
+
+| File | Responsibility |
+| --- | --- |
+| `gotst.go` | Entry modes, `Server`, phase pipeline, discovery, capture, listing, scheduler, retries, and argument normalization |
+| `profile.go` | Configuration discovery, strict YAML decoding, includes, and resolved profiles |
+| `invocation.go` | Positional package/profile/test interpretation and selection matching |
+| `cache.go` | Per-run directories and cleanup of abandoned runs |
+| `testcache.go` | Persistent result-cache interface, disk backend, test-log parsing, and dependency fingerprints |
+| `cacheprog.go` | Parent-owned external build-cache client, socket broker, cmd/go frontend, executable association, and verification |
+| `progress.go` | Immutable progress snapshots, terminal reporting, and flaky summary |
+| `web.go` / `root.tmpl.html` | HTTP status projection and rendering |
+| `util.go` | Subprocess-output plumbing, Go binary discovery, and process checks |
+| `NOTES.md` | Known limitations and future design work |
+
+Tests generally live beside the subsystem they exercise. `cacheprog_test.go`
+uses a subprocess helper to test the real streaming protocol and, importantly,
+the lifecycle where cmd/go closes before a late executable registration.
+
+## Correctness invariants
+
+Changes should preserve these properties:
+
+- no selected test starts until every selected test package compiles;
+- source scanning may reduce work but never determines the authoritative test
+  inventory;
+- captured executable contents agree with their content-addressed filename;
+- a test-result hit is used only after all recorded dependencies validate;
+- flaky or failed executions are never stored as clean passing results;
+- fail-fast cancellation does not turn sibling cancellation into additional
+  test failures;
+- an executable from an external build cache is never run without content-hash
+  and Go build-ID verification; and
+- the real `GOCACHEPROG` helper outlives cmd/go's frontend and all capture
+  registrations.
+
+Run `go test ./...`, `go test -race ./...`, `go vet ./...`, and
+`git diff --check` after changes that affect concurrency, process protocols, or
+cache identity.
