@@ -47,6 +47,7 @@ var (
 	testCount     = flag.Int("count", 1, "run each test n times; explicitly setting this disables result caching")
 	maxRetries    = flag.Int("max-retries", 3, "maximum additional attempts after a test failure")
 	buildOnly     = flag.Bool("build-only", false, "build and capture selected test binaries without listing or running tests")
+	debugUncached = flag.Bool("debug-uncached", false, "run a cache-seeding pass, then diagnose tests that do not reuse it")
 	testCountSet  bool
 )
 
@@ -89,6 +90,20 @@ func main() {
 	}
 	if *maxRetries < 0 {
 		log.Fatal("-max-retries must not be negative")
+	}
+	if *debugUncached {
+		if testCountSet {
+			log.Fatal("-debug-uncached and -count are mutually exclusive")
+		}
+		if !*useCache {
+			log.Fatal("-debug-uncached requires -cache=true")
+		}
+		if *buildOnly {
+			log.Fatal("-debug-uncached and -build-only are mutually exclusive")
+		}
+		if *failFast {
+			log.Fatal("-debug-uncached and -failfast are mutually exclusive")
+		}
 	}
 	log.SetPrefix("gotst: ")
 	log.SetFlags(log.Flags() | log.Lmsgprefix)
@@ -146,20 +161,24 @@ type Server struct {
 	cacheChecks       int
 	cacheHits         int
 	failFastTriggered bool
+	debugPass         int
+	debugMisses       int
+	debugSeedErrors   map[string]string // test cache key ID -> why pass 1 did not seed it
 }
 
 type packageStatus struct {
 	glp *goListPackage
 
 	// following fields guarded by [Server.mu]
-	pkgState pkgState
-	exeHash  string // once known, the sha256 hex of test binary in Server.cacheDir
-	workDir  string
-	exeArgs  []string
-	tests    map[string]*testStatus
-	numFails int // number of tests in tests that failed
-	runErr   string
-	runIn    time.Duration
+	pkgState  pkgState
+	exeHash   string // once known, the sha256 hex of test binary in Server.cacheDir
+	exeCached bool   // executable was restored from the linked-binary cache
+	workDir   string
+	exeArgs   []string
+	tests     map[string]*testStatus
+	numFails  int // number of tests in tests that failed
+	runErr    string
+	runIn     time.Duration
 }
 
 type testStatus struct {
@@ -205,14 +224,15 @@ func NewServer(profile runProfile, tests testSelection) *Server {
 		}
 	}
 	return &Server{
-		start:     time.Now(),
-		cacheDir:  mustNewCacheDir(),
-		ctx:       ctx,
-		cancel:    cancel,
-		profile:   profile,
-		tests:     tests,
-		testCache: cache,
-		execSem:   make(chan bool, *jobs),
+		start:           time.Now(),
+		cacheDir:        mustNewCacheDir(),
+		ctx:             ctx,
+		cancel:          cancel,
+		profile:         profile,
+		tests:           tests,
+		testCache:       cache,
+		execSem:         make(chan bool, *jobs),
+		debugSeedErrors: make(map[string]string),
 	}
 }
 
@@ -251,8 +271,14 @@ func (s *Server) Run() (retErr error) {
 	}
 
 	s.setPhase(phaseTesting)
-	if err := s.runAllTests(); err != nil {
-		return err
+	if *debugUncached {
+		if err := s.runDebugUncached(); err != nil {
+			return err
+		}
+	} else {
+		if err := s.runAllTests(); err != nil {
+			return err
+		}
 	}
 
 	if *extraSleep > 0 {
@@ -260,6 +286,102 @@ func (s *Server) Run() (retErr error) {
 		time.Sleep(*extraSleep)
 	}
 	return nil
+}
+
+func (s *Server) runDebugUncached() error {
+	s.mu.Lock()
+	s.debugPass = 1
+	s.mu.Unlock()
+	log.Printf("debug-uncached: pass 1/2: running all tests to seed the result cache")
+	if err := s.runAllTests(); err != nil {
+		return fmt.Errorf("debug-uncached seed pass: %w", err)
+	}
+
+	s.mu.Lock()
+	s.debugPass = 2
+	s.cacheChecks = 0
+	s.cacheHits = 0
+	for _, ps := range s.pkgs {
+		if ps.exeHash == "" {
+			continue
+		}
+		ps.pkgState = pkgStateBuilt
+		ps.numFails = 0
+		ps.runErr = ""
+		ps.runIn = 0
+		for _, ts := range ps.tests {
+			*ts = testStatus{}
+		}
+	}
+	s.mu.Unlock()
+	log.Printf("debug-uncached: pass 2/2: verifying every seeded result is reused")
+	s.verifyDebugCache()
+	s.mu.Lock()
+	misses, checks, hits := s.debugMisses, s.cacheChecks, s.cacheHits
+	s.mu.Unlock()
+	if misses != 0 {
+		return fmt.Errorf("debug-uncached: %d/%d tests did not reuse the result cache (%d hits)", misses, checks, hits)
+	}
+	log.Printf("debug-uncached: all %d tests reused the seeded result cache", hits)
+	return nil
+}
+
+func (s *Server) verifyDebugCache() {
+	tasks := s.allTestTasks()
+	work := make(chan testTask)
+	var wg sync.WaitGroup
+	for range min(*jobs, len(tasks)) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for task := range work {
+				s.verifyDebugCacheTask(task)
+			}
+		}()
+	}
+	for _, task := range tasks {
+		work <- task
+	}
+	close(work)
+	wg.Wait()
+}
+
+func (s *Server) verifyDebugCacheTask(task testTask) {
+	key := s.cacheKeyForTask(task)
+	s.mu.Lock()
+	s.cacheChecks++
+	seedError := s.debugSeedErrors[key.id()]
+	s.mu.Unlock()
+	if seedError != "" {
+		s.reportDebugCacheMiss(task, key, "seed pass did not create a clean result", nil)
+		s.finishTest(task, true, 0, nil, nil)
+		return
+	}
+	entry, err := s.testCache.Get(s.ctx, key)
+	if err != nil {
+		reason := "cache entry missing after seed pass"
+		if !errors.Is(err, errTestCacheMiss) {
+			reason = "reading seeded cache entry: " + err.Error()
+		}
+		s.reportDebugCacheMiss(task, key, reason, nil)
+		s.finishTest(task, true, 0, nil, nil)
+		return
+	}
+	changes, err := changedDependencies(entry.Dependencies)
+	if err != nil {
+		s.reportDebugCacheMiss(task, key, "validating cached dependencies: "+err.Error(), nil)
+		s.finishTest(task, true, 0, nil, nil)
+		return
+	}
+	if len(changes) != 0 {
+		s.reportDebugCacheMiss(task, key, "recorded inputs changed", changes)
+		s.finishTest(task, true, 0, nil, nil)
+		return
+	}
+	s.mu.Lock()
+	s.cacheHits++
+	s.mu.Unlock()
+	s.finishTest(task, true, entry.PassedIn, nil, nil)
 }
 
 func (s *Server) Cleanup() {
@@ -629,7 +751,7 @@ func (s *Server) buildAllTestBinaries() error {
 						errs = append(errs, fmt.Errorf("unmarshal ExecSnarf JSON from package %q: %w", ev.Package, err))
 						continue
 					}
-					s.addTestBinary(ev.Package, es)
+					s.addTestBinary(ev.Package, es, shim.executableWasCached(es.ExeHash))
 				}
 			}
 		}
@@ -690,7 +812,7 @@ func (m *outputMap) Get(pkg string) string {
 	return buf.String()
 }
 
-func (s *Server) addTestBinary(pkg string, es ExecSnarf) {
+func (s *Server) addTestBinary(pkg string, es ExecSnarf, cached bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	ps, ok := s.pkgs[pkg]
@@ -700,6 +822,7 @@ func (s *Server) addTestBinary(pkg string, es ExecSnarf) {
 	}
 	ps.pkgState = pkgStateBuilt
 	ps.exeHash = es.ExeHash
+	ps.exeCached = cached
 	ps.workDir = es.WorkingDir
 	ps.exeArgs = slices.Clone(es.Args)
 
@@ -896,27 +1019,7 @@ func (s *Server) runAllTests() error {
 	if len(bins) == 0 {
 		return nil
 	}
-	var tasks []testTask
-	for _, bin := range bins {
-		s.mu.Lock()
-		ps := s.pkgs[bin.pkg]
-		tests := make([]string, 0, len(ps.tests))
-		for test := range ps.tests {
-			if isRunnableTopLevelTest(test) {
-				tests = append(tests, test)
-			}
-		}
-		s.mu.Unlock()
-		sort.Strings(tests)
-		for _, test := range tests {
-			tasks = append(tasks, testTask{bin: bin, test: test})
-		}
-		if len(tests) == 0 {
-			s.mu.Lock()
-			ps.pkgState = pkgStateDone
-			s.mu.Unlock()
-		}
-	}
+	tasks := s.allTestTasks()
 	if *verbose {
 		log.Printf("Running %d tests in %d packages with up to %d concurrent processes...", len(tasks), len(bins), *jobs)
 	}
@@ -971,7 +1074,6 @@ func (s *Server) runAllTests() error {
 		err := result.err
 		if err != nil {
 			if *failFast && s.failFastWasTriggered() && !result.primaryFailure {
-				// Expected cancellation of sibling work after the first failure.
 				continue
 			}
 			var ee *exec.ExitError
@@ -989,6 +1091,32 @@ func (s *Server) runAllTests() error {
 		return fmt.Errorf("%d test(s) failed", failed)
 	}
 	return nil
+}
+
+func (s *Server) allTestTasks() []testTask {
+	bins := s.capturedTestBinaries()
+	var tasks []testTask
+	for _, bin := range bins {
+		s.mu.Lock()
+		ps := s.pkgs[bin.pkg]
+		tests := make([]string, 0, len(ps.tests))
+		for test := range ps.tests {
+			if isRunnableTopLevelTest(test) {
+				tests = append(tests, test)
+			}
+		}
+		s.mu.Unlock()
+		sort.Strings(tests)
+		for _, test := range tests {
+			tasks = append(tasks, testTask{bin: bin, test: test})
+		}
+		if len(tests) == 0 {
+			s.mu.Lock()
+			ps.pkgState = pkgStateDone
+			s.mu.Unlock()
+		}
+	}
+	return tasks
 }
 
 func (s *Server) triggerFailFast() bool {
@@ -1014,8 +1142,29 @@ type testTask struct {
 	test string
 }
 
+func (s *Server) packageRoot(pkg string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pkgs[pkg].glp.Root
+}
+
 func isRunnableTopLevelTest(name string) bool {
 	return strings.HasPrefix(name, "Test") || strings.HasPrefix(name, "Fuzz") || strings.HasPrefix(name, "Example")
+}
+
+func (s *Server) cacheKeyForTask(task testTask) testCacheKey {
+	baseArgs := profileTestArgs(task.bin.args, s.profile)
+	baseArgs = setTestArg(baseArgs, "-test.count", "1")
+	if *failFast {
+		baseArgs = setTestArg(baseArgs, "-test.failfast", "true")
+	}
+	return testCacheKey{
+		BinarySHA256: binHash(task.bin.absBin),
+		Package:      task.bin.pkg,
+		Test:         task.test,
+		WorkingDir:   task.bin.workDir,
+		Args:         slices.Clone(baseArgs),
+	}
 }
 
 func (s *Server) runTest(task testTask) error {
@@ -1030,14 +1179,9 @@ func (s *Server) runTest(task testTask) error {
 	if *failFast {
 		baseArgs = setTestArg(baseArgs, "-test.failfast", "true")
 	}
-	key := testCacheKey{
-		BinarySHA256: binHash(bin.absBin),
-		Package:      bin.pkg,
-		Test:         task.test,
-		WorkingDir:   bin.workDir,
-		Args:         slices.Clone(baseArgs),
-	}
-	if s.testCache != nil {
+	key := s.cacheKeyForTask(task)
+	debugPass := s.currentDebugPass()
+	if s.testCache != nil && debugPass != 1 {
 		s.mu.Lock()
 		s.cacheChecks++
 		s.mu.Unlock()
@@ -1103,9 +1247,22 @@ func (s *Server) runTest(task testTask) error {
 			Version: testCacheVersion, Key: key, Created: time.Now().UTC(),
 			PassedIn: total, Dependencies: cacheDeps,
 		}
-		if putErr := s.testCache.Put(s.ctx, entry); putErr != nil && *verbose {
-			log.Printf("caching %s/%s: %v", bin.pkg, task.test, putErr)
+		if putErr := s.testCache.Put(s.ctx, entry); putErr != nil {
+			if debugPass == 1 {
+				s.setDebugSeedError(key, "writing cache entry: "+putErr.Error())
+			}
+			if *verbose {
+				log.Printf("caching %s/%s: %v", bin.pkg, task.test, putErr)
+			}
 		}
+	} else if debugPass == 1 {
+		reason := "test result was not cacheable"
+		if len(failures) != 0 {
+			reason = fmt.Sprintf("test passed only after %d failed attempt(s)", len(failures))
+		} else if cacheDeps == nil {
+			reason = "test input log could not be captured"
+		}
+		s.setDebugSeedError(key, reason)
 	}
 	s.finishTest(task, true, total, failures, nil)
 	s.printTestResult(task, total, false, true, "")
@@ -1136,9 +1293,12 @@ func (s *Server) runTestAttempt(task testTask, key testCacheKey, baseArgs []stri
 	var deps []cacheDependency
 	if err == nil && s.testCache != nil {
 		var depErr error
-		deps, depErr = parseTestLog(logPath, task.bin.workDir)
+		deps, depErr = parseTestLog(logPath, task.bin.workDir, s.packageRoot(task.bin.pkg))
 		if depErr != nil {
 			deps = nil
+			if s.currentDebugPass() == 1 {
+				s.setDebugSeedError(key, "parsing test input log: "+depErr.Error())
+			}
 			if *verbose {
 				log.Printf("not caching %s/%s: %v", task.bin.pkg, task.test, depErr)
 			}
@@ -1148,6 +1308,34 @@ func (s *Server) runTestAttempt(task testTask, key testCacheKey, baseArgs []stri
 		os.Remove(logPath)
 	}
 	return d, out.String(), deps, err
+}
+
+func (s *Server) currentDebugPass() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.debugPass
+}
+
+func (s *Server) setDebugSeedError(key testCacheKey, reason string) {
+	s.mu.Lock()
+	if s.debugSeedErrors[key.id()] == "" {
+		s.debugSeedErrors[key.id()] = reason
+	}
+	s.mu.Unlock()
+}
+
+func (s *Server) reportDebugCacheMiss(task testTask, key testCacheKey, reason string, details []string) {
+	s.mu.Lock()
+	s.debugMisses++
+	seedError := s.debugSeedErrors[key.id()]
+	s.mu.Unlock()
+	if seedError != "" {
+		reason += "; seed pass: " + seedError
+	}
+	log.Printf("debug-uncached: MISS %s/%s: %s", task.bin.pkg, task.test, reason)
+	for _, detail := range details {
+		log.Printf("debug-uncached:   %s", detail)
+	}
 }
 
 func (s *Server) recordTestAttempt(task testTask) {

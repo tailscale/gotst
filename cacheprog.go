@@ -259,6 +259,7 @@ type cacheShim struct {
 	mu       sync.Mutex
 	misses   map[string][]byte // 120-bit build-ID prefix -> full action ID
 	uploaded map[string]bool
+	execHit  map[string]bool // SHA-256 output ID of each executable cache hit
 }
 
 // runCacheShim runs in the child process started by cmd/go. The gotst parent
@@ -307,7 +308,7 @@ func startCacheShim(command, socket string, helperEnv ...string) (*cacheShim, er
 	}
 	shim := &cacheShim{
 		downstream: downstream, execDir: execDir, listener: ln, socket: socket, endpoint: socket,
-		misses: make(map[string][]byte), uploaded: make(map[string]bool),
+		misses: make(map[string][]byte), uploaded: make(map[string]bool), execHit: make(map[string]bool),
 	}
 	shim.acceptDone = make(chan struct{})
 	go shim.acceptLoop()
@@ -334,7 +335,7 @@ func startRunCacheShim(command string, helperEnv ...string) (*cacheShim, error) 
 		shim := &cacheShim{
 			downstream: downstream, execDir: execDir, listener: ln,
 			endpoint: "tcp:" + ln.Addr().String(), socketDir: execDir,
-			misses: make(map[string][]byte), uploaded: make(map[string]bool),
+			misses: make(map[string][]byte), uploaded: make(map[string]bool), execHit: make(map[string]bool),
 		}
 		shim.acceptDone = make(chan struct{})
 		go shim.acceptLoop()
@@ -457,9 +458,18 @@ func (s *cacheShim) forward(ctx context.Context, req cacheProgRequest) (*cachePr
 			return &cacheProgResponse{Miss: true}, nil
 		}
 		res.DiskPath = path
+		s.mu.Lock()
+		s.execHit[hex.EncodeToString(res.OutputID)] = true
+		s.mu.Unlock()
 		s.execHits.Add(1)
 	}
 	return res, nil
+}
+
+func (s *cacheShim) executableWasCached(outputHash string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.execHit[outputHash]
 }
 
 func (s *cacheShim) recordMiss(actionID []byte) {

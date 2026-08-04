@@ -30,6 +30,7 @@ type progressSnapshot struct {
 	PackagesDiscovered int
 	PackagesTotal      int
 	PackagesBuilt      int
+	PackagesCached     int
 	PackagesListed     int
 	PackagesDone       int
 
@@ -69,6 +70,9 @@ func (s *Server) progressSnapshot() progressSnapshot {
 		}
 		if ps.exeHash != "" {
 			p.PackagesBuilt++
+			if ps.exeCached {
+				p.PackagesCached++
+			}
 		}
 		if ps.tests != nil {
 			p.PackagesListed++
@@ -101,12 +105,12 @@ func (p progressSnapshot) line() string {
 	case phaseDiscovering:
 		fmt.Fprintf(&b, "%d pkgs matched; %d with tests", p.PackagesDiscovered, p.PackagesTotal)
 	case phaseBuilding:
-		fmt.Fprintf(&b, "%d pkgs matched, %d with tests; %d/%d test pkgs compiled", p.PackagesDiscovered, p.PackagesTotal, p.PackagesBuilt, p.PackagesTotal)
+		p.writeBuildProgress(&b)
 	case phaseListing:
 		fmt.Fprintf(&b, "%d pkgs matched, %d with tests; %d/%d test pkgs listed; %d tests found", p.PackagesDiscovered, p.PackagesTotal, p.PackagesListed, p.PackagesTotal, p.TestsTotal)
 	case phaseDone, phaseFailed:
 		if p.BuildOnly {
-			fmt.Fprintf(&b, "%d pkgs matched, %d with tests; %d/%d test pkgs compiled", p.PackagesDiscovered, p.PackagesTotal, p.PackagesBuilt, p.PackagesTotal)
+			p.writeBuildProgress(&b)
 			break
 		}
 		fallthrough
@@ -128,6 +132,16 @@ func (p progressSnapshot) line() string {
 	}
 	fmt.Fprintf(&b, "; %s", p.Elapsed)
 	return b.String()
+}
+
+func (p progressSnapshot) writeBuildProgress(b *strings.Builder) {
+	fmt.Fprintf(b, "%d/%d test pkgs; %d/%d built", p.PackagesTotal, p.PackagesDiscovered, p.PackagesBuilt, p.PackagesTotal)
+	if p.PackagesBuilt == 0 {
+		fmt.Fprintf(b, " (%d cached)", p.PackagesCached)
+		return
+	}
+	pct := 100 * float64(p.PackagesCached) / float64(p.PackagesBuilt)
+	fmt.Fprintf(b, " (%d cached, %.1f%%)", p.PackagesCached, pct)
 }
 
 type flakyTestSummary struct {

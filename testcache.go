@@ -20,7 +20,7 @@ import (
 	"time"
 )
 
-const testCacheVersion = 1
+const testCacheVersion = 2
 
 var errTestCacheMiss = errors.New("test result cache miss")
 
@@ -179,7 +179,7 @@ func safeCacheName(s string) string {
 	return b.String()
 }
 
-func parseTestLog(path, workDir string) ([]cacheDependency, error) {
+func parseTestLog(path, workDir, packageRoot string) ([]cacheDependency, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -209,6 +209,13 @@ func parseTestLog(path, workDir string) ([]cacheDependency, error) {
 				path = filepath.Join(pwd, path)
 			}
 			path = filepath.Clean(path)
+			// Match cmd/go's test cache: open and stat outside the package's
+			// module, GOPATH, or GOROOT root are not rechecked. In particular,
+			// creating a temporary file records an internal open of the shared
+			// temp root, which is bookkeeping rather than a test input.
+			if op != "chdir" && !pathWithinRoot(path, packageRoot) {
+				continue
+			}
 			fd, err := fingerprintPath(path, op == "open")
 			if err != nil {
 				return nil, fmt.Errorf("fingerprinting %s %q: %w", op, path, err)
@@ -226,6 +233,14 @@ func parseTestLog(path, workDir string) ([]cacheDependency, error) {
 		return nil, err
 	}
 	return deduplicateDependencies(deps), nil
+}
+
+func pathWithinRoot(path, root string) bool {
+	if root == "" {
+		return false
+	}
+	rel, err := filepath.Rel(root, path)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 func environmentDependency(name string) cacheDependency {
@@ -313,25 +328,84 @@ func writeFileState(w io.Writer, info fs.FileInfo) {
 }
 
 func validateDependencies(deps []cacheDependency) (bool, error) {
+	changes, err := changedDependencies(deps)
+	return len(changes) == 0, err
+}
+
+func changedDependencies(deps []cacheDependency) ([]string, error) {
+	var changes []string
 	for _, old := range deps {
-		var current cacheDependency
-		switch old.Operation {
-		case "getenv":
-			current = environmentDependency(old.Name)
-		case "open", "stat", "chdir":
-			fd, err := fingerprintPath(old.Path, old.Operation == "open")
-			if err != nil {
-				return false, err
-			}
-			current = cacheDependency{Operation: old.Operation, Name: old.Name, Path: old.Path, File: fd}
-		default:
-			return false, fmt.Errorf("unknown cached dependency operation %q", old.Operation)
+		current, err := currentDependency(old)
+		if err != nil {
+			return nil, err
 		}
 		if !dependenciesEqual(old, current) {
-			return false, nil
+			changes = append(changes, describeDependencyChange(old, current))
 		}
 	}
-	return true, nil
+	return changes, nil
+}
+
+func currentDependency(old cacheDependency) (cacheDependency, error) {
+	switch old.Operation {
+	case "getenv":
+		return environmentDependency(old.Name), nil
+	case "open", "stat", "chdir":
+		fd, err := fingerprintPath(old.Path, old.Operation == "open")
+		if err != nil {
+			return cacheDependency{}, err
+		}
+		return cacheDependency{Operation: old.Operation, Name: old.Name, Path: old.Path, File: fd}, nil
+	default:
+		return cacheDependency{}, fmt.Errorf("unknown cached dependency operation %q", old.Operation)
+	}
+}
+
+func describeDependencyChange(old, current cacheDependency) string {
+	if old.Operation == "getenv" {
+		return fmt.Sprintf("getenv %q changed (%s -> %s)", old.Name, environmentSummary(old), environmentSummary(current))
+	}
+	return fmt.Sprintf("%s %q changed (%s -> %s)", old.Operation, old.Path, fileDependencySummary(old.File), fileDependencySummary(current.File))
+}
+
+func environmentSummary(dep cacheDependency) string {
+	if dep.Present == nil || !*dep.Present {
+		return "unset"
+	}
+	return "set, sha256=" + shortHash(dep.ValueSHA256)
+}
+
+func fileDependencySummary(dep *fileDependency) string {
+	if dep == nil {
+		return "no fingerprint"
+	}
+	if !dep.Exists {
+		if dep.Error != "" {
+			return "missing/error=" + dep.Error
+		}
+		return "missing"
+	}
+	var parts []string
+	if dep.Stat != nil {
+		parts = append(parts, fmt.Sprintf("size=%d mode=%s mtime=%s", dep.Stat.Size, dep.Stat.Mode, dep.Stat.ModTime.UTC().Format(time.RFC3339Nano)))
+	}
+	if dep.ContentSHA256 != "" {
+		parts = append(parts, "content="+shortHash(dep.ContentSHA256))
+	}
+	if dep.DirectorySHA256 != "" {
+		parts = append(parts, "directory="+shortHash(dep.DirectorySHA256))
+	}
+	if dep.Error != "" {
+		parts = append(parts, "error="+dep.Error)
+	}
+	return strings.Join(parts, " ")
+}
+
+func shortHash(hash string) string {
+	if len(hash) > 12 {
+		return hash[:12]
+	}
+	return hash
 }
 
 func dependenciesEqual(a, b cacheDependency) bool {

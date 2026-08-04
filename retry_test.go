@@ -118,6 +118,46 @@ func TestRetryAndCountEndToEnd(t *testing.T) {
 			t.Fatalf("attempt count after warm run = %d; want 1", got)
 		}
 	})
+
+	t.Run("debug uncached verifies stable test", func(t *testing.T) {
+		dir := makeAttemptModule(t, 0)
+		out, err := runGotstFixture(exe, dir, "-debug-uncached", "-cache-dir="+t.TempDir())
+		if err != nil {
+			t.Fatalf("debug-uncached failed: %v\n%s", err, out)
+		}
+		if !strings.Contains(out, "debug-uncached: all 1 tests reused the seeded result cache") {
+			t.Fatalf("debug-uncached did not verify the cache hit:\n%s", out)
+		}
+		if got := readAttemptCount(t, dir); got != 1 {
+			t.Fatalf("test process ran %d times, want once plus one cached verification", got)
+		}
+	})
+
+	t.Run("debug uncached diagnoses changed input", func(t *testing.T) {
+		dir := makeUnstableCacheModule(t)
+		out, err := runGotstFixture(exe, dir, "-debug-uncached", "-j=1", "-cache-dir="+t.TempDir())
+		if err == nil {
+			t.Fatalf("debug-uncached unexpectedly succeeded:\n%s", out)
+		}
+		for _, want := range []string{
+			"debug-uncached: MISS unstablecache/TestRead: recorded inputs changed",
+			"open ",
+			"shared-input\" changed",
+			"1/2 tests did not reuse the result cache (1 hits)",
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("debug output missing %q:\n%s", want, out)
+			}
+		}
+	})
+
+	t.Run("debug uncached rejects count", func(t *testing.T) {
+		dir := makeAttemptModule(t, 0)
+		out, err := runGotstFixture(exe, dir, "-debug-uncached", "-count=1")
+		if err == nil || !strings.Contains(out, "-debug-uncached and -count are mutually exclusive") {
+			t.Fatalf("debug-uncached with count: err=%v\n%s", err, out)
+		}
+	})
 }
 
 func makeAttemptModule(t *testing.T, failUntil int) string {
@@ -153,6 +193,36 @@ func TestAttempts(t *testing.T) {
 	if err != nil { t.Fatal(err) }
 	failUntil, _ := strconv.Atoi(string(data))
 	if n <= failUntil { t.Fatalf("intentional failure %d", n) }
+}
+`)
+	return dir
+}
+
+func makeUnstableCacheModule(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	write := func(name, content string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("go.mod", "module unstablecache\n\ngo 1.25.1\n")
+	write("unstable.go", "package unstablecache\n")
+	write("shared-input", "before")
+	write("unstable_test.go", `package unstablecache
+
+import (
+	"os"
+	"testing"
+)
+
+func TestRead(t *testing.T) {
+	if _, err := os.ReadFile("shared-input"); err != nil { t.Fatal(err) }
+}
+
+func TestWrite(t *testing.T) {
+	if err := os.WriteFile("shared-input", []byte("after"), 0600); err != nil { t.Fatal(err) }
 }
 `)
 	return dir

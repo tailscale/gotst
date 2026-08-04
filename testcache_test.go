@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -76,7 +77,7 @@ func TestParseAndValidateTestLog(t *testing.T) {
 	if err := os.WriteFile(logPath, []byte(log), 0600); err != nil {
 		t.Fatal(err)
 	}
-	deps, err := parseTestLog(logPath, dir)
+	deps, err := parseTestLog(logPath, dir, dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,6 +103,42 @@ func TestParseAndValidateTestLog(t *testing.T) {
 	}
 	if ok, err := validateDependencies(deps); err != nil || ok {
 		t.Fatalf("file-changed validation = %v, %v", ok, err)
+	}
+}
+
+func TestParseTestLogIgnoresPathsOutsidePackageRoot(t *testing.T) {
+	root := t.TempDir()
+	external := t.TempDir()
+	inside := filepath.Join(root, "inside")
+	outside := filepath.Join(external, "outside")
+	for _, path := range []string{inside, outside} {
+		if err := os.WriteFile(path, []byte("one"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	logPath := filepath.Join(root, "testlog.txt")
+	log := fmt.Sprintf("# test log\nopen %s\nstat %s\nopen %s\nstat %s\n", inside, inside, outside, outside)
+	if err := os.WriteFile(logPath, []byte(log), 0600); err != nil {
+		t.Fatal(err)
+	}
+	deps, err := parseTestLog(logPath, root, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := len(deps), 3; got != want { // GODEBUG, open inside, stat inside
+		t.Fatalf("got %d dependencies, want %d: %+v", got, want, deps)
+	}
+	if err := os.WriteFile(outside, []byte("two"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := validateDependencies(deps); err != nil || !ok {
+		t.Fatalf("external change invalidated entry: %v, %v", ok, err)
+	}
+	if err := os.WriteFile(inside, []byte("two"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := validateDependencies(deps); err != nil || ok {
+		t.Fatalf("in-root change did not invalidate entry: %v, %v", ok, err)
 	}
 }
 
@@ -183,7 +220,7 @@ func TestInputs(t *testing.T) {
 	assertCached(run("one"), true)
 	assertCached(run("two"), false)
 
-	matches, err := filepath.Glob(filepath.Join(cacheDir, "test-results", "v1", "*", "*", "TestInputs-*.json"))
+	matches, err := filepath.Glob(filepath.Join(cacheDir, "test-results", fmt.Sprintf("v%d", testCacheVersion), "*", "*", "TestInputs-*.json"))
 	if err != nil || len(matches) != 1 {
 		t.Fatalf("cache entries = %q, %v; want one", matches, err)
 	}

@@ -74,4 +74,7 @@ func TestNeverRuns(t *testing.T) { t.Fatal("test ran") }
 	if !bytes.Contains(out.Bytes(), []byte("linked executable cache: 1 hit(s), 0 put(s)")) {
 		t.Fatalf("second build did not reuse linked executable:\n%s", &out)
 	}
+	if !bytes.Contains(out.Bytes(), []byte("1/1 test pkgs; 1/1 built (1 cached, 100.0%)")) {
+		t.Fatalf("second build progress did not report cached executable:\n%s", &out)
+	}
 }
