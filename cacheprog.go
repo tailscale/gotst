@@ -24,14 +24,17 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 const (
 	cacheShimSocketEnv = "GOTST_CACHE_SHIM_SOCKET"
 	cacheShimArg       = "-gotst-cache-shim"
+	localCacheProgArg  = "-gotst-local-cache-prog"
 	cacheConnCmdGo     = byte('C')
 	cacheConnRegister  = byte('R')
 )
@@ -85,7 +88,7 @@ type cacheProgClient struct {
 	readErr error
 }
 
-func startCacheProgClient(command string) (*cacheProgClient, error) {
+func startCacheProgClient(command string, extraEnv ...string) (*cacheProgClient, error) {
 	args, err := splitQuoted(command)
 	if err != nil {
 		return nil, fmt.Errorf("parsing GOCACHEPROG: %w", err)
@@ -94,7 +97,8 @@ func startCacheProgClient(command string) (*cacheProgClient, error) {
 		return nil, errors.New("empty GOCACHEPROG")
 	}
 	cmd := exec.Command(args[0], args[1:]...)
-	cmd.Env = envWithout(os.Environ(), "GOCACHEPROG", cacheShimSocketEnv)
+	cmd.Env = append(envWithout(os.Environ(), "GOCACHEPROG", cacheShimSocketEnv,
+		localCacheDirEnv, stockGoCacheDirEnv), extraEnv...)
 	cmd.Stderr = os.Stderr
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -240,12 +244,17 @@ type executableRegistration struct {
 }
 
 type cacheShim struct {
-	downstream *cacheProgClient
-	execDir    string
-	listener   net.Listener
-	socket     string
-	acceptDone chan struct{}
-	connWG     sync.WaitGroup
+	downstream        *cacheProgClient
+	execDir           string
+	directExecutables bool // downstream paths are gotst-owned and executable
+	listener          net.Listener
+	socket            string
+	endpoint          string
+	socketDir         string
+	acceptDone        chan struct{}
+	connWG            sync.WaitGroup
+	execHits          atomic.Int64
+	execPuts          atomic.Int64
 
 	mu       sync.Mutex
 	misses   map[string][]byte // 120-bit build-ID prefix -> full action ID
@@ -261,7 +270,7 @@ func runCacheShim() error {
 	if socket == "" {
 		return errors.New("missing cache shim socket")
 	}
-	conn, err := net.Dial("unix", socket)
+	conn, err := dialCacheEndpoint(socket)
 	if err != nil {
 		return err
 	}
@@ -279,8 +288,8 @@ func runCacheShim() error {
 	return err
 }
 
-func startCacheShim(command, socket string) (*cacheShim, error) {
-	downstream, err := startCacheProgClient(command)
+func startCacheShim(command, socket string, helperEnv ...string) (*cacheShim, error) {
+	downstream, err := startCacheProgClient(command, helperEnv...)
 	if err != nil {
 		return nil, err
 	}
@@ -297,12 +306,59 @@ func startCacheShim(command, socket string) (*cacheShim, error) {
 		return nil, err
 	}
 	shim := &cacheShim{
-		downstream: downstream, execDir: execDir, listener: ln, socket: socket,
+		downstream: downstream, execDir: execDir, listener: ln, socket: socket, endpoint: socket,
 		misses: make(map[string][]byte), uploaded: make(map[string]bool),
 	}
 	shim.acceptDone = make(chan struct{})
 	go shim.acceptLoop()
 	return shim, nil
+}
+
+func startRunCacheShim(command string, helperEnv ...string) (*cacheShim, error) {
+	if runtime.GOOS == "windows" {
+		downstream, err := startCacheProgClient(command, helperEnv...)
+		if err != nil {
+			return nil, err
+		}
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			_ = downstream.close()
+			return nil, err
+		}
+		execDir, err := os.MkdirTemp("", "gotst-cache-executables-")
+		if err != nil {
+			_ = ln.Close()
+			_ = downstream.close()
+			return nil, err
+		}
+		shim := &cacheShim{
+			downstream: downstream, execDir: execDir, listener: ln,
+			endpoint: "tcp:" + ln.Addr().String(), socketDir: execDir,
+			misses: make(map[string][]byte), uploaded: make(map[string]bool),
+		}
+		shim.acceptDone = make(chan struct{})
+		go shim.acceptLoop()
+		return shim, nil
+	}
+	dir, err := os.MkdirTemp("", "gotst-cache-socket-")
+	if err != nil {
+		return nil, err
+	}
+	socket := filepath.Join(dir, "cache.sock")
+	shim, err := startCacheShim(command, socket, helperEnv...)
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		return nil, err
+	}
+	shim.socketDir = dir
+	return shim, nil
+}
+
+func dialCacheEndpoint(endpoint string) (net.Conn, error) {
+	if address, ok := strings.CutPrefix(endpoint, "tcp:"); ok {
+		return net.Dial("tcp", address)
+	}
+	return net.Dial("unix", endpoint)
 }
 
 func (s *cacheShim) serveCmdGo(r io.Reader, w io.Writer) error {
@@ -401,6 +457,7 @@ func (s *cacheShim) forward(ctx context.Context, req cacheProgRequest) (*cachePr
 			return &cacheProgResponse{Miss: true}, nil
 		}
 		res.DiskPath = path
+		s.execHits.Add(1)
 	}
 	return res, nil
 }
@@ -427,6 +484,14 @@ func (s *cacheShim) materializeExecutable(actionID []byte, res *cacheProgRespons
 	gotHash, _, err := hashFile(res.DiskPath)
 	if err != nil || !bytes.Equal(gotHash, res.OutputID) {
 		return "", false
+	}
+	if s.directExecutables {
+		if runtime.GOOS == "windows" {
+			return res.DiskPath, true
+		}
+		if fi, err := os.Stat(res.DiskPath); err == nil && fi.Mode().IsRegular() && fi.Mode()&0100 != 0 {
+			return res.DiskPath, true
+		}
 	}
 	target := filepath.Join(s.execDir, hex.EncodeToString(res.OutputID))
 	if fi, err := os.Stat(target); err == nil && fi.Mode().IsRegular() {
@@ -482,7 +547,12 @@ func (s *cacheShim) close() error {
 	_ = s.listener.Close()
 	<-s.acceptDone
 	s.connWG.Wait()
-	_ = os.Remove(s.socket)
+	if s.socket != "" {
+		_ = os.Remove(s.socket)
+	}
+	if s.socketDir != "" {
+		_ = os.RemoveAll(s.socketDir)
+	}
 	return s.downstream.close()
 }
 
@@ -542,12 +612,18 @@ func (s *cacheShim) registerExecutable(reg executableRegistration) error {
 	if res.DiskPath == "" {
 		return errors.New("GOCACHEPROG executable put returned no disk path")
 	}
+	if s.directExecutables && runtime.GOOS != "windows" {
+		if err := os.Chmod(res.DiskPath, 0700); err != nil {
+			return fmt.Errorf("marking cached executable: %w", err)
+		}
+	}
 	uploaded = true
+	s.execPuts.Add(1)
 	return nil
 }
 
 func registerTestExecutable(socket, path, outputHash string, size int64) error {
-	conn, err := net.Dial("unix", socket)
+	conn, err := dialCacheEndpoint(socket)
 	if err != nil {
 		return err
 	}

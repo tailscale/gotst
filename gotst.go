@@ -57,6 +57,12 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) == 2 && os.Args[1] == localCacheProgArg {
+		if err := runLocalCacheProg(); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	if dir := os.Getenv("GOTST_EXEC_DEST"); dir != "" {
 		// We're running as a test binary under "go test -exec".
 		// Just capture our output to the given directory and exit.
@@ -558,14 +564,31 @@ func (s *Server) buildAllTestBinaries() error {
 	cmd.Env = append(envWithout(os.Environ(), "GOTST_EXEC_DEST"), "GOTST_EXEC_DEST="+s.cacheDir)
 	var shim *cacheShim
 	if realCacheProg := os.Getenv("GOCACHEPROG"); realCacheProg != "" {
-		socket := filepath.Join(s.cacheDir, "cache-shim.sock")
-		shim, err = startCacheShim(realCacheProg, socket)
+		shim, err = startRunCacheShim(realCacheProg)
 		if err != nil {
 			return fmt.Errorf("starting GOCACHEPROG shim: %w", err)
 		}
 		cmd.Env = append(envWithout(cmd.Env, "GOCACHEPROG", cacheShimSocketEnv),
 			"GOCACHEPROG="+quoteCacheProgArg(selfExe)+" "+cacheShimArg,
-			cacheShimSocketEnv+"="+socket,
+			cacheShimSocketEnv+"="+shim.endpoint,
+		)
+	} else {
+		stockCache, err := goBuildCacheDir(s.profile.Root)
+		if err != nil {
+			return fmt.Errorf("locating Go build cache: %w", err)
+		}
+		localDir := filepath.Join(mustCacheRoot(), "build-cache", "v1")
+		shim, err = startRunCacheShim(quoteCacheProgArg(selfExe)+" "+localCacheProgArg,
+			localCacheDirEnv+"="+localDir,
+			stockGoCacheDirEnv+"="+stockCache,
+		)
+		if err != nil {
+			return fmt.Errorf("starting local build cache: %w", err)
+		}
+		shim.directExecutables = true
+		cmd.Env = append(envWithout(cmd.Env, "GOCACHEPROG", cacheShimSocketEnv),
+			"GOCACHEPROG="+quoteCacheProgArg(selfExe)+" "+cacheShimArg,
+			cacheShimSocketEnv+"="+shim.endpoint,
 		)
 	}
 	err = processCmdOutput(cmd, func(r io.Reader) error {
@@ -623,6 +646,9 @@ func (s *Server) buildAllTestBinaries() error {
 	})
 	if shim != nil {
 		err = errors.Join(err, shim.close())
+		if *verbose {
+			log.Printf("linked executable cache: %d hit(s), %d put(s)", shim.execHits.Load(), shim.execPuts.Load())
+		}
 	}
 	return err
 }

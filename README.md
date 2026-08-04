@@ -111,12 +111,18 @@ nondeterministic behavior.
 
 ## External build caching
 
-On platforms with Unix-domain sockets, setting `GOCACHEPROG` makes gotst place
-a broker in front of the configured helper. Stock cmd/go can read linked test
-executables from an external cache but does not write newly linked executables
-to it. Gotst's broker supplies that missing write. This allows a later machine
-with an empty local `GOCACHE` to reuse the executable without linking it again.
-Cached executables are verified before execution.
+Stock cmd/go does not normally retain linked test executables. When
+`GOCACHEPROG` is unset, gotst automatically adds a persistent local build cache
+below its cache root. It reads through to the ordinary Go build cache, so an
+existing warm `GOCACHE` remains useful, while retaining linked test executables
+for later gotst runs. The first run writes those large artifacts and can be
+slower; subsequent unchanged runs avoid linking them.
+
+When `GOCACHEPROG` is set, gotst instead places the same broker in front of the
+configured helper. This allows a machine with an empty local `GOCACHE` to reuse
+executables linked by another run or machine. Cached executables are verified
+before execution. The private broker transport uses Unix-domain sockets on
+Unix and loopback TCP on Windows.
 
 Its goals are:
 

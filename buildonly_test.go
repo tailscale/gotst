@@ -51,6 +51,8 @@ func TestNeverRuns(t *testing.T) { t.Fatal("test ran") }
 
 	cmd := exec.Command(exe, "-listen=", "-build-only", "-progress=0")
 	cmd.Dir = dir
+	cacheDir := filepath.Join(t.TempDir(), "cache")
+	cmd.Args = append(cmd.Args, "-cache-dir="+cacheDir)
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out
@@ -59,5 +61,17 @@ func TestNeverRuns(t *testing.T) { t.Fatal("test ran") }
 	}
 	if _, err := os.Stat(filepath.Join(dir, "test-binary-ran")); !os.IsNotExist(err) {
 		t.Fatalf("test binary ran; stat error = %v\noutput:\n%s", err, &out)
+	}
+
+	cmd = exec.Command(exe, "-listen=", "-build-only", "-progress=0", "-vlog", "-cache-dir="+cacheDir)
+	cmd.Dir = dir
+	out.Reset()
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("second gotst -build-only: %v\n%s", err, &out)
+	}
+	if !bytes.Contains(out.Bytes(), []byte("linked executable cache: 1 hit(s), 0 put(s)")) {
+		t.Fatalf("second build did not reuse linked executable:\n%s", &out)
 	}
 }

@@ -45,7 +45,7 @@ are possible extensions, not properties of the current architecture.
 
 ## Process roles
 
-The gotst executable has three entry modes. `main` selects the two child modes
+The gotst executable has four entry modes. `main` selects the three child modes
 before parsing normal command-line flags.
 
 1. **Runner.** The normal command owns configuration, discovery, compilation,
@@ -57,6 +57,9 @@ before parsing normal command-line flags.
 3. **Build-cache frontend.** With the private `-gotst-cache-shim` argument,
    gotst bridges cmd/go's `GOCACHEPROG` connection to the broker owned by the
    runner process.
+4. **Local build-cache helper.** With the private `-gotst-local-cache-prog`
+   argument, gotst serves the standard cache protocol from its persistent local
+   store with read-through fallback to the ordinary Go disk cache.
 
 Using one binary for all three roles means `go test -exec` and `GOCACHEPROG`
 do not require separately installed helper programs.
@@ -280,12 +283,23 @@ system state are outside its current model.
 
 ## External Go build-cache broker
 
-This subsystem is separate from the test-result cache. It is active only when
-the runner inherits `GOCACHEPROG`. The current broker transport is a Unix-domain
-socket, so this integration is currently limited to platforms that support
-that transport. It primarily addresses fresh-disk and cross-machine builds; it
-is not part of the common local-development path, where `GOCACHEPROG` is usually
-unset and the ordinary Go disk cache remains authoritative.
+This subsystem is separate from the test-result cache. The broker is used in
+both performance environments, with different downstream helpers:
+
+- when the runner inherits `GOCACHEPROG`, that configured helper remains the
+  downstream cache for fresh-disk and cross-machine reuse; and
+- when `GOCACHEPROG` is unset, gotst automatically starts its own persistent
+  local helper below `build-cache/v1` in the gotst cache root.
+
+The automatic helper is a two-tier cache. It writes new package artifacts and
+linked executables into gotst's cache. On a miss, it reads the stable v1 action
+record from the ordinary `GOCACHE` read-only. This preserves the value of a
+developer's already-warm Go cache without requiring gotst to write cmd/go's
+internal disk format or locking protocol. The first run pays additional I/O to
+persist linked executables; later unchanged runs can skip their link actions.
+
+The runner and its frontend/capture children communicate over a private
+Unix-domain socket on Unix and a loopback-only TCP listener on Windows.
 
 Stock cmd/go asks an external cache for linker outputs but does not upload a
 newly linked executable to it. Gotst fills that gap without patching Go. The
@@ -360,7 +374,8 @@ runner state.
 | `invocation.go` | Positional package/profile/test interpretation and selection matching |
 | `cache.go` | Per-run directories and cleanup of abandoned runs |
 | `testcache.go` | Persistent result-cache interface, disk backend, test-log parsing, and dependency fingerprints |
-| `cacheprog.go` | Parent-owned external build-cache client, socket broker, cmd/go frontend, executable association, and verification |
+| `cacheprog.go` | Parent-owned build-cache client, private broker transport, cmd/go frontend, executable association, and verification |
+| `localcache.go` | Automatic persistent local build-cache helper and read-only fallback to the ordinary Go disk cache |
 | `progress.go` | Immutable progress snapshots, terminal reporting, and flaky summary |
 | `web.go` / `root.tmpl.html` | HTTP status projection and rendering |
 | `util.go` | Subprocess-output plumbing, Go binary discovery, and process checks |

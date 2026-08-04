@@ -271,6 +271,10 @@ Build tags and caching:
 - [ ] Design test annotations for cacheability, isolation, resource needs, and
   other scheduling properties.
 - [ ] Verify integration requirements for gomodfs and gocached.
+- [ ] Add size/age accounting and eviction for the automatic persistent local
+  build cache. Linked test executables are large, and the first implementation
+  intentionally prioritizes correctness and measurable reuse over a complete
+  retention policy.
 - [ ] Define a versioned cache-service protocol behind the existing internal
   `testResultCache` interface. Support a long-lived child process in the style
   of `GOCACHEPROG`, then a network/database implementation, without exposing
