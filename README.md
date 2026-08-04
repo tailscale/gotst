@@ -28,6 +28,12 @@ unrelated test binaries, then always uses each compiled binary's `-test.list`
 output as the authoritative check after build-tag evaluation. The command
 fails if any requested test is not found.
 
+Use `-build-only` to discover packages and build/link the selected test
+binaries without listing or running their tests. This is useful for warming the
+Go build cache or an external `GOCACHEPROG` cache. Because test binaries are not
+listed in this mode, requested test names are only source-level build-pruning
+hints and are not authoritatively checked for existence.
+
 Example configuration:
 
 ```yaml

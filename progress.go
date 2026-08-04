@@ -23,8 +23,9 @@ const (
 )
 
 type progressSnapshot struct {
-	Phase   runPhase
-	Elapsed time.Duration
+	Phase     runPhase
+	Elapsed   time.Duration
+	BuildOnly bool
 
 	PackagesDiscovered int
 	PackagesTotal      int
@@ -54,6 +55,7 @@ func (s *Server) progressSnapshot() progressSnapshot {
 	p := progressSnapshot{
 		Phase:              s.phase,
 		Elapsed:            time.Since(s.start).Round(time.Second),
+		BuildOnly:          *buildOnly,
 		PackagesDiscovered: len(s.pkgs),
 		PackagesTotal:      s.pkgsWithTests,
 		TestsTotal:         s.testsTotal,
@@ -102,10 +104,16 @@ func (p progressSnapshot) line() string {
 		fmt.Fprintf(&b, "%d pkgs matched, %d with tests; %d/%d test pkgs compiled", p.PackagesDiscovered, p.PackagesTotal, p.PackagesBuilt, p.PackagesTotal)
 	case phaseListing:
 		fmt.Fprintf(&b, "%d pkgs matched, %d with tests; %d/%d test pkgs listed; %d tests found", p.PackagesDiscovered, p.PackagesTotal, p.PackagesListed, p.PackagesTotal, p.TestsTotal)
+	case phaseDone, phaseFailed:
+		if p.BuildOnly {
+			fmt.Fprintf(&b, "%d pkgs matched, %d with tests; %d/%d test pkgs compiled", p.PackagesDiscovered, p.PackagesTotal, p.PackagesBuilt, p.PackagesTotal)
+			break
+		}
+		fallthrough
 	default:
 		fmt.Fprintf(&b, "%d/%d test pkgs, %d/%d tests; %d running", p.PackagesDone, p.PackagesTotal, p.TestsDone, p.TestsTotal, p.TestsRunning)
 	}
-	if p.Phase == phaseTesting || p.Phase == phaseDone || p.Phase == phaseFailed {
+	if (p.Phase == phaseTesting || p.Phase == phaseDone || p.Phase == phaseFailed) && !p.BuildOnly {
 		if p.TestsFlaky > 0 {
 			fmt.Fprintf(&b, "; %d flaky", p.TestsFlaky)
 		}

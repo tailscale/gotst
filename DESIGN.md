@@ -22,6 +22,23 @@ The core choices are:
 - expose one synchronized state model to terminal progress and the web UI; and
 - augment, but remain compatible with, stock Go's `GOCACHEPROG` support.
 
+Gotst is intended to make two important environments fast:
+
+- **Ephemeral CI and VM workers.** These machines may start every run with a
+  fresh disk and therefore cannot benefit from a previous local Go build cache.
+  A shared cache reached through `GOCACHEPROG` should let them reuse compiled
+  packages and linked test executables across machines and runs.
+- **Local development on macOS, Linux, and Windows.** Developers repeatedly
+  edit, build, and run focused tests on a persistent workstation. In this mode
+  `GOCACHEPROG` will usually be unset. Gotst must still be fast by cooperating
+  with Go's ordinary local build cache, avoiding unnecessary package links and
+  test-binary startup, selecting only relevant work, and reusing valid local
+  per-test results and learned scheduling/resource history.
+
+Neither environment is a fallback for the other. Features and defaults should
+not require a remote cache to provide good laptop behavior, and local-only
+optimizations should not assume a warm persistent disk on ephemeral workers.
+
 Gotst does not currently distribute work between machines, batch multiple
 top-level tests into one process, or provide a remote test-result cache. Those
 are possible extensions, not properties of the current architecture.
@@ -71,6 +88,11 @@ The corresponding `runPhase` values are `discovering`, `building`, `listing`,
 `testing`, and then `done` or `failed`. A compilation failure stops the run
 before any test executes. This is intentional: build errors should be reported
 as build errors, rather than appearing after unrelated tests have run.
+
+With `-build-only`, a successful run stops after the build-and-capture phase.
+It does not invoke captured binaries for `-test.list` and therefore neither
+executes package initialization/`TestMain` nor validates requested test names
+against the compiled test inventory.
 
 Each run gets a private directory named `pid<PID>-t<TIMESTAMP>` below the gotst
 cache root. It holds captured executables, test logs, the broker socket, and
@@ -261,7 +283,9 @@ system state are outside its current model.
 This subsystem is separate from the test-result cache. It is active only when
 the runner inherits `GOCACHEPROG`. The current broker transport is a Unix-domain
 socket, so this integration is currently limited to platforms that support
-that transport.
+that transport. It primarily addresses fresh-disk and cross-machine builds; it
+is not part of the common local-development path, where `GOCACHEPROG` is usually
+unset and the ordinary Go disk cache remains authoritative.
 
 Stock cmd/go asks an external cache for linker outputs but does not upload a
 newly linked executable to it. Gotst fills that gap without patching Go. The

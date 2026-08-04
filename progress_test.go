@@ -44,6 +44,14 @@ func TestProgressLine(t *testing.T) {
 			p:    progressSnapshot{Phase: phaseDone, PackagesDone: 2, PackagesTotal: 2, TestsDone: 10, TestsTotal: 10},
 			want: []string{"done", "2/2 test pkgs", "10/10 tests", "0 running", "cache off"},
 		},
+		{
+			name: "build only done",
+			p: progressSnapshot{
+				Phase: phaseDone, BuildOnly: true, PackagesDiscovered: 300,
+				PackagesTotal: 282, PackagesBuilt: 282, CacheEnabled: true,
+			},
+			want: []string{"done", "300 pkgs matched", "282 with tests", "282/282 test pkgs compiled"},
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			got := tt.p.line()

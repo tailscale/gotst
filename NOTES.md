@@ -150,6 +150,34 @@ Correctness and hardening:
 
 Scheduler, retries, and distribution:
 
+- [ ] Split build and test concurrency shortly. Add `-build-j` for cmd/go's
+  package/build action parallelism and `-test-j` for concurrently running test
+  binaries, retaining `-j` as a convenient shorthand that sets both. They have
+  different memory and CPU profiles and should not be forced to share one
+  limit.
+- [ ] Add memory-aware test admission after concurrency is split. Measure and
+  persist a conservative peak-memory estimate per top-level test, keyed by at
+  least binary/configuration, test arguments, GOOS, and GOARCH; schedule only
+  when both a test-process slot and a configured memory budget are available.
+  Give unseen tests a conservative default, include headroom/high-percentile
+  behavior rather than trusting one observation, and treat OOM/signal outcomes
+  as resource observations rather than ordinary test failures. Investigate
+  process-tree accounting (for example cgroups on Linux and job objects on
+  Windows), since parent RSS alone misses child processes. Keep `-test-j` as a
+  hard ceiling even with weighted admission, and use `-build-j` as the initial
+  practical bound for cmd/go, whose per-action memory is less observable.
+- [ ] Investigate whether test-binary construction ever repeats stale shared
+  dependency work, and whether build ordering can reduce it. Today gotst passes
+  all selected test packages to one `go test` invocation, so cmd/go should
+  construct one action DAG, compile a shared dependency such as `pkg/heavy`
+  once, and make both test-binary link actions wait for it. Verify that with
+  `-x`/build traces and cache metrics on a large cold or partially stale tree.
+  If duplicate work exists—or if future scheduling splits test-package builds
+  across cmd/go processes—compute the union of dependencies needed by all test
+  packages and evaluate an explicit compile/prewarm barrier before starting
+  top-level test links. Preserve test-only dependencies, build tags, cgo and
+  other build modes, and avoid doing a second full package-loading pass unless
+  measurements show a net benefit.
 - [ ] Define a versioned protocol/API for a statistics and history store. Before
   a run, gotst should be able to query estimated durations for the discovered
   tests so it can compute an approximate uncached-work denominator, show useful

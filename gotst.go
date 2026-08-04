@@ -46,6 +46,7 @@ var (
 	failFast      = flag.Bool("failfast", false, "stop queued and running tests after the first failure")
 	testCount     = flag.Int("count", 1, "run each test n times; explicitly setting this disables result caching")
 	maxRetries    = flag.Int("max-retries", 3, "maximum additional attempts after a test failure")
+	buildOnly     = flag.Bool("build-only", false, "build and capture selected test binaries without listing or running tests")
 	testCountSet  bool
 )
 
@@ -233,6 +234,9 @@ func (s *Server) Run() (retErr error) {
 	s.setPhase(phaseBuilding)
 	if err := s.buildAllTestBinaries(); err != nil {
 		return fmt.Errorf("buildAllTestBinaries: %w", err)
+	}
+	if *buildOnly {
+		return nil
 	}
 
 	s.setPhase(phaseListing)
