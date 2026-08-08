@@ -178,14 +178,16 @@ Scheduler, retries, and distribution:
   top-level test links. Preserve test-only dependencies, build tags, cgo and
   other build modes, and avoid doing a second full package-loading pass unless
   measurements show a net benefit.
-- [ ] Define a versioned protocol/API for a statistics and history store. Before
+- [x] Define and implement a versioned protocol/API for a statistics and history store. Before
   a run, gotst should be able to query estimated durations for the discovered
   tests so it can compute an approximate uncached-work denominator, show useful
   overall progress, schedule longest work first, and balance shards. After each
   run, it should record successful test durations and attempt outcomes needed
   to measure flakes over time. Define test identity, build/configuration keys,
   aggregation/windowing, missing-history behavior, schema evolution, batching,
-  and behavior when the store is unavailable.
+  and behavior when the store is unavailable. The initial local and HTTP
+  stores, portable key/dependency schema, and PostgreSQL query plan are in
+  `history.go` and `DESIGN.md`; scheduling does not consume the data yet.
 - [ ] Decide how duration estimates compose into progress. Parallel work means
   summed test CPU-time is not wall-clock time; distinguish total estimated work
   from estimated critical-path/wall time, and update estimates as uncached tests

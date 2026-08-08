@@ -80,6 +80,26 @@ The current scheduler executes each top-level test in its own process. This
 makes cache entries and invalidation attributable to individual tests, at the
 cost of repeating package initialization and `TestMain`.
 
+## Test history
+
+Gotst records advisory per-test history by default below the operating system's
+user cache directory (`~/.cache/gotst/history/v1` on typical Linux systems), or
+the selected `-cache-dir`. History contains recent outcomes, durations, attempt
+counts, and portable dependency shapes. It is separate from the test-result
+cache: history can inform scheduling, but never causes a test to be treated as
+passing.
+
+Use `-history=off` to disable history. In a shared production environment,
+`-history=https://history.example/base` uses the versioned HTTP API instead;
+`GOTST_HISTORY_TOKEN` supplies an optional bearer token. History service and
+local history failures are soft failures and do not stop tests.
+
+The current implementation collects and retrieves history but does not yet
+change scheduling. It establishes the storage and protocol needed for future
+duration- and memory-aware scheduling and conservative batching. See
+[DESIGN.md](DESIGN.md#test-history) for identity, protocol, and database
+details.
+
 ## Progress output
 
 By default gotst prints one aggregate status line per second and a final

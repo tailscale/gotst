@@ -306,6 +306,200 @@ This mechanism can only invalidate on dependencies reported by Go's test-log
 hooks. Network services, subprocess behavior, time, randomness, and unreported
 system state are outside its current model.
 
+## Test history
+
+Test history is scheduling evidence, not a result cache. The narrow
+`testHistoryStore` interface performs one batched lookup before execution and
+one batched record at the end of a run. The default implementation is local;
+an HTTP implementation supports a shared production service. Backend errors
+are reported with `-vlog` and otherwise ignored so history availability cannot
+affect whether tests run or whether a run passes.
+
+The scheduler does not consume the retrieved histories yet. Recording and
+transport are implemented first so useful data accumulates before
+history-driven scheduling is enabled.
+
+### Identity and observations
+
+A history key contains the package import path, top-level test name, GOOS,
+GOARCH, sorted build tags, and effective test arguments. Its ID is the SHA-256
+of a versioned canonical encoding. It deliberately omits the test-binary hash,
+source revision, and checkout directory: duration, memory, and dependency-shape
+evidence should survive an edit and should be shareable between machines. A
+binary hash remains mandatory in the separate correctness-sensitive result
+cache.
+
+Each completed, actually executed test contributes an observation containing:
+
+- a unique idempotency ID and UTC timestamp;
+- `pass`, `fail`, or `flaky` outcome;
+- total duration and number of attempts;
+- observed test-log dependency shape; and
+- a reserved peak-RSS field for memory-aware admission.
+
+A result-cache hit does not fabricate a duration observation. Dependency
+history retains operations and environment-variable names but not environment
+values or file contents. Package-relative and module-relative paths use
+`$PACKAGE` and `$MODULE` prefixes. External paths are represented by a
+non-reversible short hash plus basename, avoiding usernames and absolute paths
+while conservatively preventing unlike machine layouts from matching. A null
+dependency list means capture failed; an empty list means capture succeeded
+and saw no inputs.
+
+When retries or explicit repetitions produce multiple input logs, the
+observation records their union. If any attempt's input capture fails, the
+whole observation's dependency shape is unknown rather than pretending that a
+partial union is complete.
+
+Gotst requests `-test.testlogfile` whenever either history or result caching is
+enabled. It parses the log even after a failed test, because failure history is
+also useful for batching and flake policy. The local store keeps the newest 32
+observations per key under the gotst user cache:
+
+```text
+history/v1/<first-key-hash-byte>/<key-hash>/<observation-id-hash>.json
+```
+
+One atomically renamed file per observation makes concurrent gotst processes
+safe without a cross-platform file lock or lossy read-modify-write. Writes are
+idempotent by observation ID. Retention pruning is opportunistic; a concurrent
+writer may temporarily leave more than 32 files, and a later write converges
+the directory to the bound.
+
+### HTTP API
+
+`-history=https://host/base` selects the remote store. Requests are JSON POSTs,
+have a five-second client timeout, and include `Authorization: Bearer
+<GOTST_HISTORY_TOKEN>` when that environment variable is set. The base URL may
+include a path. Version 1 has two operations:
+
+```http
+POST /base/v1/history/lookup
+Content-Type: application/json
+
+{"version":1,"keys":[{"package":"example.com/p","test":"TestX","goos":"linux","goarch":"amd64"}],"limit":32}
+```
+
+```json
+{"version":1,"histories":[{"version":1,"key":{"package":"example.com/p","test":"TestX","goos":"linux","goarch":"amd64"},"observations":[{"id":"...","observed_at":"2026-08-08T12:00:00Z","outcome":"pass","duration_ns":1200000,"attempts":1,"dependencies":[{"operation":"getenv","name":"GODEBUG"}]}]}]}
+```
+
+```http
+POST /base/v1/history/record
+Content-Type: application/json
+
+{"version":1,"observations":[...]}
+```
+
+Lookup returns at most `limit` newest observations for each key. Record is
+idempotent by observation ID and may return `204 No Content`. The server must
+reject unsupported versions and invalid outcomes, sizes, or key/observation
+associations. Request authentication and tenant/repository authorization are
+deployment concerns; the wire format intentionally contains no
+Tailscale-specific fields.
+
+### PostgreSQL schema and queries
+
+The HTTP service can compute the same canonical key hash as the client and use
+the following initial schema. `scope_id` is derived from authentication or the
+configured service/base URL rather than trusted client JSON; it isolates
+repositories or tenants that happen to use the same import path. JSON arrays
+preserve the protocol representation without requiring joins for fields that
+are only returned as key metadata.
+
+```sql
+CREATE TABLE test_history_key (
+    scope_id uuid NOT NULL,
+    key_hash bytea NOT NULL CHECK (octet_length(key_hash) = 32),
+    package text NOT NULL,
+    test_name text NOT NULL,
+    goos text NOT NULL,
+    goarch text NOT NULL,
+    tags jsonb NOT NULL,
+    args jsonb NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    last_observed_at timestamptz NOT NULL,
+    PRIMARY KEY (scope_id, key_hash)
+);
+
+CREATE TABLE test_history_observation (
+    scope_id uuid NOT NULL,
+    observation_id text NOT NULL,
+    key_hash bytea NOT NULL,
+    FOREIGN KEY (scope_id, key_hash)
+        REFERENCES test_history_key(scope_id, key_hash)
+        ON DELETE CASCADE,
+    observed_at timestamptz NOT NULL,
+    outcome text NOT NULL CHECK (outcome IN ('pass', 'fail', 'flaky')),
+    duration_ns bigint NOT NULL CHECK (duration_ns >= 0),
+    attempts integer NOT NULL CHECK (attempts > 0),
+    peak_rss_bytes bigint CHECK (peak_rss_bytes IS NULL OR peak_rss_bytes >= 0),
+    dependencies jsonb,
+    PRIMARY KEY (scope_id, observation_id)
+);
+
+CREATE INDEX test_history_observation_key_time
+    ON test_history_observation
+       (scope_id, key_hash, observed_at DESC, observation_id)
+    INCLUDE (outcome, duration_ns, attempts, peak_rss_bytes);
+
+CREATE INDEX test_history_key_last_observed
+    ON test_history_key (scope_id, last_observed_at);
+
+CREATE INDEX test_history_observation_time
+    ON test_history_observation (scope_id, observed_at);
+```
+
+`observation_id` is opaque text so protocol evolution does not bind the server
+to one UUID representation. Batched lookup uses the key/time index and one
+index-limited scan per requested hash:
+
+```sql
+SELECT requested.ordinality, o.*
+FROM unnest($1::bytea[]) WITH ORDINALITY AS requested(key_hash, ordinality)
+CROSS JOIN LATERAL (
+    SELECT observation_id, key_hash, observed_at, outcome, duration_ns,
+           attempts, peak_rss_bytes, dependencies
+    FROM test_history_observation
+    WHERE scope_id = $2 AND key_hash = requested.key_hash
+    ORDER BY observed_at DESC, observation_id
+    LIMIT $3
+) AS o
+ORDER BY requested.ordinality, o.observed_at DESC, o.observation_id;
+```
+
+Recording first upserts key metadata and monotonically advances its last-seen
+time, then inserts observations with `ON CONFLICT (scope_id, observation_id) DO
+NOTHING`. The service must verify that a conflicting ID was not previously
+associated with a different key. Old observations can be deleted in bounded
+batches using the observation-time index; keys with no remaining observations
+can then be deleted using `last_observed_at`. The per-key time index also
+supports trimming to the newest N observations if retention is count-based.
+
+No GIN index on `dependencies` is planned initially. Online scheduler queries
+are by key hash and retrieve a small recent window; they do not search inside
+dependency JSON. Dependencies are deliberately not an included index column
+because shapes can be large; the bounded lookup fetches them from the table.
+If server-side dependency grouping becomes useful, add a canonical
+`dependency_shape_hash bytea` column and a targeted B-tree index instead of
+broadly indexing JSON. Recent observations can likewise feed
+median/p95 duration, flake-rate, and peak-RSS estimates; precomputed aggregate
+tables should be added only after those query windows and write volume are
+measured.
+
+### Conservative future batching
+
+History-driven batching must remain speculative. Only tests whose prior
+dependency shapes match may share a test-binary invocation. If the batch
+fails, gotst reruns its tests individually. If the batch's observed union of
+dependencies differs from the expected historical shape, gotst also splits
+and reruns, even if the batch passed. Individual passing observations or cache
+entries are recorded from a batch only when the whole batch passes and its
+dependencies match history; otherwise only the isolated reruns establish new
+per-test evidence. Unknown, slow, or historically flaky tests can remain
+isolated. This preserves attributable cache inputs and outcomes while allowing
+the fast, stable long tail to amortize process startup later.
+
 ## External Go build-cache broker
 
 This subsystem is separate from the test-result cache. The broker is used in
@@ -400,6 +594,7 @@ runner state.
 | `invocation.go` | Positional package/profile/test interpretation and selection matching |
 | `cache.go` | Per-run directories and cleanup of abandoned runs |
 | `testcache.go` | Persistent result-cache interface, disk backend, test-log parsing, and dependency fingerprints |
+| `history.go` | Advisory scheduling history, portable dependency shapes, and local/HTTP stores |
 | `cacheprog.go` | Parent-owned build-cache client, private broker transport, cmd/go frontend, executable association, and verification |
 | `localcache.go` | Automatic persistent local build-cache helper and read-only fallback to the ordinary Go disk cache |
 | `progress.go` | Immutable progress snapshots, terminal reporting, and flaky summary |
@@ -421,6 +616,7 @@ Changes should preserve these properties:
 - captured executable contents agree with their content-addressed filename;
 - a test-result hit is used only after all recorded dependencies validate;
 - flaky or failed executions are never stored as clean passing results;
+- history failures never suppress execution or change a test outcome;
 - fail-fast cancellation does not turn sibling cancellation into additional
   test failures;
 - an executable from an external build cache is never run without content-hash
