@@ -408,6 +408,14 @@ Tailscale-specific fields.
 
 ### PostgreSQL schema and queries
 
+`cmd/testhistoryd` implements the HTTP service with the same
+`github.com/jackc/pgx/v5` driver used by Tailscale's cfgdb PostgreSQL backend.
+It uses `pgxpool` directly, requires PostgreSQL major version 17 at startup,
+embeds the schema in the binary, and refuses an unknown schema version. Each
+process is configured with one UUID `scope_id`; the value comes from trusted
+daemon configuration rather than client input. Writes are transactional and
+idempotent by `(scope_id, observation_id)`.
+
 The HTTP service can compute the same canonical key hash as the client and use
 the following initial schema. `scope_id` is derived from authentication or the
 configured service/base URL rather than trusted client JSON; it isolates
@@ -604,6 +612,7 @@ runner state.
 | `testcache.go` | Persistent result-cache interface, disk backend, test-log parsing, and dependency fingerprints |
 | `history/history.go` | Public advisory-history model, store interface, and versioned HTTP wire types |
 | `history.go` | Gotst integration, portable dependency shapes, and local/HTTP store implementations |
+| `cmd/testhistoryd` | PostgreSQL 17 history service, embedded schema, and HTTP handlers |
 | `cacheprog.go` | Parent-owned build-cache client, private broker transport, cmd/go frontend, executable association, and verification |
 | `localcache.go` | Automatic persistent local build-cache helper and read-only fallback to the ordinary Go disk cache |
 | `progress.go` | Immutable progress snapshots, terminal reporting, and flaky summary |

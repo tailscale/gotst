@@ -102,6 +102,32 @@ details. Go implementations can import
 `github.com/tailscale/gotst/history` for the store interface and versioned HTTP
 wire types.
 
+The `testhistoryd` command is a reference HTTP service backed by PostgreSQL 17:
+
+```sh
+TESTHISTORYD_POSTGRES_DSN='postgres://user:password@host/database' \
+TESTHISTORYD_SCOPE_ID='7d29976e-abb4-4c2a-a614-a2f01e6d85c1' \
+TESTHISTORYD_TOKEN='secret' \
+go run ./cmd/testhistoryd
+```
+
+Each daemon instance serves one repository or tenant scope. It creates its
+versioned tables and indexes at startup and refuses PostgreSQL major versions
+other than 17. `GET /healthz` is unauthenticated; history requests require the
+configured token. In production, terminate TLS before the daemon and use a
+TLS-enabled PostgreSQL DSN.
+
+For local development, `docker-compose.testhistoryd.yml` runs PostgreSQL 17 and
+the daemon on loopback ports 55432 and 58080. PostgreSQL data is a bind mount at
+`.testhistoryd-postgres/`, not an anonymous Docker volume. Set
+`TESTHISTORYD_POSTGRES_DATA` to choose another bounded host directory:
+
+```sh
+docker compose -f docker-compose.testhistoryd.yml up
+TESTHISTORYD_TEST_POSTGRES_DSN='postgres://testhistory:local-development-only@127.0.0.1:55432/testhistory?sslmode=disable' \
+  go test ./cmd/testhistoryd -run TestPostgresStore -v
+```
+
 ## Progress output
 
 By default gotst prints one aggregate status line per second and a final

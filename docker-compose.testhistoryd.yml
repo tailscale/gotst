@@ -1,0 +1,41 @@
+services:
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: testhistory
+      POSTGRES_USER: testhistory
+      POSTGRES_PASSWORD: local-development-only
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      # This is deliberately a bind mount, not an anonymous Docker volume.
+      # Override TESTHISTORYD_POSTGRES_DATA with another bounded host path.
+      - type: bind
+        source: ${TESTHISTORYD_POSTGRES_DATA:-./.testhistoryd-postgres}
+        target: /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U testhistory -d testhistory"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  testhistoryd:
+    image: golang:1.25
+    working_dir: /src
+    command: ["go", "run", "./cmd/testhistoryd"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      TESTHISTORYD_LISTEN: 0.0.0.0:8080
+      TESTHISTORYD_POSTGRES_DSN: postgres://testhistory:local-development-only@postgres:5432/testhistory?sslmode=disable
+      TESTHISTORYD_SCOPE_ID: 00000000-0000-0000-0000-000000000001
+      TESTHISTORYD_TOKEN: local-development-only
+    ports:
+      - "127.0.0.1:58080:8080"
+    volumes:
+      - type: bind
+        source: .
+        target: /src
+        read_only: true
