@@ -127,7 +127,7 @@ type History struct {
 
 // LookupRequest is the JSON body accepted at LookupPath.
 type LookupRequest struct {
-	// Version must equal Version.
+	// Version must equal [Version].
 	Version int   `json:"version"`
 	Keys    []Key `json:"keys"`
 
@@ -138,14 +138,14 @@ type LookupRequest struct {
 
 // LookupResponse is the JSON body returned from LookupPath.
 type LookupResponse struct {
-	// Version must equal Version.
+	// Version must equal [Version].
 	Version   int        `json:"version"`
 	Histories []*History `json:"histories"`
 }
 
 // RecordRequest is the JSON body accepted at RecordPath.
 type RecordRequest struct {
-	// Version must equal Version.
+	// Version must equal [Version].
 	Version      int           `json:"version"`
 	Observations []Observation `json:"observations"`
 }
