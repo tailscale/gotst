@@ -16,17 +16,19 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/tailscale/gotst/history"
 )
 
-func testHistoryKey(test string) historyKey {
-	return historyKey{Package: "example.com/p", Test: test, GOOS: "linux", GOARCH: "amd64", Tags: []string{"one"}}
+func testHistoryKey(test string) history.Key {
+	return history.Key{Package: "example.com/p", Test: test, GOOS: "linux", GOARCH: "amd64", Tags: []string{"one"}}
 }
 
-func testHistoryObservation(key historyKey, id string, at time.Time) historyObservation {
-	return historyObservation{
-		ID: id, Key: key, ObservedAt: at, Outcome: historyPass,
+func testHistoryObservation(key history.Key, id string, at time.Time) history.Observation {
+	return history.Observation{
+		ID: id, Key: key, ObservedAt: at, Outcome: history.OutcomePass,
 		Duration: 5 * time.Millisecond, Attempts: 1,
-		Dependencies: []historyDependency{{Operation: "getenv", Name: "GODEBUG"}},
+		Dependencies: []history.Dependency{{Operation: "getenv", Name: "GODEBUG"}},
 	}
 }
 
@@ -38,14 +40,14 @@ func TestDiskHistoryStore(t *testing.T) {
 	key := testHistoryKey("TestOne")
 	older := testHistoryObservation(key, "older", time.Unix(100, 0).UTC())
 	newer := testHistoryObservation(key, "newer", time.Unix(200, 0).UTC())
-	if err := store.Record(context.Background(), []historyObservation{older, newer, newer}); err != nil {
+	if err := store.Record(context.Background(), []history.Observation{older, newer, newer}); err != nil {
 		t.Fatal(err)
 	}
-	got, err := store.Lookup(context.Background(), []historyKey{key, testHistoryKey("missing")}, 1)
+	got, err := store.Lookup(context.Background(), []history.Key{key, testHistoryKey("missing")}, history.LookupOptions{RecentPerKey: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := got[key.id()]
+	h := got[key.ID()]
 	if h == nil || len(h.Observations) != 1 || h.Observations[0].ID != "newer" {
 		t.Fatalf("Lookup = %+v; want newest observation only", h)
 	}
@@ -75,7 +77,7 @@ func TestDiskHistoryStoreConcurrentWriters(t *testing.T) {
 	errs := make(chan error, 2)
 	for writer, store := range []*diskHistoryStore{store1, store2} {
 		go func() {
-			var observations []historyObservation
+			var observations []history.Observation
 			for i := range localHistoryLimit {
 				id := fmt.Sprintf("writer-%d-%02d", writer, i)
 				observations = append(observations, testHistoryObservation(key, id, time.Unix(int64(writer*100+i), 0).UTC()))
@@ -93,16 +95,16 @@ func TestDiskHistoryStoreConcurrentWriters(t *testing.T) {
 	// Pruning is opportunistic: simultaneous writers can each finish pruning
 	// before observing all of the other's files. Any later record converges the
 	// directory to the configured bound.
-	if err := store1.Record(context.Background(), []historyObservation{
+	if err := store1.Record(context.Background(), []history.Observation{
 		testHistoryObservation(key, "writer-1-31", time.Unix(131, 0).UTC()),
 	}); err != nil {
 		t.Fatal(err)
 	}
-	got, err := store1.Lookup(context.Background(), []historyKey{key}, localHistoryLimit)
+	got, err := store1.Lookup(context.Background(), []history.Key{key}, history.LookupOptions{RecentPerKey: localHistoryLimit})
 	if err != nil {
 		t.Fatal(err)
 	}
-	observations := got[key.id()].Observations
+	observations := got[key.ID()].Observations
 	if len(observations) != localHistoryLimit {
 		t.Fatalf("got %d observations; want %d", len(observations), localHistoryLimit)
 	}
@@ -114,8 +116,8 @@ func TestDiskHistoryStoreConcurrentWriters(t *testing.T) {
 func TestHTTPHistoryStore(t *testing.T) {
 	key := testHistoryKey("TestHTTP")
 	obs := testHistoryObservation(key, "observation-id", time.Unix(200, 0).UTC())
-	var gotLookup historyLookupRequest
-	var gotRecord historyRecordRequest
+	var gotLookup history.LookupRequest
+	var gotRecord history.RecordRequest
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /base/v1/history/lookup", func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer secret" {
@@ -124,9 +126,9 @@ func TestHTTPHistoryStore(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&gotLookup); err != nil {
 			t.Error(err)
 		}
-		json.NewEncoder(w).Encode(historyLookupResponse{
-			Version:   historyVersion,
-			Histories: []*testHistory{{Version: historyVersion, Key: key, Observations: []historyObservation{obs}}},
+		json.NewEncoder(w).Encode(history.LookupResponse{
+			Version:   history.Version,
+			Histories: []*history.History{{Version: history.Version, Key: key, Observations: []history.Observation{obs}}},
 		})
 	})
 	mux.HandleFunc("POST /base/v1/history/record", func(w http.ResponseWriter, r *http.Request) {
@@ -142,17 +144,17 @@ func TestHTTPHistoryStore(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	histories, err := store.Lookup(context.Background(), []historyKey{key}, 7)
+	histories, err := store.Lookup(context.Background(), []history.Key{key}, history.LookupOptions{RecentPerKey: 7})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if histories[key.id()] == nil || gotLookup.Limit != 7 || !reflect.DeepEqual(gotLookup.Keys, []historyKey{key}) {
+	if histories[key.ID()] == nil || gotLookup.RecentPerKey != 7 || !reflect.DeepEqual(gotLookup.Keys, []history.Key{key}) {
 		t.Fatalf("Lookup response=%+v request=%+v", histories, gotLookup)
 	}
-	if err := store.Record(context.Background(), []historyObservation{obs}); err != nil {
+	if err := store.Record(context.Background(), []history.Observation{obs}); err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(gotRecord.Observations, []historyObservation{obs}) {
+	if !reflect.DeepEqual(gotRecord.Observations, []history.Observation{obs}) {
 		t.Fatalf("Record request = %+v; want %+v", gotRecord, obs)
 	}
 }
@@ -167,7 +169,7 @@ func TestHistoryDependenciesPortable(t *testing.T) {
 		{Operation: "open", Name: "/private/user/tmp/input", Path: "/private/user/tmp/input"},
 	}
 	got := historyDependencies(deps, pkgDir, root)
-	want := []historyDependency{
+	want := []history.Dependency{
 		{Operation: "getenv", Name: "GODEBUG"},
 		{Operation: "open", Path: portableHistoryPath("/private/user/tmp/input", pkgDir, root)},
 		{Operation: "open", Path: "$PACKAGE/testdata/fixture"},
@@ -245,7 +247,7 @@ func TestHistoryKeyIgnoresBinaryAndCheckout(t *testing.T) {
 	k1 := historyKeyForTask(task1, profile)
 	profile.Root = "/checkout/two"
 	k2 := historyKeyForTask(task2, profile)
-	if k1.id() != k2.id() {
-		t.Fatalf("history IDs differ across binaries/checkouts: %s != %s", k1.id(), k2.id())
+	if k1.ID() != k2.ID() {
+		t.Fatalf("history IDs differ across binaries/checkouts: %s != %s", k1.ID(), k2.ID())
 	}
 }

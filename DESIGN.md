@@ -308,12 +308,20 @@ system state are outside its current model.
 
 ## Test history
 
-Test history is scheduling evidence, not a result cache. The narrow
-`testHistoryStore` interface performs one batched lookup before execution and
-one batched record at the end of a run. The default implementation is local;
-an HTTP implementation supports a shared production service. Backend errors
-are reported with `-vlog` and otherwise ignored so history availability cannot
-affect whether tests run or whether a run passes.
+Test history is scheduling evidence, not a result cache. The importable,
+dependency-light `github.com/tailscale/gotst/history` package defines the
+`history.Store` interface and all value and HTTP wire types. `Store.Lookup`
+takes a named `LookupOptions` value; `RecentPerKey` bounds the number of newest
+observations returned for each key. The interface is available for embedding
+an in-process backend, while external services normally implement the HTTP
+protocol using the same package's `LookupRequest`, `LookupResponse`, and
+`RecordRequest` types.
+
+Gotst performs one batched lookup before execution and one batched record at
+the end of a run. The default implementation is local; an HTTP implementation
+supports a shared production service. Backend errors are reported with `-vlog`
+and otherwise ignored so history availability cannot affect whether tests run
+or whether a run passes.
 
 The scheduler does not consume the retrieved histories yet. Recording and
 transport are implemented first so useful data accumulates before
@@ -594,7 +602,8 @@ runner state.
 | `invocation.go` | Positional package/profile/test interpretation and selection matching |
 | `cache.go` | Per-run directories and cleanup of abandoned runs |
 | `testcache.go` | Persistent result-cache interface, disk backend, test-log parsing, and dependency fingerprints |
-| `history.go` | Advisory scheduling history, portable dependency shapes, and local/HTTP stores |
+| `history/history.go` | Public advisory-history model, store interface, and versioned HTTP wire types |
+| `history.go` | Gotst integration, portable dependency shapes, and local/HTTP store implementations |
 | `cacheprog.go` | Parent-owned build-cache client, private broker transport, cmd/go frontend, executable association, and verification |
 | `localcache.go` | Automatic persistent local build-cache helper and read-only fallback to the ordinary Go disk cache |
 | `progress.go` | Immutable progress snapshots, terminal reporting, and flaky summary |

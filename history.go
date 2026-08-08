@@ -23,81 +23,17 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/tailscale/gotst/history"
 )
 
 const (
-	historyVersion        = 1
 	localHistoryLimit     = 32
 	historyRequestLimit   = 32
 	historyRequestTimeout = 5 * time.Second
 )
 
 var errHistoryNotFound = errors.New("test history not found")
-
-// testHistoryStore is scheduling and resource history, independent from the
-// correctness-sensitive test result cache. Implementations may be local or
-// remote; failures must never prevent tests from running.
-type testHistoryStore interface {
-	Lookup(context.Context, []historyKey, int) (map[string]*testHistory, error)
-	Record(context.Context, []historyObservation) error
-}
-
-// historyKey is stable across source changes, rebuilds, checkout locations,
-// and machines. It intentionally excludes the test binary hash.
-type historyKey struct {
-	Package string   `json:"package"`
-	Test    string   `json:"test"`
-	GOOS    string   `json:"goos"`
-	GOARCH  string   `json:"goarch"`
-	Tags    []string `json:"tags,omitempty"`
-	Args    []string `json:"args,omitempty"`
-}
-
-func (k historyKey) id() string {
-	h := sha256.New()
-	fmt.Fprintf(h, "gotst history key v%d\npackage %s\ntest %s\ngoos %s\ngoarch %s\n",
-		historyVersion, k.Package, k.Test, k.GOOS, k.GOARCH)
-	for _, tag := range k.Tags {
-		fmt.Fprintf(h, "tag %q\n", tag)
-	}
-	for _, arg := range k.Args {
-		fmt.Fprintf(h, "arg %q\n", arg)
-	}
-	return hex.EncodeToString(h.Sum(nil))
-}
-
-type historyOutcome string
-
-const (
-	historyPass  historyOutcome = "pass"
-	historyFail  historyOutcome = "fail"
-	historyFlaky historyOutcome = "flaky"
-)
-
-type historyDependency struct {
-	Operation string `json:"operation"`
-	Name      string `json:"name"`
-	Path      string `json:"path,omitempty"`
-}
-
-type historyObservation struct {
-	ID           string         `json:"id"`
-	Key          historyKey     `json:"key"`
-	ObservedAt   time.Time      `json:"observed_at"`
-	Outcome      historyOutcome `json:"outcome"`
-	Duration     time.Duration  `json:"duration_ns"`
-	Attempts     int            `json:"attempts"`
-	PeakRSSBytes int64          `json:"peak_rss_bytes,omitempty"`
-	// Dependencies is nil when input capture failed. An empty, non-nil slice
-	// means capture succeeded and observed no inputs.
-	Dependencies []historyDependency `json:"dependencies"`
-}
-
-type testHistory struct {
-	Version      int                  `json:"version"`
-	Key          historyKey           `json:"key"`
-	Observations []historyObservation `json:"observations"` // newest first
-}
 
 func newObservationID() string {
 	var b [16]byte
@@ -109,11 +45,11 @@ func newObservationID() string {
 	return fmt.Sprintf("%d-%d", time.Now().UnixNano(), os.Getpid())
 }
 
-func historyKeyForTask(task testTask, profile runProfile) historyKey {
+func historyKeyForTask(task testTask, profile runProfile) history.Key {
 	args := effectiveTestArgs(task, profile)
 	tags := slices.Clone(profile.Tags)
 	sort.Strings(tags)
-	return historyKey{
+	return history.Key{
 		Package: task.bin.pkg,
 		Test:    task.test,
 		GOOS:    runtime.GOOS,
@@ -123,13 +59,13 @@ func historyKeyForTask(task testTask, profile runProfile) historyKey {
 	}
 }
 
-func historyDependencies(deps []cacheDependency, packageDir, moduleRoot string) []historyDependency {
+func historyDependencies(deps []cacheDependency, packageDir, moduleRoot string) []history.Dependency {
 	if deps == nil {
 		return nil
 	}
-	ret := make([]historyDependency, 0, len(deps))
+	ret := make([]history.Dependency, 0, len(deps))
 	for _, dep := range deps {
-		hd := historyDependency{Operation: dep.Operation}
+		hd := history.Dependency{Operation: dep.Operation}
 		if dep.Operation == "getenv" {
 			hd.Name = dep.Name
 		}
@@ -138,7 +74,7 @@ func historyDependencies(deps []cacheDependency, packageDir, moduleRoot string) 
 		}
 		ret = append(ret, hd)
 	}
-	slices.SortFunc(ret, func(a, b historyDependency) int {
+	slices.SortFunc(ret, func(a, b history.Dependency) int {
 		if c := strings.Compare(a.Operation, b.Operation); c != 0 {
 			return c
 		}
@@ -185,19 +121,22 @@ type diskHistoryStore struct {
 	dir string
 }
 
+var _ history.Store = (*diskHistoryStore)(nil)
+
 func newDiskHistoryStore(cacheRoot string) (*diskHistoryStore, error) {
-	dir := filepath.Join(cacheRoot, "history", fmt.Sprintf("v%d", historyVersion))
+	dir := filepath.Join(cacheRoot, "history", fmt.Sprintf("v%d", history.Version))
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
 	return &diskHistoryStore{dir: dir}, nil
 }
 
-func (s *diskHistoryStore) Lookup(ctx context.Context, keys []historyKey, limit int) (map[string]*testHistory, error) {
+func (s *diskHistoryStore) Lookup(ctx context.Context, keys []history.Key, opts history.LookupOptions) (map[string]*history.History, error) {
+	limit := opts.RecentPerKey
 	if limit <= 0 {
 		limit = historyRequestLimit
 	}
-	ret := make(map[string]*testHistory)
+	ret := make(map[string]*history.History)
 	for _, key := range keys {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -212,19 +151,19 @@ func (s *diskHistoryStore) Lookup(ctx context.Context, keys []historyKey, limit 
 		if len(h.Observations) > limit {
 			h.Observations = h.Observations[:limit]
 		}
-		ret[key.id()] = h
+		ret[key.ID()] = h
 	}
 	return ret, nil
 }
 
-func (s *diskHistoryStore) Record(ctx context.Context, observations []historyObservation) error {
+func (s *diskHistoryStore) Record(ctx context.Context, observations []history.Observation) error {
 	keyDirs := make(map[string]bool)
 	seen := make(map[string]bool)
 	for _, obs := range observations {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		entryID := obs.Key.id() + "\x00" + obs.ID
+		entryID := obs.Key.ID() + "\x00" + obs.ID
 		if seen[entryID] {
 			continue
 		}
@@ -232,7 +171,7 @@ func (s *diskHistoryStore) Record(ctx context.Context, observations []historyObs
 		if err := s.writeObservation(obs); err != nil {
 			return err
 		}
-		keyDirs[obs.Key.id()] = true
+		keyDirs[obs.Key.ID()] = true
 	}
 	for id := range keyDirs {
 		if err := ctx.Err(); err != nil {
@@ -245,8 +184,8 @@ func (s *diskHistoryStore) Record(ctx context.Context, observations []historyObs
 	return nil
 }
 
-func (s *diskHistoryStore) read(key historyKey) (*testHistory, error) {
-	dir := s.keyDir(key.id())
+func (s *diskHistoryStore) read(key history.Key) (*history.History, error) {
+	dir := s.keyDir(key.ID())
 	entries, err := os.ReadDir(dir)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, errHistoryNotFound
@@ -254,7 +193,7 @@ func (s *diskHistoryStore) read(key historyKey) (*testHistory, error) {
 	if err != nil {
 		return nil, err
 	}
-	h := &testHistory{Version: historyVersion, Key: key}
+	h := &history.History{Version: history.Version, Key: key}
 	seen := make(map[string]bool)
 	for _, entry := range entries {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
@@ -268,11 +207,11 @@ func (s *diskHistoryStore) read(key historyKey) (*testHistory, error) {
 		if err != nil {
 			return nil, err
 		}
-		var obs historyObservation
+		var obs history.Observation
 		if err := json.Unmarshal(data, &obs); err != nil {
 			return nil, fmt.Errorf("decoding %s: %w", filepath.Join(dir, entry.Name()), err)
 		}
-		if obs.Key.id() != key.id() {
+		if obs.Key.ID() != key.ID() {
 			return nil, fmt.Errorf("history observation %s has wrong key", obs.ID)
 		}
 		if !seen[obs.ID] {
@@ -287,8 +226,8 @@ func (s *diskHistoryStore) read(key historyKey) (*testHistory, error) {
 	return h, nil
 }
 
-func (s *diskHistoryStore) writeObservation(obs historyObservation) error {
-	dir := s.keyDir(obs.Key.id())
+func (s *diskHistoryStore) writeObservation(obs history.Observation) error {
+	dir := s.keyDir(obs.Key.ID())
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
@@ -341,7 +280,7 @@ func (s *diskHistoryStore) prune(keyID string, limit int) error {
 	}
 	type fileObservation struct {
 		path string
-		obs  historyObservation
+		obs  history.Observation
 	}
 	var observations []fileObservation
 	for _, entry := range entries {
@@ -356,7 +295,7 @@ func (s *diskHistoryStore) prune(keyID string, limit int) error {
 		if err != nil {
 			return err
 		}
-		var obs historyObservation
+		var obs history.Observation
 		if err := json.Unmarshal(data, &obs); err != nil {
 			return err
 		}
@@ -373,7 +312,7 @@ func (s *diskHistoryStore) prune(keyID string, limit int) error {
 	return nil
 }
 
-func compareHistoryObservations(a, b historyObservation) int {
+func compareHistoryObservations(a, b history.Observation) int {
 	if c := b.ObservedAt.Compare(a.ObservedAt); c != 0 {
 		return c
 	}
@@ -384,12 +323,12 @@ func (s *diskHistoryStore) keyDir(id string) string {
 	return filepath.Join(s.dir, id[:2], id)
 }
 
-func (s *diskHistoryStore) observationPath(obs historyObservation) string {
+func (s *diskHistoryStore) observationPath(obs history.Observation) string {
 	// Hash the opaque observation ID rather than treating it as a filename.
 	// This also gives a fixed-length path if a future producer uses UUIDs or a
 	// server-assigned ID of a different form.
 	h := sha256.Sum256([]byte(obs.ID))
-	return filepath.Join(s.keyDir(obs.Key.id()), hex.EncodeToString(h[:])+".json")
+	return filepath.Join(s.keyDir(obs.Key.ID()), hex.EncodeToString(h[:])+".json")
 }
 
 type httpHistoryStore struct {
@@ -398,21 +337,7 @@ type httpHistoryStore struct {
 	token  string
 }
 
-type historyLookupRequest struct {
-	Version int          `json:"version"`
-	Keys    []historyKey `json:"keys"`
-	Limit   int          `json:"limit"`
-}
-
-type historyLookupResponse struct {
-	Version   int            `json:"version"`
-	Histories []*testHistory `json:"histories"`
-}
-
-type historyRecordRequest struct {
-	Version      int                  `json:"version"`
-	Observations []historyObservation `json:"observations"`
-}
+var _ history.Store = (*httpHistoryStore)(nil)
 
 func newHTTPHistoryStore(rawURL string) (*httpHistoryStore, error) {
 	u, err := url.Parse(rawURL)
@@ -430,31 +355,32 @@ func newHTTPHistoryStore(rawURL string) (*httpHistoryStore, error) {
 	}, nil
 }
 
-func (s *httpHistoryStore) Lookup(ctx context.Context, keys []historyKey, limit int) (map[string]*testHistory, error) {
+func (s *httpHistoryStore) Lookup(ctx context.Context, keys []history.Key, opts history.LookupOptions) (map[string]*history.History, error) {
+	limit := opts.RecentPerKey
 	if limit <= 0 {
 		limit = historyRequestLimit
 	}
-	var res historyLookupResponse
-	err := s.doJSON(ctx, "/v1/history/lookup", historyLookupRequest{
-		Version: historyVersion, Keys: keys, Limit: limit,
+	var res history.LookupResponse
+	err := s.doJSON(ctx, history.LookupPath, history.LookupRequest{
+		Version: history.Version, Keys: keys, RecentPerKey: limit,
 	}, &res)
 	if err != nil {
 		return nil, err
 	}
-	if res.Version != historyVersion {
-		return nil, fmt.Errorf("history service returned version %d, want %d", res.Version, historyVersion)
+	if res.Version != history.Version {
+		return nil, fmt.Errorf("history service returned version %d, want %d", res.Version, history.Version)
 	}
-	ret := make(map[string]*testHistory)
+	ret := make(map[string]*history.History)
 	wanted := make(map[string]bool, len(keys))
 	for _, key := range keys {
-		wanted[key.id()] = true
+		wanted[key.ID()] = true
 	}
 	for _, h := range res.Histories {
-		if h == nil || h.Version != historyVersion || !wanted[h.Key.id()] {
+		if h == nil || h.Version != history.Version || !wanted[h.Key.ID()] {
 			continue
 		}
 		for _, obs := range h.Observations {
-			if obs.Key.id() != h.Key.id() {
+			if obs.Key.ID() != h.Key.ID() {
 				return nil, fmt.Errorf("history service returned observation %q under the wrong key", obs.ID)
 			}
 		}
@@ -462,14 +388,14 @@ func (s *httpHistoryStore) Lookup(ctx context.Context, keys []historyKey, limit 
 		if len(h.Observations) > limit {
 			h.Observations = h.Observations[:limit]
 		}
-		ret[h.Key.id()] = h
+		ret[h.Key.ID()] = h
 	}
 	return ret, nil
 }
 
-func (s *httpHistoryStore) Record(ctx context.Context, observations []historyObservation) error {
-	return s.doJSON(ctx, "/v1/history/record", historyRecordRequest{
-		Version: historyVersion, Observations: observations,
+func (s *httpHistoryStore) Record(ctx context.Context, observations []history.Observation) error {
+	return s.doJSON(ctx, history.RecordPath, history.RecordRequest{
+		Version: history.Version, Observations: observations,
 	}, nil)
 }
 
@@ -516,16 +442,16 @@ func (s *Server) loadHistory(tasks []testTask) {
 	// advisory, so the run proceeds rather than repeatedly delaying execution.
 	s.historyLoaded = true
 	s.mu.Unlock()
-	keys := make([]historyKey, 0, len(tasks))
+	keys := make([]history.Key, 0, len(tasks))
 	seen := make(map[string]bool)
 	for _, task := range tasks {
 		key := historyKeyForTask(task, s.profile)
-		if id := key.id(); !seen[id] {
+		if id := key.ID(); !seen[id] {
 			seen[id] = true
 			keys = append(keys, key)
 		}
 	}
-	histories, err := s.history.Lookup(s.ctx, keys, historyRequestLimit)
+	histories, err := s.history.Lookup(s.ctx, keys, history.LookupOptions{RecentPerKey: historyRequestLimit})
 	if err != nil {
 		if *verbose {
 			log.Printf("loading test history: %v", err)
@@ -542,12 +468,12 @@ func (s *Server) loadHistory(tasks []testTask) {
 	}
 }
 
-func (s *Server) recordHistory(task testTask, outcome historyOutcome, duration time.Duration, attempts int, deps []cacheDependency) {
+func (s *Server) recordHistory(task testTask, outcome history.Outcome, duration time.Duration, attempts int, deps []cacheDependency) {
 	if s.history == nil {
 		return
 	}
 	key := historyKeyForTask(task, s.profile)
-	obs := historyObservation{
+	obs := history.Observation{
 		ID: newObservationID(), Key: key, ObservedAt: time.Now().UTC(),
 		Outcome: outcome, Duration: duration, Attempts: attempts,
 		Dependencies: historyDependencies(deps, task.bin.workDir, s.packageRoot(task.bin.pkg)),

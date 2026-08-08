@@ -98,7 +98,9 @@ The current implementation collects and retrieves history but does not yet
 change scheduling. It establishes the storage and protocol needed for future
 duration- and memory-aware scheduling and conservative batching. See
 [DESIGN.md](DESIGN.md#test-history) for identity, protocol, and database
-details.
+details. Go implementations can import
+`github.com/tailscale/gotst/history` for the store interface and versioned HTTP
+wire types.
 
 ## Progress output
 

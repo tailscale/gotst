@@ -28,6 +28,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/tailscale/gotst/history"
 )
 
 var (
@@ -151,7 +153,7 @@ type Server struct {
 	profile   runProfile
 	tests     testSelection
 	testCache testResultCache
-	history   testHistoryStore
+	history   history.Store
 
 	execSem chan bool // buffered chan semaphore to limit subprocesses
 	outMu   sync.Mutex
@@ -168,8 +170,8 @@ type Server struct {
 	debugMisses       int
 	debugSeedErrors   map[string]string // test cache key ID -> why pass 1 did not seed it
 	historyLoaded     bool
-	histories         map[string]*testHistory
-	historyPending    []historyObservation
+	histories         map[string]*history.History
+	historyPending    []history.Observation
 }
 
 type packageStatus struct {
@@ -230,7 +232,7 @@ func NewServer(profile runProfile, tests testSelection) *Server {
 			log.Fatalf("initializing test result cache: %v", err)
 		}
 	}
-	var history testHistoryStore
+	var historyStore history.Store
 	switch {
 	case *historyConfig == "off":
 	case *historyConfig == "local" || *historyConfig == "":
@@ -238,11 +240,11 @@ func NewServer(profile runProfile, tests testSelection) *Server {
 		if err != nil && *verbose {
 			log.Printf("disabling local test history: %v", err)
 		} else if err == nil {
-			history = localHistory
+			historyStore = localHistory
 		}
 	case strings.HasPrefix(*historyConfig, "http://") || strings.HasPrefix(*historyConfig, "https://"):
 		var err error
-		history, err = newHTTPHistoryStore(*historyConfig)
+		historyStore, err = newHTTPHistoryStore(*historyConfig)
 		if err != nil {
 			log.Fatalf("initializing HTTP test history: %v", err)
 		}
@@ -257,10 +259,10 @@ func NewServer(profile runProfile, tests testSelection) *Server {
 		profile:         profile,
 		tests:           tests,
 		testCache:       cache,
-		history:         history,
+		history:         historyStore,
 		execSem:         make(chan bool, *jobs),
 		debugSeedErrors: make(map[string]string),
-		histories:       make(map[string]*testHistory),
+		histories:       make(map[string]*history.History),
 	}
 }
 
@@ -1276,7 +1278,7 @@ func (s *Server) runTest(task testTask) error {
 			failures = append(failures, failInfo{dur: d, out: output})
 			if retry == *maxRetries {
 				s.finishTest(task, false, total, failures, err)
-				s.recordHistory(task, historyFail, total, totalAttempts, completeHistoryDeps(historyDeps, historyDepsComplete))
+				s.recordHistory(task, history.OutcomeFail, total, totalAttempts, completeHistoryDeps(historyDeps, historyDepsComplete))
 				s.printTestResult(task, d, false, false, output)
 				return err
 			}
@@ -1309,9 +1311,9 @@ func (s *Server) runTest(task testTask) error {
 		s.setDebugSeedError(key, reason)
 	}
 	s.finishTest(task, true, total, failures, nil)
-	outcome := historyPass
+	outcome := history.OutcomePass
 	if len(failures) != 0 {
-		outcome = historyFlaky
+		outcome = history.OutcomeFlaky
 	}
 	s.recordHistory(task, outcome, total, totalAttempts, completeHistoryDeps(historyDeps, historyDepsComplete))
 	s.printTestResult(task, total, false, true, "")
