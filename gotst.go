@@ -49,6 +49,7 @@ var (
 	buildOnly     = flag.Bool("build-only", false, "build and capture selected test binaries without listing or running tests")
 	debugUncached = flag.Bool("debug-uncached", false, "run a cache-seeding pass, then diagnose tests that do not reuse it")
 	jsonSummary   = flag.Bool("json-summary", false, "emit a machine-readable flaky-test summary including testing.T attributes")
+	historyConfig = flag.String("history", "local", "history store: local, off, or an http(s) base URL")
 	testCountSet  bool
 )
 
@@ -150,6 +151,7 @@ type Server struct {
 	profile   runProfile
 	tests     testSelection
 	testCache testResultCache
+	history   testHistoryStore
 
 	execSem chan bool // buffered chan semaphore to limit subprocesses
 	outMu   sync.Mutex
@@ -165,6 +167,9 @@ type Server struct {
 	debugPass         int
 	debugMisses       int
 	debugSeedErrors   map[string]string // test cache key ID -> why pass 1 did not seed it
+	historyLoaded     bool
+	histories         map[string]*testHistory
+	historyPending    []historyObservation
 }
 
 type packageStatus struct {
@@ -225,6 +230,25 @@ func NewServer(profile runProfile, tests testSelection) *Server {
 			log.Fatalf("initializing test result cache: %v", err)
 		}
 	}
+	var history testHistoryStore
+	switch {
+	case *historyConfig == "off":
+	case *historyConfig == "local" || *historyConfig == "":
+		localHistory, err := newDiskHistoryStore(mustCacheRoot())
+		if err != nil && *verbose {
+			log.Printf("disabling local test history: %v", err)
+		} else if err == nil {
+			history = localHistory
+		}
+	case strings.HasPrefix(*historyConfig, "http://") || strings.HasPrefix(*historyConfig, "https://"):
+		var err error
+		history, err = newHTTPHistoryStore(*historyConfig)
+		if err != nil {
+			log.Fatalf("initializing HTTP test history: %v", err)
+		}
+	default:
+		log.Fatalf("invalid -history value %q; want local, off, or an http(s) URL", *historyConfig)
+	}
 	return &Server{
 		start:           time.Now(),
 		cacheDir:        mustNewCacheDir(),
@@ -233,8 +257,10 @@ func NewServer(profile runProfile, tests testSelection) *Server {
 		profile:         profile,
 		tests:           tests,
 		testCache:       cache,
+		history:         history,
 		execSem:         make(chan bool, *jobs),
 		debugSeedErrors: make(map[string]string),
+		histories:       make(map[string]*testHistory),
 	}
 }
 
@@ -250,6 +276,7 @@ func (s *Server) Run() (retErr error) {
 		}
 		s.printProgress()
 		s.printFlakySummary()
+		s.flushHistory()
 	}()
 
 	if err := s.resolveQualifiedTests(); err != nil {
@@ -1022,6 +1049,7 @@ func (s *Server) runAllTests() error {
 		return nil
 	}
 	tasks := s.allTestTasks()
+	s.loadHistory(tasks)
 	if *verbose {
 		log.Printf("Running %d tests in %d packages with up to %d concurrent processes...", len(tasks), len(bins), *jobs)
 	}
@@ -1155,21 +1183,27 @@ func isRunnableTopLevelTest(name string) bool {
 }
 
 func (s *Server) cacheKeyForTask(task testTask) testCacheKey {
-	baseArgs := profileTestArgs(task.bin.args, s.profile)
-	baseArgs = setTestArg(baseArgs, "-test.count", "1")
-	if *failFast {
-		baseArgs = setTestArg(baseArgs, "-test.failfast", "true")
-	}
-	if *jsonSummary {
-		baseArgs = setTestArg(baseArgs, "-test.v", "true")
-	}
 	return testCacheKey{
 		BinarySHA256: binHash(task.bin.absBin),
 		Package:      task.bin.pkg,
 		Test:         task.test,
 		WorkingDir:   task.bin.workDir,
-		Args:         slices.Clone(baseArgs),
+		Args:         effectiveTestArgs(task, s.profile),
 	}
+}
+
+func effectiveTestArgs(task testTask, profile runProfile) []string {
+	args := profileTestArgs(task.bin.args, profile)
+	// Gotst owns repetition and retries. Each child process is exactly one
+	// attempt even if captured/profile arguments contained another count.
+	args = setTestArg(args, "-test.count", "1")
+	if *failFast {
+		args = setTestArg(args, "-test.failfast", "true")
+	}
+	if *jsonSummary {
+		args = setTestArg(args, "-test.v", "true")
+	}
+	return args
 }
 
 func (s *Server) runTest(task testTask) error {
@@ -1177,16 +1211,7 @@ func (s *Server) runTest(task testTask) error {
 		return err
 	}
 	bin := task.bin
-	baseArgs := profileTestArgs(bin.args, s.profile)
-	// gotst owns repetition and retries. Each child process is exactly one
-	// attempt even if captured/profile arguments contained another count.
-	baseArgs = setTestArg(baseArgs, "-test.count", "1")
-	if *failFast {
-		baseArgs = setTestArg(baseArgs, "-test.failfast", "true")
-	}
-	if *jsonSummary {
-		baseArgs = setTestArg(baseArgs, "-test.v", "true")
-	}
+	baseArgs := effectiveTestArgs(task, s.profile)
 	key := s.cacheKeyForTask(task)
 	debugPass := s.currentDebugPass()
 	if s.testCache != nil && debugPass != 1 {
@@ -1223,10 +1248,19 @@ func (s *Server) runTest(task testTask) error {
 	var total time.Duration
 	var failures []failInfo
 	var cacheDeps []cacheDependency
+	historyDeps := make([]cacheDependency, 0)
+	historyDepsComplete := true
+	totalAttempts := 0
 	for repetition := range *testCount {
 		for retry := 0; ; retry++ {
 			d, output, attrs, deps, err := s.runTestAttempt(task, key, baseArgs, repetition, retry)
 			total += d
+			totalAttempts++
+			if deps == nil {
+				historyDepsComplete = false
+			} else {
+				historyDeps = append(historyDeps, deps...)
+			}
 			s.recordTestAttrs(task, attrs)
 			s.recordTestAttempt(task)
 			if err == nil {
@@ -1242,6 +1276,7 @@ func (s *Server) runTest(task testTask) error {
 			failures = append(failures, failInfo{dur: d, out: output})
 			if retry == *maxRetries {
 				s.finishTest(task, false, total, failures, err)
+				s.recordHistory(task, historyFail, total, totalAttempts, completeHistoryDeps(historyDeps, historyDepsComplete))
 				s.printTestResult(task, d, false, false, output)
 				return err
 			}
@@ -1274,8 +1309,20 @@ func (s *Server) runTest(task testTask) error {
 		s.setDebugSeedError(key, reason)
 	}
 	s.finishTest(task, true, total, failures, nil)
+	outcome := historyPass
+	if len(failures) != 0 {
+		outcome = historyFlaky
+	}
+	s.recordHistory(task, outcome, total, totalAttempts, completeHistoryDeps(historyDeps, historyDepsComplete))
 	s.printTestResult(task, total, false, true, "")
 	return nil
+}
+
+func completeHistoryDeps(deps []cacheDependency, complete bool) []cacheDependency {
+	if !complete {
+		return nil
+	}
+	return deps
 }
 
 func (s *Server) runTestAttempt(task testTask, key testCacheKey, baseArgs []string, repetition, retry int) (time.Duration, string, map[string]string, []cacheDependency, error) {
@@ -1285,7 +1332,8 @@ func (s *Server) runTestAttempt(task testTask, key testCacheKey, baseArgs []stri
 	attrOut.max = 1 << 20
 	logPath := filepath.Join(s.cacheDir, fmt.Sprintf("testlog-%s-%d-%d", key.id(), repetition, retry))
 	args := setTestArg(baseArgs, "-test.run", "^"+regexp.QuoteMeta(task.test)+"$")
-	if s.testCache != nil {
+	captureDeps := s.testCache != nil || s.history != nil
+	if captureDeps {
 		args = setTestArg(args, "-test.testlogfile", logPath)
 	}
 	t0 := time.Now()
@@ -1301,26 +1349,26 @@ func (s *Server) runTestAttempt(task testTask, key testCacheKey, baseArgs []stri
 	d := time.Since(t0).Round(time.Millisecond)
 	attrs := testAttrs(attrOut.String())
 	if s.ctx.Err() != nil {
-		if s.testCache != nil {
+		if captureDeps {
 			os.Remove(logPath)
 		}
 		return d, out.String(), attrs, nil, context.Canceled
 	}
 	var deps []cacheDependency
-	if err == nil && s.testCache != nil {
+	if captureDeps {
 		var depErr error
 		deps, depErr = parseTestLog(logPath, task.bin.workDir, s.packageRoot(task.bin.pkg))
 		if depErr != nil {
 			deps = nil
-			if s.currentDebugPass() == 1 {
+			if err == nil && s.currentDebugPass() == 1 {
 				s.setDebugSeedError(key, "parsing test input log: "+depErr.Error())
 			}
 			if *verbose {
-				log.Printf("not caching %s/%s: %v", task.bin.pkg, task.test, depErr)
+				log.Printf("capturing test inputs for %s/%s: %v", task.bin.pkg, task.test, depErr)
 			}
 		}
 	}
-	if s.testCache != nil {
+	if captureDeps {
 		os.Remove(logPath)
 	}
 	return d, out.String(), attrs, deps, err
