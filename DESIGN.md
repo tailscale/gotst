@@ -43,6 +43,25 @@ Gotst does not currently distribute work between machines, batch multiple
 top-level tests into one process, or provide a remote test-result cache. Those
 are possible extensions, not properties of the current architecture.
 
+## Live status page
+
+The optional HTTP server renders the current synchronized `Server` state as a
+complete HTML document. Each browser also opens `/live-ws`. The server renders
+at most once per 500 milliseconds per connection and sends a compact
+common-prefix/common-suffix patch relative to that connection's preceding
+document. WebSocket per-message deflate with context takeover compresses the
+patch stream. The browser reconstructs the next document and morphs the live
+DOM in place, preserving the page rather than navigating or replacing the
+whole body.
+
+At the end of `Server.Run`, after setting the terminal `done` or `failed`
+phase, gotst sends a final patch to every connected browser. Browsers
+acknowledge that sequence only after applying it. The runner waits for those
+acknowledgements, with a two-second bound so an unresponsive browser cannot
+prevent process exit. This finalization happens inside `Server.Run` because
+the caller reports an error with `log.Fatal`, whose `os.Exit` would skip a
+defer in `main`.
+
 ## Process roles
 
 The gotst executable has four entry modes. `main` selects the three child modes

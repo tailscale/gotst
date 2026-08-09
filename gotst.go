@@ -159,6 +159,8 @@ type Server struct {
 
 	execSem chan bool // buffered chan semaphore to limit subprocesses
 	outMu   sync.Mutex
+	webMu   sync.Mutex
+	webLive map[*liveClient]struct{}
 
 	mu                sync.Mutex
 	pkgs              map[string]*packageStatus // test package import path -> status
@@ -278,6 +280,7 @@ func (s *Server) Run() (retErr error) {
 		} else {
 			s.setPhase(phaseDone)
 		}
+		s.flushFinalLiveStatus()
 		s.printProgress()
 		s.printFlakySummary()
 		s.flushHistory()

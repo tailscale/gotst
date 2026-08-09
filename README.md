@@ -77,6 +77,10 @@ Use `-listen=ADDRESS` to change the configured listener, or `-listen=` to
 disable the status server and Tailscale discovery. Failure to reach the local
 Tailscale daemon does not affect the test run.
 
+The page updates incrementally over a compressed WebSocket, at most once every
+500 milliseconds. At the end of a run, gotst sends the final state to connected
+browsers and briefly waits for them to apply and acknowledge it before exiting.
+
 ## Test result caching
 
 gotst disables cmd/go's package test-result cache with `go test -count=1` and

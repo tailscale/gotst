@@ -4,7 +4,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
@@ -16,8 +18,10 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/coder/websocket"
 	"tailscale.com/ipn/ipnstate"
 
 	_ "embed"
@@ -26,7 +30,35 @@ import (
 //go:embed root.tmpl.html
 var rootTemplateHTML string
 
+//go:embed live.js
+var liveJS []byte
+
 var rootTmpl = template.Must(template.New("root").Parse(rootTemplateHTML))
+
+const liveUpdateInterval = 500 * time.Millisecond
+
+type htmlPatch struct {
+	Seq    uint64 `json:"seq"`
+	Prefix int    `json:"prefix"`
+	Suffix int    `json:"suffix"`
+	Insert string `json:"insert"`
+	Final  bool   `json:"final,omitempty"`
+}
+
+type liveCommand struct {
+	ctx   context.Context
+	html  string
+	final bool
+	done  chan error
+}
+
+type liveClient struct {
+	server *Server
+	conn   *websocket.Conn
+	cmd    chan liveCommand
+	done   chan struct{}
+	acks   chan uint64
+}
 
 type tailscaleStatusClient interface {
 	StatusWithoutPeers(context.Context) (*ipnstate.Status, error)
@@ -115,17 +147,222 @@ func closeListeners(listeners []net.Listener) {
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	switch r.URL.Path {
+	case "/":
+		s.serveStatusRoot(w, r)
+	case "/live.js":
+		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		_, _ = w.Write(liveJS)
+	case "/live-ws":
+		s.serveLiveWS(w, r)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func (s *Server) serveStatusRoot(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := rootTmpl.Execute(w, s.statusData()); err != nil {
+	w.Header().Set("Cache-Control", "no-store")
+	html, err := s.renderStatusHTML()
+	if err != nil {
 		log.Printf("executing template: %v", err)
 		http.Error(w, "executing template: "+err.Error(), http.StatusInternalServerError)
+		return
 	}
+	_, _ = w.Write([]byte(html))
+}
+
+func (s *Server) renderStatusHTML() (string, error) {
+	var buf bytes.Buffer
+	if err := rootTmpl.Execute(&buf, s.statusData()); err != nil {
+		return "", err
+	}
+	return buf.String(), nil
+}
+
+func (s *Server) serveLiveWS(w http.ResponseWriter, r *http.Request) {
+	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+		CompressionMode:      websocket.CompressionContextTakeover,
+		CompressionThreshold: 1,
+	})
+	if err != nil {
+		log.Printf("live websocket: %v", err)
+		return
+	}
+	c := &liveClient{
+		server: s, conn: conn, cmd: make(chan liveCommand),
+		done: make(chan struct{}), acks: make(chan uint64, 1),
+	}
+	s.webMu.Lock()
+	if s.webLive == nil {
+		s.webLive = make(map[*liveClient]struct{})
+	}
+	s.webLive[c] = struct{}{}
+	s.webMu.Unlock()
+	c.run(r.Context())
+	s.webMu.Lock()
+	delete(s.webLive, c)
+	s.webMu.Unlock()
+}
+
+func (c *liveClient) run(requestCtx context.Context) {
+	defer close(c.done)
+	defer c.conn.CloseNow()
+	ctx, cancel := context.WithCancel(requestCtx)
+	defer cancel()
+	go c.readAcks(ctx, cancel)
+
+	var lastHTML string
+	var seq uint64
+	var lastPush time.Time
+	ticker := time.NewTicker(liveUpdateInterval)
+	defer ticker.Stop()
+	push := func(ctx context.Context, html string, final bool) error {
+		if html == lastHTML && !final {
+			return nil
+		}
+		if wait := liveUpdateInterval - time.Since(lastPush); !lastPush.IsZero() && wait > 0 {
+			timer := time.NewTimer(wait)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		seq++
+		patch := makeHTMLPatch(lastHTML, html)
+		patch.Seq, patch.Final = seq, final
+		msg, err := json.Marshal(patch)
+		if err != nil {
+			return err
+		}
+		if err := c.conn.Write(ctx, websocket.MessageText, msg); err != nil {
+			return err
+		}
+		lastPush = time.Now()
+		lastHTML = html
+		if !final {
+			return nil
+		}
+		for {
+			select {
+			case ack := <-c.acks:
+				if ack == seq {
+					return nil
+				}
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	}
+	if html, err := c.server.renderStatusHTML(); err == nil {
+		if err := push(ctx, html, false); err != nil {
+			return
+		}
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			html, err := c.server.renderStatusHTML()
+			if err != nil || push(ctx, html, false) != nil {
+				return
+			}
+		case cmd := <-c.cmd:
+			err := push(cmd.ctx, cmd.html, cmd.final)
+			cmd.done <- err
+			if cmd.final || err != nil {
+				return
+			}
+		}
+	}
+}
+
+func (c *liveClient) readAcks(ctx context.Context, cancel context.CancelFunc) {
+	defer cancel()
+	for {
+		_, msg, err := c.conn.Read(ctx)
+		if err != nil {
+			return
+		}
+		var ack struct {
+			Ack uint64 `json:"ack"`
+		}
+		if json.Unmarshal(msg, &ack) == nil && ack.Ack != 0 {
+			select {
+			case c.acks <- ack.Ack:
+			default:
+			}
+		}
+	}
+}
+
+func makeHTMLPatch(oldHTML, newHTML string) htmlPatch {
+	oldRunes, newRunes := []rune(oldHTML), []rune(newHTML)
+	prefix := 0
+	for prefix < len(oldRunes) && prefix < len(newRunes) && oldRunes[prefix] == newRunes[prefix] {
+		prefix++
+	}
+	suffix := 0
+	for suffix < len(oldRunes)-prefix && suffix < len(newRunes)-prefix &&
+		oldRunes[len(oldRunes)-1-suffix] == newRunes[len(newRunes)-1-suffix] {
+		suffix++
+	}
+	return htmlPatch{
+		Prefix: prefix,
+		Suffix: suffix,
+		Insert: string(newRunes[prefix : len(newRunes)-suffix]),
+	}
+}
+
+func (s *Server) flushFinalLiveStatus() {
+	s.webMu.Lock()
+	clients := make([]*liveClient, 0, len(s.webLive))
+	for c := range s.webLive {
+		clients = append(clients, c)
+	}
+	s.webMu.Unlock()
+	if len(clients) == 0 {
+		return
+	}
+	html, err := s.renderStatusHTML()
+	if err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	var wg sync.WaitGroup
+	for _, c := range clients {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			done := make(chan error, 1)
+			cmd := liveCommand{ctx: ctx, html: html, final: true, done: done}
+			select {
+			case c.cmd <- cmd:
+			case <-c.done:
+				return
+			case <-ctx.Done():
+				return
+			}
+			select {
+			case <-done:
+			case <-c.done:
+			case <-ctx.Done():
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 // statusData is the data argument type for [rootTmpl].
 type statusData struct {
 	StartedAt  string
 	StartedAgo string
+	Phase      runPhase
 
 	Packages []packageData
 }
@@ -149,6 +386,7 @@ func (s *Server) statusData() *statusData {
 	d := &statusData{
 		StartedAt:  s.start.Format(time.RFC3339),
 		StartedAgo: now.Sub(s.start).Round(time.Second).String(),
+		Phase:      s.phase,
 	}
 
 	for _, importPath := range slices.Sorted(maps.Keys(s.pkgs)) {

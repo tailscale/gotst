@@ -8,6 +8,7 @@
 <body>
     <h1>gotst</h1>
     <p>Started at {{ .StartedAt }} ({{ .StartedAgo }})</p>
+    <p>Phase: {{ .Phase }}</p>
 
     <h2>Packages</h2>
     <table border="1" cellpadding="5" cellspacing="0">
@@ -24,5 +25,6 @@
         </tr>
         {{ end }}
     </table>
+    <script src="/live.js"></script>
 </body>
 </html>

@@ -308,7 +308,8 @@ Web UI and usability:
 - [ ] Show build, discovery, queued, running, retrying, passed, flaky, failed,
   and skipped states with live progress.
 - [ ] Add per-test attempt history, durations, and bounded failure output.
-- [ ] Add automatic updates (SSE, WebSocket, or polling) and useful CI links.
+- [x] Add automatic status-page updates using compressed WebSocket HTML diffs
+  and incremental DOM updates. Useful CI links remain future work.
 - [ ] Preserve the optional web status mode as another client of the same
   backend interface. Serve an initial status snapshot and live updates over a
   WebSocket (with reconnect/resynchronization behavior), rather than coupling
