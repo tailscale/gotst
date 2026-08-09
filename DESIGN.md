@@ -552,18 +552,26 @@ median/p95 duration, flake-rate, and peak-RSS estimates; precomputed aggregate
 tables should be added only after those query windows and write volume are
 measured.
 
-### Conservative future batching
+### Test batching experiment
 
-History-driven batching must remain speculative. Only tests whose prior
-dependency shapes match may share a test-binary invocation. If the batch
-fails, gotst reruns its tests individually. If the batch's observed union of
-dependencies differs from the expected historical shape, gotst also splits
-and reruns, even if the batch passed. Individual passing observations or cache
-entries are recorded from a batch only when the whole batch passes and its
-dependencies match history; otherwise only the isolated reruns establish new
-per-test evidence. Unknown, slow, or historically flaky tests can remain
-isolated. This preserves attributable cache inputs and outcomes while allowing
-the fast, stable long tail to amortize process startup later.
+An experiment grouped historically fast, successful tests from the same binary
+when their recorded test-log dependency signatures were identical. A batch was
+accepted only if it passed quickly with the same observed dependency signature;
+otherwise every member was rerun individually.
+
+On the tailscale.com suite, batching reduced the median number of test-binary
+processes from 2,535 to 834 (67.1%), but median total CPU time improved only
+from 365.35 to 360.87 CPU-seconds (1.2%). System CPU fell from 74.65 to 71.31
+seconds (4.5%), user CPU was effectively unchanged, and wall time was flat at
+about 71.3 seconds. The additional scheduler, output parsing, dependency
+validation, fallback, and reporting complexity was not justified by that gain,
+so gotst continues to run one top-level test per process.
+
+This result does not rule out batching forever, but distributed execution over
+multiple ephemeral VMs is expected to provide a substantially larger win and
+is the preferred next scheduling direction. History durations and outcomes can
+be used to balance work across those machines and reduce the final straggler
+edge without coupling correctness to advisory history.
 
 ## External Go build-cache broker
 
