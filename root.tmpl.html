@@ -4,27 +4,98 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>gotst</title>
+    <style>
+        :root { color-scheme: light dark; font-family: ui-sans-serif, system-ui, sans-serif; }
+        body { margin: 1.25rem auto; max-width: 110rem; padding: 0 1.25rem 3rem; }
+        h1 { display: inline; margin-right: .75rem; }
+        h2 { margin: 1.4rem 0 .5rem; }
+        .live { align-items: center; display: inline-flex; gap: .45rem; }
+        .connection { border-radius: 1rem; font-size: .85rem; font-weight: 650; padding: .2rem .65rem; }
+        .connected { background: #15803d; color: white; }
+        .connecting { background: #a16207; color: white; }
+        .disconnected { background: #b91c1c; color: white; }
+        .stopped { background: #475569; color: white; }
+        .live button { cursor: pointer; font-size: .8rem; padding: .15rem .45rem; }
+        .live button:disabled { cursor: default; opacity: .45; }
+        .run-meta { color: #64748b; margin: .65rem 0; }
+        .summary { border: 1px solid color-mix(in srgb, CanvasText 17%, Canvas); border-radius: .45rem; display: inline-grid; font-size: .9rem; grid-template-columns: minmax(11rem, auto) repeat(5, minmax(7.5rem, auto)); margin: .8rem 0 1.1rem; overflow: hidden; }
+        .summary > div { border-bottom: 1px solid color-mix(in srgb, CanvasText 12%, Canvas); padding: .35rem .65rem; }
+        .summary > div:not(:nth-child(6n+1)) { text-align: right; }
+        .summary > div:nth-last-child(-n+6) { border-bottom: 0; }
+        .summary .head { background: color-mix(in srgb, CanvasText 8%, Canvas); color: #64748b; font-size: .75rem; font-weight: 700; text-transform: uppercase; }
+        .summary .kind { font-weight: 700; text-align: left; }
+        .summary b { font-variant-numeric: tabular-nums; }
+        .subtle { color: #64748b; }
+        .passed { color: #16a34a; font-weight: 750; }
+        .failed { color: #dc2626; font-weight: 750; }
+        .flaky { color: #d97706; font-weight: 750; }
+        table { border-collapse: collapse; font-size: .92rem; width: 100%; }
+        th, td { border-bottom: 1px solid color-mix(in srgb, CanvasText 16%, Canvas); padding: .4rem .55rem; text-align: left; }
+        th button { background: none; border: 0; color: inherit; cursor: pointer; font: inherit; font-weight: 700; padding: 0; }
+        th button:hover { text-decoration: underline; }
+        th button[data-direction="asc"]::after { content: " ▲"; }
+        th button[data-direction="desc"]::after { content: " ▼"; }
+        td:nth-child(2), th:nth-child(2) { text-align: right; }
+        td:last-child, th:last-child { white-space: nowrap; }
+        .issues { display: grid; gap: .45rem; }
+        details { border: 1px solid color-mix(in srgb, CanvasText 17%, Canvas); border-radius: .4rem; }
+        summary { cursor: pointer; padding: .45rem .6rem; }
+        pre { background: color-mix(in srgb, CanvasText 7%, Canvas); margin: 0; max-height: 40rem; overflow: auto; padding: .75rem; white-space: pre-wrap; word-break: break-word; }
+    </style>
 </head>
 <body>
-    <h1>gotst</h1>
-    <p>Started at {{ .StartedAt }} ({{ .StartedAgo }})</p>
-    <p>Phase: {{ .Phase }}</p>
+    <header>
+        <h1>gotst</h1>
+        <span class="live"><span id="connection-status" class="connection connecting">Connecting…</span><button id="stop-live" type="button" title="Stop reconnecting">🛑 STOP</button><button id="start-live" type="button" title="Resume reconnecting" disabled>▶️ PLAY</button></span>
+        <p class="run-meta">Started at {{ .StartedAt }} ({{ .StartedAgo }}) · Phase: <b>{{ .Phase }}</b> · Last exit: <b class="{{ .ExitClass }}">{{ .ExitStatus }}</b></p>
+    </header>
 
-    <h2>Packages</h2>
-    <table border="1" cellpadding="5" cellspacing="0">
-        <tr style="text-align: left;">
-            <th>Package</th>
-            <th>Tests</th>
-            <th>Status</th>
-        </tr>
-        {{ range .Packages }}
-        <tr>
-            <td>{{ .ImportPath }}</a></td>
-            <td>{{ .HasTests }}</td>
-            <td>{{ .Status }}</td>
-        </tr>
-        {{ end }}
-    </table>
+    <section class="summary" aria-label="Overall statistics">
+        <div class="head">Object</div><div class="head">Total</div><div class="head">Done</div><div class="head">Cached</div><div class="head">Afresh</div><div class="head">Remain</div>
+        <div class="kind">Package binaries</div><div><b>{{ .PackagesTotal }}</b></div><div><b>{{ .PackagesLinked }}</b></div><div><b>{{ .PackagesLinkCache }}</b></div><div><b>{{ .PackagesLinkFresh }}</b></div><div><b>{{ .LinksRemaining }}</b></div>
+        <div class="kind">Packages tested</div><div><b>{{ .PackagesTotal }}</b></div><div><b>{{ .PackagesDone }}</b></div><div><b>{{ .PackagesTestCache }}</b></div><div><b>{{ .PackagesTestFresh }}</b></div><div><b>{{ .PackagesRemaining }}</b></div>
+        <div class="kind">Tests</div><div><b>{{ .TestsTotal }}</b></div><div><b>{{ .TestsDone }}</b> <span class="subtle">({{ .TestsPassed }} passed{{ if .TestsFailed }} · <span class="failed">{{ .TestsFailed }} failed</span>{{ end }}{{ if .TestsFlaky }} · <span class="flaky">{{ .TestsFlaky }} flaky</span>{{ end }})</span></div><div>{{ if .TestCacheDisabled }}<span class="subtle">disabled</span>{{ else }}<b>{{ .TestsCached }}</b>{{ end }}</div><div><b>{{ .TestsFresh }}</b></div><div><b>{{ .TestsRunning }}</b> running · <b>{{ .TestsRemaining }}</b> remain</div>
+        <div class="kind">Build dependencies</div><div><b>{{ .BuildDepsTotal }}</b></div><div class="subtle">unavailable</div><div class="subtle">unavailable</div><div class="subtle">unavailable</div><div class="subtle">unavailable</div>
+        <div class="kind">Binary size</div><div><b>{{ .BinarySize }}</b></div><div class="subtle">—</div><div class="subtle">—</div><div class="subtle">—</div><div class="subtle">—</div>
+    </section>
+
+    {{ if .Issues }}
+    <section>
+        <h2>Failures and flakes ({{ len .Issues }})</h2>
+        <div class="issues">
+            {{ range .Issues }}
+            <details id="{{ .ID }}">
+                <summary><span class="{{ if .Flaky }}flaky{{ else }}failed{{ end }}">{{ .Status }}</span>: {{ .Name }} ({{ .Attempts }} attempts)</summary>
+                <pre>{{ .Output }}</pre>
+            </details>
+            {{ end }}
+        </div>
+    </section>
+    {{ end }}
+
+    <section>
+        <h2>Test packages</h2>
+        <table id="packages">
+            <thead>
+                <tr>
+                    <th><button type="button" data-sort="name">Package</button></th>
+                    <th><button type="button" data-sort="tests">Tests</button></th>
+                    <th><button type="button" data-sort="status">Status</button></th>
+                    <th><button type="button" data-sort="changed" data-direction="desc">Last changed</button></th>
+                </tr>
+            </thead>
+            <tbody>
+                {{ range .Packages }}
+                <tr data-name="{{ .ImportPath }}" data-tests="{{ .NumTests }}" data-status="{{ .Status }}" data-changed="{{ .LastChangedUnix }}">
+                    <td>{{ .ImportPath }}</td>
+                    <td>{{ if .NumTestsKnown }}{{ .NumTests }}{{ else }}—{{ end }}</td>
+                    <td class="{{ if .Passed }}passed{{ else if .Failed }}failed{{ end }}">{{ .Status }}</td>
+                    <td>{{ .LastChanged }}</td>
+                </tr>
+                {{ end }}
+            </tbody>
+        </table>
+    </section>
     <script src="/live.js"></script>
 </body>
 </html>

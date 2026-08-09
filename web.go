@@ -20,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/coder/websocket"
 	"tailscale.com/ipn/ipnstate"
@@ -36,6 +37,8 @@ var liveJS []byte
 var rootTmpl = template.Must(template.New("root").Parse(rootTemplateHTML))
 
 const liveUpdateInterval = 500 * time.Millisecond
+
+const webFailureOutputLimit = 500 << 10
 
 type htmlPatch struct {
 	Seq    uint64 `json:"seq"`
@@ -363,19 +366,54 @@ type statusData struct {
 	StartedAt  string
 	StartedAgo string
 	Phase      runPhase
+	ExitStatus string
+	ExitClass  string
+
+	PackagesTotal     int
+	PackagesLinked    int
+	PackagesLinkFresh int
+	PackagesLinkCache int
+	PackagesDone      int
+	PackagesTestCache int
+	PackagesTestFresh int
+	PackagesRemaining int
+	LinksRemaining    int
+	BinarySize        string
+	TestsTotal        int
+	TestsDone         int
+	TestsPassed       int
+	TestsCached       int
+	TestCacheDisabled bool
+	TestsFresh        int
+	TestsFailed       int
+	TestsFlaky        int
+	TestsRunning      int
+	TestsRemaining    int
+	BuildDepsTotal    int
 
 	Packages []packageData
+	Issues   []testIssueData
 }
 
 // packageData is the html/template frozen version of a [packageStatus].
 type packageData struct {
-	ImportPath    string // import path
-	HasTests      bool
-	NumTestsKnown bool   // whether test binary has been listed and tests enumerated
-	NumTests      int    // number of tests
-	Status        string // TODO
-	Passed        bool   // whether all tests passed
-	Failed        bool   // whether any tests failed
+	ImportPath      string // import path
+	NumTestsKnown   bool   // whether test binary has been listed and tests enumerated
+	NumTests        int    // number of runnable top-level tests
+	Status          string
+	Passed          bool // whether all tests passed
+	Failed          bool // whether any tests failed
+	LastChanged     string
+	LastChangedUnix int64
+}
+
+type testIssueData struct {
+	ID       string
+	Name     string
+	Status   string
+	Flaky    bool
+	Output   string
+	Attempts int
 }
 
 func (s *Server) statusData() *statusData {
@@ -384,40 +422,184 @@ func (s *Server) statusData() *statusData {
 
 	now := time.Now()
 	d := &statusData{
-		StartedAt:  s.start.Format(time.RFC3339),
-		StartedAgo: now.Sub(s.start).Round(time.Second).String(),
-		Phase:      s.phase,
+		StartedAt:         s.start.Format(time.RFC3339),
+		StartedAgo:        formatAge(now, s.start),
+		Phase:             s.phase,
+		PackagesTotal:     s.pkgsWithTests,
+		TestsTotal:        s.testsTotal,
+		TestCacheDisabled: testCountSet,
+		BuildDepsTotal:    s.buildDepsTotal,
+	}
+	switch s.phase {
+	case phaseDone:
+		d.ExitStatus, d.ExitClass = "success", "passed"
+	case phaseFailed:
+		d.ExitStatus, d.ExitClass = "failure", "failed"
+	default:
+		d.ExitStatus = "not exited"
 	}
 
 	for _, importPath := range slices.Sorted(maps.Keys(s.pkgs)) {
 		ps := s.pkgs[importPath]
+		if !ps.glp.hasTests() {
+			continue
+		}
 		pd := packageData{
-			ImportPath: importPath,
-			HasTests:   ps.glp.hasTests(),
+			ImportPath:      importPath,
+			LastChanged:     formatAge(now, ps.changed),
+			LastChangedUnix: ps.changed.UnixNano(),
+		}
+		if ps.exeHash != "" {
+			d.PackagesLinked++
+			if ps.exeCached {
+				d.PackagesLinkCache++
+			} else {
+				d.PackagesLinkFresh++
+			}
 		}
 		switch ps.pkgState {
+		case pkgStateDiscovered:
+			pd.Status = "waiting to link"
 		case pkgStateBuilt:
-			pd.Status = "built, " + ps.exeHash[:min(len(ps.exeHash), 8)]
+			pd.Status = "linked"
 			if ps.tests != nil {
-				pd.Status += fmt.Sprintf(", %d tests", len(ps.tests))
+				pd.Status = "queued"
 			}
 		case pkgStateTesting:
 			pd.Status = "testing"
 		case pkgStateDone:
+			d.PackagesDone++
 			if ps.numFails > 0 {
 				pd.Status = fmt.Sprintf("FAILED in %v", ps.runIn)
 				pd.Failed = true
 			} else {
-				pd.Status = fmt.Sprintf("PASSED %d tests in %v", len(ps.tests), ps.runIn)
+				pd.Status = fmt.Sprintf("PASSED in %v", ps.runIn)
 				pd.Passed = true
 			}
 		}
 		if ps.tests != nil {
 			pd.NumTestsKnown = true
-			pd.NumTests = len(ps.tests)
+			allCached := true
+			hasRunnable := false
+			for testName, ts := range ps.tests {
+				if !isRunnableTopLevelTest(testName) {
+					continue
+				}
+				hasRunnable = true
+				pd.NumTests++
+				if ts.running {
+					d.TestsRunning++
+				}
+				if ts.done {
+					d.TestsDone++
+					if ts.cached {
+						d.TestsCached++
+					} else {
+						d.TestsFresh++
+						allCached = false
+					}
+					if ts.passed {
+						d.TestsPassed++
+						if len(ts.fails) > 0 {
+							d.TestsFlaky++
+							d.Issues = append(d.Issues, newTestIssue(importPath, testName, ts, true, len(d.Issues)))
+						}
+					} else {
+						d.TestsFailed++
+						d.Issues = append(d.Issues, newTestIssue(importPath, testName, ts, false, len(d.Issues)))
+					}
+				} else {
+					allCached = false
+				}
+			}
+			if ps.pkgState == pkgStateDone && hasRunnable {
+				if allCached {
+					d.PackagesTestCache++
+				} else {
+					d.PackagesTestFresh++
+				}
+			}
 		}
 		d.Packages = append(d.Packages, pd)
 	}
+	d.PackagesRemaining = max(0, d.PackagesTotal-d.PackagesDone)
+	d.LinksRemaining = max(0, d.PackagesTotal-d.PackagesLinked)
+	d.TestsRemaining = max(0, d.TestsTotal-d.TestsDone-d.TestsRunning)
+	var binaryBytes int64
+	for _, ps := range s.pkgs {
+		if ps.glp.hasTests() && ps.exeHash != "" {
+			binaryBytes += ps.exeSize
+		}
+	}
+	d.BinarySize = formatByteSize(binaryBytes)
+	slices.SortFunc(d.Issues, func(a, b testIssueData) int { return strings.Compare(a.Name, b.Name) })
 
 	return d
+}
+
+func formatAge(now, changed time.Time) string {
+	if changed.IsZero() || changed.After(now) {
+		return "0s ago"
+	}
+	return now.Sub(changed).Truncate(time.Second).String() + " ago"
+}
+
+func formatByteSize(n int64) string {
+	const unit = int64(1024)
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := unit, 0
+	for value := n / unit; value >= unit && exp < 3; value /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGT"[exp])
+}
+
+func newTestIssue(pkg, test string, ts *testStatus, flaky bool, id int) testIssueData {
+	status := "FAILED"
+	if flaky {
+		status = "FLAKY"
+	}
+	return testIssueData{
+		ID:       fmt.Sprintf("test-issue-%d", id),
+		Name:     pkg + "." + test,
+		Status:   status,
+		Flaky:    flaky,
+		Output:   boundedFailureOutput(ts.fails),
+		Attempts: ts.attempts,
+	}
+}
+
+func boundedFailureOutput(failures []failInfo) string {
+	const marker = "\n[output truncated at 500 KiB]\n"
+	var b strings.Builder
+	for i, failure := range failures {
+		segment := fmt.Sprintf("--- failed attempt %d (%v) ---\n%s", i+1, failure.dur, strings.ToValidUTF8(failure.out, "�"))
+		if b.Len()+len(segment) <= webFailureOutputLimit {
+			b.WriteString(segment)
+			if !strings.HasSuffix(segment, "\n") {
+				b.WriteByte('\n')
+			}
+			continue
+		}
+		remaining := webFailureOutputLimit - b.Len() - len(marker)
+		if remaining > 0 {
+			piece := segment[:min(remaining, len(segment))]
+			for len(piece) > 0 && !utf8.ValidString(piece) {
+				piece = piece[:len(piece)-1]
+			}
+			b.WriteString(piece)
+		}
+		result := b.String()
+		if len(result) > webFailureOutputLimit-len(marker) {
+			result = result[:webFailureOutputLimit-len(marker)]
+			for len(result) > 0 && !utf8.ValidString(result) {
+				result = result[:len(result)-1]
+			}
+		}
+		return result + marker
+	}
+	return b.String()
 }

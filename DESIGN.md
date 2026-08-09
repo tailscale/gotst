@@ -54,6 +54,21 @@ patch stream. The browser reconstructs the next document and morphs the live
 DOM in place, preserving the page rather than navigating or replacing the
 whole body.
 
+The frozen status snapshot contains only packages with test source, linked
+binary counts and sizes, per-test and per-package progress, last-change times,
+and failed or flaky attempts. Failure details are present in collapsed DOM
+elements so they are immediately inspectable, but output is capped at 500 KiB
+per test. Package columns are sorted in the browser, initially by most recent
+change, without altering the server's deterministic document order.
+
+The summary also counts the distinct package nodes in the selected test build
+graph, discovered with `go list -deps -test`. This is only a total. Go 1.26's
+structured build stream reports build output and failures, but not successful
+package compiles or cache hits, so gotst cannot truthfully show live
+done/cached/afresh dependency counts from `go test -json`. Obtaining those
+would require observing tool invocations (for example through `-toolexec`) or
+a richer cmd/go event protocol.
+
 At the end of `Server.Run`, after setting the terminal `done` or `failed`
 phase, gotst sends a final patch to every connected browser. Browsers
 acknowledge that sequence only after applying it. The runner waits for those

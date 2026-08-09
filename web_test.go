@@ -126,6 +126,86 @@ func TestHTMLPatch(t *testing.T) {
 	}
 }
 
+func TestStatusDataAndFailureOutput(t *testing.T) {
+	now := time.Now()
+	s := NewServer(runProfile{}, testSelection{})
+	defer s.Cleanup()
+	s.start = now.Add(-5 * time.Second)
+	s.phase = phaseTesting
+	s.pkgs = map[string]*packageStatus{
+		"example.com/notests": {glp: &goListPackage{ImportPath: "example.com/notests"}, changed: now},
+		"example.com/pkg": {
+			glp:      &goListPackage{ImportPath: "example.com/pkg", TestGoFiles: []string{"pkg_test.go"}},
+			pkgState: pkgStateDone,
+			exeHash:  "hash",
+			exeSize:  2 << 20,
+			numFails: 1,
+			runIn:    time.Second,
+			changed:  now.Add(-4 * time.Second),
+			tests: map[string]*testStatus{
+				"TestPass":  {done: true, passed: true, changed: now},
+				"TestFlaky": {done: true, passed: true, attempts: 2, changed: now, fails: []failInfo{{out: "flaky output"}}},
+				"TestFail":  {done: true, attempts: 4, changed: now, fails: []failInfo{{out: strings.Repeat("x", webFailureOutputLimit+100)}}},
+			},
+		},
+	}
+	s.pkgsWithTests = 1
+	s.testsTotal = 3
+	s.buildDepsTotal = 321
+
+	d := s.statusData()
+	if len(d.Packages) != 1 || d.Packages[0].NumTests != 3 {
+		t.Fatalf("packages = %+v; want one package with 3 tests", d.Packages)
+	}
+	if d.Packages[0].LastChanged != "4s ago" {
+		t.Fatalf("last changed = %q; want 4s ago", d.Packages[0].LastChanged)
+	}
+	if d.PackagesLinked != 1 || d.PackagesLinkFresh != 1 || d.PackagesTestFresh != 1 || d.BinarySize != "2.0 MiB" || d.TestsDone != 3 || d.TestsPassed != 2 || d.TestsFresh != 3 || d.TestsFailed != 1 || d.TestsFlaky != 1 || d.BuildDepsTotal != 321 {
+		t.Fatalf("status data = %+v", d)
+	}
+	if len(d.Issues) != 2 {
+		t.Fatalf("issues = %d; want 2", len(d.Issues))
+	}
+	for _, issue := range d.Issues {
+		if len(issue.Output) > webFailureOutputLimit {
+			t.Errorf("%s output is %d bytes; limit is %d", issue.Name, len(issue.Output), webFailureOutputLimit)
+		}
+	}
+	html, err := s.renderStatusHTML()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(html, "example.com/notests") || !strings.Contains(html, "example.com/pkg") {
+		t.Fatalf("rendered package filtering is wrong: %q", html)
+	}
+	for _, want := range []string{"Package binaries", "Build dependencies", "321", "2.0 MiB", "4s ago", "FAILED", "FLAKY", "flaky output", `data-sort="changed"`, "▶️ PLAY"} {
+		if !strings.Contains(html, want) {
+			t.Errorf("rendered status missing %q", want)
+		}
+	}
+}
+
+func TestStatusTestSummaryOmitsZeroIssuesAndShowsDisabledCache(t *testing.T) {
+	oldTestCountSet := testCountSet
+	testCountSet = true
+	t.Cleanup(func() { testCountSet = oldTestCountSet })
+
+	s := NewServer(runProfile{}, testSelection{})
+	defer s.Cleanup()
+	s.pkgs = map[string]*packageStatus{}
+	s.testsTotal = 4
+	html, err := s.renderStatusHTML()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(html, ">disabled</span>") {
+		t.Fatal("test summary does not show disabled cache")
+	}
+	if strings.Contains(html, "failed</span>") || strings.Contains(html, "flaky</span>") {
+		t.Fatalf("test summary shows zero failure or flake breakdown: %q", html)
+	}
+}
+
 func TestLiveWebSocketUpdatesAndFinalFlush(t *testing.T) {
 	s := NewServer(runProfile{}, testSelection{})
 	defer s.Cleanup()
@@ -186,7 +266,7 @@ func TestLiveWebSocketUpdatesAndFinalFlush(t *testing.T) {
 		final, finalAt = readPatch()
 		html = applyHTMLPatch(html, final)
 	}
-	if !strings.Contains(html, "Phase: done") {
+	if !strings.Contains(html, "Phase: <b>done</b>") {
 		t.Fatalf("final HTML missing done phase: %q", html)
 	}
 	if elapsed := finalAt.Sub(secondAt); elapsed < liveUpdateInterval-25*time.Millisecond {

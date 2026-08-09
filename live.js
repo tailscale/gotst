@@ -3,7 +3,9 @@
 
     var currentHTML = "";
     var ws = null;
-    var finished = false;
+    var stopped = false;
+    var reconnectTimer = null;
+    var sort = {key: "changed", direction: "desc"};
 
     function morph(live, fresh) {
         var liveChildren = live.childNodes;
@@ -33,12 +35,24 @@
     function morphAttrs(live, fresh) {
         for (var i = live.attributes.length - 1; i >= 0; i--) {
             var name = live.attributes[i].name;
+            if (live.tagName === "DETAILS" && name === "open") continue;
             if (!fresh.hasAttribute(name)) live.removeAttribute(name);
         }
         for (var j = 0; j < fresh.attributes.length; j++) {
             var attr = fresh.attributes[j];
             if (live.getAttribute(attr.name) !== attr.value) live.setAttribute(attr.name, attr.value);
         }
+    }
+
+    function setConnection(text, state) {
+        var node = document.getElementById("connection-status");
+        if (!node) return;
+        node.textContent = text;
+        node.className = "connection " + state;
+        var stop = document.getElementById("stop-live");
+        var start = document.getElementById("start-live");
+        if (stop) stop.disabled = stopped;
+        if (start) start.disabled = !stopped;
     }
 
     function applyPatch(patch) {
@@ -51,24 +65,96 @@
             .join("");
         var fresh = new DOMParser().parseFromString(currentHTML, "text/html");
         morph(document.body, fresh.body);
-        if (patch.final) {
-            finished = true;
-            ws.send(JSON.stringify({ack: patch.seq}));
+        bindControls();
+        sortPackages();
+        setConnection("Connected", "connected");
+        if (patch.final && ws) ws.send(JSON.stringify({ack: patch.seq}));
+    }
+
+    function sortPackages() {
+        var body = document.querySelector("#packages tbody");
+        if (!body) return;
+        var rows = Array.from(body.rows);
+        rows.sort(function(a, b) {
+            var av = a.dataset[sort.key] || "";
+            var bv = b.dataset[sort.key] || "";
+            if (sort.key === "tests" || sort.key === "changed") {
+                av = Number(av); bv = Number(bv);
+                return sort.direction === "asc" ? av - bv : bv - av;
+            }
+            var result = av.localeCompare(bv);
+            return sort.direction === "asc" ? result : -result;
+        });
+        rows.forEach(function(row) { body.appendChild(row); });
+        document.querySelectorAll("#packages th button").forEach(function(button) {
+            if (button.dataset.sort === sort.key) button.dataset.direction = sort.direction;
+            else delete button.dataset.direction;
+        });
+    }
+
+    function bindControls() {
+        var stop = document.getElementById("stop-live");
+        if (stop) {
+            stop.onclick = function() {
+                stopped = true;
+                if (reconnectTimer !== null) {
+                    clearTimeout(reconnectTimer);
+                    reconnectTimer = null;
+                }
+                if (ws) ws.close();
+                setConnection("Stopped", "stopped");
+            };
         }
+        var start = document.getElementById("start-live");
+        if (start) {
+            start.onclick = function() {
+                if (!stopped) return;
+                stopped = false;
+                connect();
+            };
+        }
+        document.querySelectorAll("#packages th button").forEach(function(button) {
+            button.onclick = function() {
+                var key = button.dataset.sort;
+                if (sort.key === key) sort.direction = sort.direction === "asc" ? "desc" : "asc";
+                else sort = {key: key, direction: "asc"};
+                sortPackages();
+            };
+        });
     }
 
     function connect() {
+        if (stopped) return;
+        if (reconnectTimer !== null) {
+            clearTimeout(reconnectTimer);
+            reconnectTimer = null;
+        }
+        currentHTML = "";
+        setConnection("Reconnecting…", "connecting");
         var proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-        ws = new WebSocket(proto + "//" + window.location.host + "/live-ws");
-        ws.onmessage = function(event) {
+        var socket = new WebSocket(proto + "//" + window.location.host + "/live-ws");
+        ws = socket;
+        socket.onopen = function() { setConnection("Connected", "connected"); };
+        socket.onmessage = function(event) {
             try { applyPatch(JSON.parse(event.data)); } catch (_) {}
         };
-        ws.onclose = function() {
+        socket.onclose = function() {
+            if (ws !== socket) return;
             ws = null;
-            if (!finished) setTimeout(connect, 1000);
+            if (stopped) {
+                setConnection("Stopped", "stopped");
+                return;
+            }
+            setConnection("Reconnecting…", "connecting");
+            reconnectTimer = setTimeout(connect, 1000);
         };
-        ws.onerror = function() { ws.close(); };
+        socket.onerror = function() {
+            setConnection("Disconnected", "disconnected");
+            socket.close();
+        };
     }
 
+    bindControls();
+    sortPackages();
     connect();
 })();

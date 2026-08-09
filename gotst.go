@@ -165,6 +165,7 @@ type Server struct {
 	mu                sync.Mutex
 	pkgs              map[string]*packageStatus // test package import path -> status
 	pkgsWithTests     int
+	buildDepsTotal    int
 	phase             runPhase
 	testsTotal        int
 	cacheChecks       int
@@ -184,13 +185,15 @@ type packageStatus struct {
 	// following fields guarded by [Server.mu]
 	pkgState  pkgState
 	exeHash   string // once known, the sha256 hex of test binary in Server.cacheDir
-	exeCached bool   // executable was restored from the linked-binary cache
+	exeSize   int64
+	exeCached bool // executable was restored from the linked-binary cache
 	workDir   string
 	exeArgs   []string
 	tests     map[string]*testStatus
 	numFails  int // number of tests in tests that failed
 	runErr    string
 	runIn     time.Duration
+	changed   time.Time
 }
 
 type testStatus struct {
@@ -198,9 +201,11 @@ type testStatus struct {
 	done     bool // if true, then test either passed or reach max failures
 	passed   bool
 	passedIn time.Duration // valid if passed is true
+	cached   bool
 	fails    []failInfo
 	attempts int
 	attrs    map[string]string
+	changed  time.Time
 }
 
 type failInfo struct {
@@ -345,8 +350,11 @@ func (s *Server) runDebugUncached() error {
 		ps.numFails = 0
 		ps.runErr = ""
 		ps.runIn = 0
+		now := time.Now()
+		ps.changed = now
 		for _, ts := range ps.tests {
-			*ts = testStatus{}
+			attrs := ts.attrs
+			*ts = testStatus{attrs: attrs, changed: now}
 		}
 	}
 	s.mu.Unlock()
@@ -390,7 +398,7 @@ func (s *Server) verifyDebugCacheTask(task testTask) {
 	s.mu.Unlock()
 	if seedError != "" {
 		s.reportDebugCacheMiss(task, key, "seed pass did not create a clean result", nil)
-		s.finishTest(task, true, 0, nil, nil)
+		s.finishTest(task, true, 0, nil, nil, false)
 		return
 	}
 	entry, err := s.testCache.Get(s.ctx, key)
@@ -400,24 +408,24 @@ func (s *Server) verifyDebugCacheTask(task testTask) {
 			reason = "reading seeded cache entry: " + err.Error()
 		}
 		s.reportDebugCacheMiss(task, key, reason, nil)
-		s.finishTest(task, true, 0, nil, nil)
+		s.finishTest(task, true, 0, nil, nil, false)
 		return
 	}
 	changes, err := changedDependencies(entry.Dependencies)
 	if err != nil {
 		s.reportDebugCacheMiss(task, key, "validating cached dependencies: "+err.Error(), nil)
-		s.finishTest(task, true, 0, nil, nil)
+		s.finishTest(task, true, 0, nil, nil, false)
 		return
 	}
 	if len(changes) != 0 {
 		s.reportDebugCacheMiss(task, key, "recorded inputs changed", changes)
-		s.finishTest(task, true, 0, nil, nil)
+		s.finishTest(task, true, 0, nil, nil, false)
 		return
 	}
 	s.mu.Lock()
 	s.cacheHits++
 	s.mu.Unlock()
-	s.finishTest(task, true, entry.PassedIn, nil, nil)
+	s.finishTest(task, true, entry.PassedIn, nil, nil, true)
 }
 
 func (s *Server) Cleanup() {
@@ -441,7 +449,8 @@ func (s *Server) addPackage(glp *goListPackage) {
 		s.pkgs = make(map[string]*packageStatus)
 	}
 	st := &packageStatus{
-		glp: glp,
+		glp:     glp,
+		changed: time.Now(),
 	}
 	s.pkgs[glp.ImportPath] = st
 	if glp.hasTests() {
@@ -580,6 +589,31 @@ func (s *Server) packagesWithTests() []string {
 	return ret
 }
 
+// learnBuildDependencyCount records the number of distinct packages in the
+// build graph for the selected test binaries. cmd/go does not report live
+// successful compile/cache progress, so this is a total only.
+func (s *Server) learnBuildDependencyCount(pkgs []string) error {
+	args := []string{
+		"list", "-buildvcs=false", "-deps", "-test",
+		"--tags=" + strings.Join(s.profile.Tags, ","), "-f={{.ImportPath}}",
+	}
+	args = append(args, pkgs...)
+	cmd := exec.Command(goCmd(), args...)
+	cmd.Dir = s.profile.Root
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("go list -deps -test: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	deps := make(map[string]struct{})
+	for _, dep := range strings.Fields(string(out)) {
+		deps[dep] = struct{}{}
+	}
+	s.mu.Lock()
+	s.buildDepsTotal = len(deps)
+	s.mu.Unlock()
+	return nil
+}
+
 // TestEvent is the text2json representation of a test event,
 // as documented in $GO/src/cmd/test2json/main.go, unioned with
 // the fields (well field singular) of BuildEvent, as "go test -json"
@@ -709,6 +743,9 @@ func (s *Server) buildAllTestBinaries() error {
 			log.Printf("No packages with tests")
 		}
 		return nil
+	}
+	if err := s.learnBuildDependencyCount(pkgs); err != nil && *verbose {
+		log.Printf("discovering build dependencies: %v", err)
 	}
 	args := []string{
 		"test",
@@ -864,6 +901,7 @@ func (s *Server) addTestBinary(pkg string, es ExecSnarf, cached bool) {
 	ps.exeCached = cached
 	ps.workDir = es.WorkingDir
 	ps.exeArgs = slices.Clone(es.Args)
+	ps.changed = time.Now()
 
 	absBin := filepath.Join(s.cacheDir, es.ExeHash)
 	fi, err := os.Stat(absBin)
@@ -871,6 +909,7 @@ func (s *Server) addTestBinary(pkg string, es ExecSnarf, cached bool) {
 		log.Fatalf("statting test binary for package %q: %v", pkg, err)
 	}
 	size := fi.Size()
+	ps.exeSize = size
 	mB := float64(size) / (1 << 20)
 
 	if *verbose {
@@ -929,15 +968,17 @@ func (s *Server) setPackageTests(pkg string, tests []string) {
 		log.Fatalf("internal error: setPackageTests: unknown package %q", pkg)
 	}
 	ps.tests = make(map[string]*testStatus)
+	now := time.Now()
 	for _, test := range tests {
 		if !s.tests.wants(pkg, test) {
 			continue
 		}
-		ps.tests[test] = &testStatus{}
+		ps.tests[test] = &testStatus{changed: now}
 		if isRunnableTopLevelTest(test) {
 			s.testsTotal++
 		}
 	}
+	ps.changed = now
 }
 
 type capturedTestBinary struct {
@@ -1154,6 +1195,7 @@ func (s *Server) allTestTasks() []testTask {
 		if len(tests) == 0 {
 			s.mu.Lock()
 			ps.pkgState = pkgStateDone
+			ps.changed = time.Now()
 			s.mu.Unlock()
 		}
 	}
@@ -1236,7 +1278,7 @@ func (s *Server) runTest(task testTask) error {
 				s.mu.Lock()
 				s.cacheHits++
 				s.mu.Unlock()
-				s.finishTest(task, true, entry.PassedIn, nil, nil)
+				s.finishTest(task, true, entry.PassedIn, nil, nil, true)
 				s.printTestResult(task, entry.PassedIn, true, true, "")
 				return nil
 			}
@@ -1253,7 +1295,10 @@ func (s *Server) runTest(task testTask) error {
 	s.mu.Lock()
 	ps := s.pkgs[bin.pkg]
 	ps.pkgState = pkgStateTesting
+	now := time.Now()
+	ps.changed = now
 	ps.tests[task.test].running = true
+	ps.tests[task.test].changed = now
 	s.mu.Unlock()
 
 	var total time.Duration
@@ -1286,7 +1331,7 @@ func (s *Server) runTest(task testTask) error {
 			}
 			failures = append(failures, failInfo{dur: d, out: output})
 			if retry == *maxRetries {
-				s.finishTest(task, false, total, failures, err)
+				s.finishTest(task, false, total, failures, err, false)
 				s.recordHistory(task, history.OutcomeFail, total, totalAttempts, completeHistoryDeps(historyDeps, historyDepsComplete))
 				s.printTestResult(task, d, false, false, output)
 				return err
@@ -1319,7 +1364,7 @@ func (s *Server) runTest(task testTask) error {
 		}
 		s.setDebugSeedError(key, reason)
 	}
-	s.finishTest(task, true, total, failures, nil)
+	s.finishTest(task, true, total, failures, nil, false)
 	outcome := history.OutcomePass
 	if len(failures) != 0 {
 		outcome = history.OutcomeFlaky
@@ -1460,19 +1505,26 @@ func (s *Server) recordTestAttrs(task testTask, attrs map[string]string) {
 
 func (s *Server) stopRunningTest(task testTask) {
 	s.mu.Lock()
-	s.pkgs[task.bin.pkg].tests[task.test].running = false
+	ps := s.pkgs[task.bin.pkg]
+	ps.tests[task.test].running = false
+	ps.tests[task.test].changed = time.Now()
+	ps.changed = time.Now()
 	s.mu.Unlock()
 }
 
-func (s *Server) finishTest(task testTask, passed bool, d time.Duration, failures []failInfo, err error) {
+func (s *Server) finishTest(task testTask, passed bool, d time.Duration, failures []failInfo, err error, cached bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	ps := s.pkgs[task.bin.pkg]
 	ts := ps.tests[task.test]
+	now := time.Now()
 	ts.running = false
 	ts.done = true
 	ts.passed = passed
+	ts.cached = cached
 	ts.fails = append(ts.fails, failures...)
+	ts.changed = now
+	ps.changed = now
 	if passed {
 		ts.passedIn = d
 	} else {
@@ -1491,6 +1543,7 @@ func (s *Server) finishTest(task testTask, passed bool, d time.Duration, failure
 	}
 	if allDone {
 		ps.pkgState = pkgStateDone
+		ps.changed = now
 	}
 }
 
