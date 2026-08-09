@@ -451,7 +451,7 @@ func (p *goListPackage) hasTests() bool {
 func (s *Server) resolveQualifiedTests() error {
 	for i := range s.tests.qualified {
 		q := &s.tests.qualified[i]
-		args := []string{"list", "--tags=" + strings.Join(s.profile.Tags, ","), "-f={{.ImportPath}}", q.packageSpec}
+		args := []string{"list", "-buildvcs=false", "--tags=" + strings.Join(s.profile.Tags, ","), "-f={{.ImportPath}}", q.packageSpec}
 		cmd := exec.Command(goCmd(), args...)
 		cmd.Dir = s.profile.Root
 		out, err := cmd.CombinedOutput()
@@ -480,7 +480,10 @@ func (s *Server) learnPackagesWithTests() error {
 	if err != nil {
 		return err
 	}
-	args := []string{"list", "--tags=" + strings.Join(s.profile.Tags, ","), "--json"}
+	// Package discovery does not use VCS stamping. Disabling it also prevents
+	// Git from briefly creating .git/index.lock while checking repository
+	// status, which would invalidate cached tests that inspect the source tree.
+	args := []string{"list", "-buildvcs=false", "--tags=" + strings.Join(s.profile.Tags, ","), "--json"}
 	args = append(args, s.profile.Packages...)
 	cmd := exec.Command(goCmd(), args...)
 	cmd.Dir = s.profile.Root
@@ -542,7 +545,7 @@ func (s *Server) resolveExcludedPackages() (map[string]bool, error) {
 	if len(s.profile.ExcludePackages) == 0 {
 		return ret, nil
 	}
-	args := []string{"list", "--tags=" + strings.Join(s.profile.Tags, ","), "-f={{.ImportPath}}"}
+	args := []string{"list", "-buildvcs=false", "--tags=" + strings.Join(s.profile.Tags, ","), "-f={{.ImportPath}}"}
 	args = append(args, s.profile.ExcludePackages...)
 	cmd := exec.Command(goCmd(), args...)
 	cmd.Dir = s.profile.Root
