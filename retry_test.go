@@ -92,6 +92,12 @@ func TestRetryAndCountEndToEnd(t *testing.T) {
 		if !strings.Contains(out, "1 test(s) failed") {
 			t.Fatalf("output missing failure summary:\n%s", out)
 		}
+		if !strings.Contains(out, "FAILED: attempttest.TestAttempts") {
+			t.Fatalf("output missing immediate failure marker:\n%s", out)
+		}
+		if marker, diagnostics := strings.Index(out, "FAILED: attempttest.TestAttempts"), strings.Index(out, "intentional failure"); diagnostics < 0 || marker > diagnostics {
+			t.Fatalf("failure marker did not precede diagnostics:\n%s", out)
+		}
 		if strings.Contains(out, "FLAKY TESTS") {
 			t.Fatalf("failed test reported as flaky:\n%s", out)
 		}

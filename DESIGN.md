@@ -323,9 +323,14 @@ supports a shared production service. Backend errors are reported with `-vlog`
 and otherwise ignored so history availability cannot affect whether tests run
 or whether a run passes.
 
-The scheduler does not consume the retrieved histories yet. Recording and
-transport are implemented first so useful data accumulates before
-history-driven scheduling is enabled.
+The scheduler uses the newest observation for each test. Tests whose newest
+outcome is `fail` run before the rest, giving likely regressions an early start
+and faster feedback. Within the failed and non-failed groups, tests run from
+longest to shortest newest observed duration. Tests without history have a
+zero estimate and sort last. This longest-processing-time-first order reduces
+the chance that a slow test becomes a straggler after other workers go idle.
+History remains advisory: missing or unavailable history falls back to stable
+package-and-test ordering and never changes the result of a run.
 
 ### Identity and observations
 

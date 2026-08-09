@@ -94,9 +94,9 @@ Use `-history=off` to disable history. In a shared production environment,
 `GOTST_HISTORY_TOKEN` supplies an optional bearer token. History service and
 local history failures are soft failures and do not stop tests.
 
-The current implementation collects and retrieves history but does not yet
-change scheduling. It establishes the storage and protocol needed for future
-duration- and memory-aware scheduling and conservative batching. See
+Before execution, gotst uses history to schedule tests whose newest observation
+failed first, then orders each group from slowest to fastest by its newest
+observed duration. Unknown tests sort after tests with known durations. See
 [DESIGN.md](DESIGN.md#test-history) for identity, protocol, and database
 details. Go implementations can import
 `github.com/tailscale/gotst/history` for the store interface and versioned HTTP

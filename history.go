@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -14,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net/http"
 	"net/url"
 	"os"
@@ -466,6 +468,64 @@ func (s *Server) loadHistory(tasks []testTask) {
 	if *verbose {
 		log.Printf("loaded history for %d/%d selected tests", len(histories), len(keys))
 	}
+}
+
+// orderTestTasksByHistory applies longest-processing-time-first scheduling,
+// with tests whose newest observation failed placed ahead of all other tests.
+// Starting likely failures early gives useful feedback sooner; starting long
+// tests before short ones reduces the chance that one straggler extends the
+// end of an otherwise idle run.
+func (s *Server) orderTestTasksByHistory(tasks []testTask) {
+	s.mu.Lock()
+	histories := maps.Clone(s.histories)
+	s.mu.Unlock()
+	type priority struct {
+		failed   bool
+		known    bool
+		duration time.Duration
+	}
+	priorities := make(map[string]priority, len(tasks))
+	for _, task := range tasks {
+		key := historyKeyForTask(task, s.profile)
+		h := histories[key.ID()]
+		if h == nil || len(h.Observations) == 0 {
+			continue
+		}
+		latest := h.Observations[0]
+		for _, obs := range h.Observations[1:] {
+			if compareHistoryObservations(obs, latest) < 0 {
+				latest = obs
+			}
+		}
+		priorities[task.bin.pkg+"\x00"+task.test] = priority{
+			failed:   latest.Outcome == history.OutcomeFail,
+			known:    true,
+			duration: latest.Duration,
+		}
+	}
+	slices.SortFunc(tasks, func(a, b testTask) int {
+		ap := priorities[a.bin.pkg+"\x00"+a.test]
+		bp := priorities[b.bin.pkg+"\x00"+b.test]
+		if ap.failed != bp.failed {
+			if ap.failed {
+				return -1
+			}
+			return 1
+		}
+		if ap.duration != bp.duration {
+			return cmp.Compare(bp.duration, ap.duration)
+		}
+		if ap.known != bp.known {
+			if ap.known {
+				return -1
+			}
+			return 1
+		}
+		if c := strings.Compare(a.bin.pkg, b.bin.pkg); c != 0 {
+			return c
+		}
+		return strings.Compare(a.test, b.test)
+	})
 }
 
 func (s *Server) recordHistory(task testTask, outcome history.Outcome, duration time.Duration, attempts int, deps []cacheDependency) {

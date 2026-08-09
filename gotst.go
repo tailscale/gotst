@@ -1055,6 +1055,7 @@ func (s *Server) runAllTests() error {
 	}
 	tasks := s.allTestTasks()
 	s.loadHistory(tasks)
+	s.orderTestTasksByHistory(tasks)
 	if *verbose {
 		log.Printf("Running %d tests in %d packages with up to %d concurrent processes...", len(tasks), len(bins), *jobs)
 	}
@@ -1495,6 +1496,7 @@ func (s *Server) printTestResult(task testTask, d time.Duration, cached, passed 
 	s.outMu.Lock()
 	defer s.outMu.Unlock()
 	if !passed {
+		fmt.Fprintf(os.Stdout, "FAILED: %s.%s\n", task.bin.pkg, task.test)
 		fmt.Fprintf(os.Stdout, "%s", output)
 		fmt.Fprintf(os.Stdout, "FAIL\t%s\t%s\t%s\n", task.bin.pkg, task.test, d)
 	} else if cached {

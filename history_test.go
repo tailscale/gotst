@@ -251,3 +251,44 @@ func TestHistoryKeyIgnoresBinaryAndCheckout(t *testing.T) {
 		t.Fatalf("history IDs differ across binaries/checkouts: %s != %s", k1.ID(), k2.ID())
 	}
 }
+
+func TestOrderTestTasksByHistory(t *testing.T) {
+	profile := runProfile{}
+	task := func(name string) testTask {
+		return testTask{bin: capturedTestBinary{pkg: "example.com/p", absBin: "/cache/hash", workDir: "/checkout/p"}, test: name}
+	}
+	failedFast := task("TestFailedFast")
+	failedSlow := task("TestFailedSlow")
+	passedFast := task("TestPassedFast")
+	passedSlow := task("TestPassedSlow")
+	unknown := task("TestUnknown")
+	tasks := []testTask{passedFast, unknown, failedFast, passedSlow, failedSlow}
+
+	now := time.Now().UTC()
+	s := &Server{profile: profile, histories: make(map[string]*history.History)}
+	add := func(task testTask, observations ...history.Observation) {
+		key := historyKeyForTask(task, profile)
+		for i := range observations {
+			observations[i].Key = key
+		}
+		s.histories[key.ID()] = &history.History{Version: history.Version, Key: key, Observations: observations}
+	}
+	add(failedFast,
+		history.Observation{ID: "old-pass", ObservedAt: now.Add(-time.Hour), Outcome: history.OutcomePass, Duration: time.Hour},
+		history.Observation{ID: "new-fail", ObservedAt: now, Outcome: history.OutcomeFail, Duration: time.Second})
+	add(failedSlow, history.Observation{ID: "fail", ObservedAt: now, Outcome: history.OutcomeFail, Duration: 10 * time.Second})
+	add(passedFast,
+		history.Observation{ID: "old-fail", ObservedAt: now.Add(-time.Hour), Outcome: history.OutcomeFail, Duration: time.Hour},
+		history.Observation{ID: "new-pass", ObservedAt: now, Outcome: history.OutcomePass})
+	add(passedSlow, history.Observation{ID: "pass-slow", ObservedAt: now, Outcome: history.OutcomePass, Duration: 20 * time.Second})
+
+	s.orderTestTasksByHistory(tasks)
+	got := make([]string, len(tasks))
+	for i, task := range tasks {
+		got[i] = task.test
+	}
+	want := []string{"TestFailedSlow", "TestFailedFast", "TestPassedSlow", "TestPassedFast", "TestUnknown"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("ordered tests = %q; want %q", got, want)
+	}
+}
