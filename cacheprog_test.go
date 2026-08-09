@@ -171,6 +171,17 @@ func TestCacheShimLifecycle(t *testing.T) {
 	if fi, err := os.Stat(hit.DiskPath); err != nil || fi.Mode()&0100 == 0 {
 		t.Fatalf("materialized executable mode: %v, %v", fi, err)
 	}
+	wantHash, wantSize, err := hashFile(testExe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotHash, gotSize, ok := lookupVerifiedTestExecutable(socket, hit.DiskPath)
+	if !ok || gotHash != hex.EncodeToString(wantHash) || gotSize != wantSize {
+		t.Fatalf("verified executable = %q, %d, %v; want %x, %d, true", gotHash, gotSize, ok, wantHash, wantSize)
+	}
+	if _, _, ok := lookupVerifiedTestExecutable(socket, filepath.Join(temp, "unknown")); ok {
+		t.Fatal("unknown executable reported as verified")
+	}
 	if err := enc.Encode(&cacheProgRequest{ID: 3, Command: cacheProgClose}); err != nil {
 		t.Fatal(err)
 	}
@@ -182,10 +193,7 @@ func TestCacheShimLifecycle(t *testing.T) {
 
 	// cmd/go has closed its frontend connection, but a late -exec wrapper can
 	// still upload the linked executable through the parent-owned broker.
-	outputID, size, err := hashFile(testExe)
-	if err != nil {
-		t.Fatal(err)
-	}
+	outputID, size := wantHash, wantSize
 	if err := registerTestExecutable(socket, testExe, hex.EncodeToString(outputID), size); err != nil {
 		t.Fatalf("late executable registration: %v", err)
 	}

@@ -1587,20 +1587,26 @@ func storeTestExecBinary(dir string) {
 	if err != nil {
 		log.Fatalf("getting working directory: %v", err)
 	}
-	f, err := os.Open(os.Args[1])
-	if err != nil {
-		log.Fatalf("opening test binary: %v", err)
-	}
-	defer f.Close()
-
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		log.Fatalf("hashing test binary: %v", err)
+	binPath := os.Args[1]
+	socket := os.Getenv(cacheShimSocketEnv)
+	exeHash, verifiedSize, verified := lookupVerifiedTestExecutable(socket, binPath)
+	var f *os.File
+	if !verified {
+		f, err = os.Open(binPath)
+		if err != nil {
+			log.Fatalf("opening test binary: %v", err)
+		}
+		defer f.Close()
+		h := sha256.New()
+		if _, err := io.Copy(h, f); err != nil {
+			log.Fatalf("hashing test binary: %v", err)
+		}
+		exeHash = fmt.Sprintf("%x", h.Sum(nil))
 	}
 
 	co := &ExecSnarf{
 		WorkingDir: pwd,
-		ExeHash:    fmt.Sprintf("%x", h.Sum(nil)),
+		ExeHash:    exeHash,
 		Args:       os.Args[2:],
 	}
 	coj, err := json.Marshal(co)
@@ -1609,12 +1615,19 @@ func storeTestExecBinary(dir string) {
 	}
 
 	target := filepath.Join(dir, co.ExeHash)
-	if err := os.Link(os.Args[1], target); err != nil {
+	if err := os.Link(binPath, target); err != nil {
 		// Hardlinked failed. Maybe we're on Windows, or maybe we're going
 		// across filesystems. Just copy instead.
 		of, err := os.CreateTemp(dir, co.ExeHash+"*")
 		if err != nil {
 			log.Fatalf("creating temp file in capture dir: %v", err)
+		}
+		if f == nil {
+			f, err = os.Open(binPath)
+			if err != nil {
+				log.Fatalf("opening test binary for copy: %v", err)
+			}
+			defer f.Close()
 		}
 		if _, err := f.Seek(0, 0); err != nil {
 			log.Fatalf("seeking to beginning of test binary: %v", err)
@@ -1632,13 +1645,18 @@ func storeTestExecBinary(dir string) {
 			log.Fatalf("renaming copied test binary to final name: %v", err)
 		}
 	}
-	if socket := os.Getenv(cacheShimSocketEnv); socket != "" {
+	if socket != "" && !verified {
 		fi, err := os.Stat(target)
 		if err != nil {
 			log.Fatalf("statting captured test binary: %v", err)
 		}
 		if err := registerTestExecutable(socket, target, co.ExeHash, fi.Size()); err != nil {
 			log.Printf("not caching test executable: %v", err)
+		}
+	}
+	if verified {
+		if fi, err := os.Stat(target); err != nil || fi.Size() != verifiedSize {
+			log.Fatalf("captured verified executable changed size: got %v, %v; want %d bytes", fi, err, verifiedSize)
 		}
 	}
 	fmt.Printf("ExecSnarf:%s\n", coj)

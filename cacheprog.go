@@ -37,6 +37,7 @@ const (
 	localCacheProgArg  = "-gotst-local-cache-prog"
 	cacheConnCmdGo     = byte('C')
 	cacheConnRegister  = byte('R')
+	cacheConnVerified  = byte('V')
 )
 
 type cacheProgCommand string
@@ -243,6 +244,11 @@ type executableRegistration struct {
 	Size       int64
 }
 
+type verifiedExecutable struct {
+	OutputHash string
+	Size       int64
+}
+
 type cacheShim struct {
 	downstream        *cacheProgClient
 	execDir           string
@@ -256,10 +262,11 @@ type cacheShim struct {
 	execHits          atomic.Int64
 	execPuts          atomic.Int64
 
-	mu       sync.Mutex
-	misses   map[string][]byte // 120-bit build-ID prefix -> full action ID
-	uploaded map[string]bool
-	execHit  map[string]bool // SHA-256 output ID of each executable cache hit
+	mu           sync.Mutex
+	misses       map[string][]byte // 120-bit build-ID prefix -> full action ID
+	uploaded     map[string]bool
+	execHit      map[string]bool               // SHA-256 output ID of each executable cache hit
+	verifiedExec map[string]verifiedExecutable // cleaned executable path -> verified metadata
 }
 
 // runCacheShim runs in the child process started by cmd/go. The gotst parent
@@ -309,6 +316,7 @@ func startCacheShim(command, socket string, helperEnv ...string) (*cacheShim, er
 	shim := &cacheShim{
 		downstream: downstream, execDir: execDir, listener: ln, socket: socket, endpoint: socket,
 		misses: make(map[string][]byte), uploaded: make(map[string]bool), execHit: make(map[string]bool),
+		verifiedExec: make(map[string]verifiedExecutable),
 	}
 	shim.acceptDone = make(chan struct{})
 	go shim.acceptLoop()
@@ -336,6 +344,7 @@ func startRunCacheShim(command string, helperEnv ...string) (*cacheShim, error) 
 			downstream: downstream, execDir: execDir, listener: ln,
 			endpoint: "tcp:" + ln.Addr().String(), socketDir: execDir,
 			misses: make(map[string][]byte), uploaded: make(map[string]bool), execHit: make(map[string]bool),
+			verifiedExec: make(map[string]verifiedExecutable),
 		}
 		shim.acceptDone = make(chan struct{})
 		go shim.acceptLoop()
@@ -458,8 +467,17 @@ func (s *cacheShim) forward(ctx context.Context, req cacheProgRequest) (*cachePr
 			return &cacheProgResponse{Miss: true}, nil
 		}
 		res.DiskPath = path
+		fi, err := os.Stat(path)
+		if err != nil || !fi.Mode().IsRegular() {
+			s.recordMiss(req.ActionID)
+			return &cacheProgResponse{Miss: true}, nil
+		}
 		s.mu.Lock()
-		s.execHit[hex.EncodeToString(res.OutputID)] = true
+		outputHash := hex.EncodeToString(res.OutputID)
+		s.execHit[outputHash] = true
+		s.verifiedExec[filepath.Clean(path)] = verifiedExecutable{
+			OutputHash: outputHash, Size: fi.Size(),
+		}
 		s.mu.Unlock()
 		s.execHits.Add(1)
 	}
@@ -533,6 +551,23 @@ func (s *cacheShim) acceptLoop() {
 			}
 			if kind[0] == cacheConnCmdGo {
 				_ = s.serveCmdGo(conn, conn)
+				return
+			}
+			if kind[0] == cacheConnVerified {
+				var req struct{ Path string }
+				var res struct {
+					OutputHash string `json:",omitempty"`
+					Size       int64  `json:",omitempty"`
+				}
+				if json.NewDecoder(conn).Decode(&req) == nil {
+					s.mu.Lock()
+					verified, ok := s.verifiedExec[filepath.Clean(req.Path)]
+					s.mu.Unlock()
+					if ok {
+						res.OutputHash, res.Size = verified.OutputHash, verified.Size
+					}
+				}
+				_ = json.NewEncoder(conn).Encode(&res)
 				return
 			}
 			if kind[0] != cacheConnRegister {
@@ -656,6 +691,28 @@ func registerTestExecutable(socket, path, outputHash string, size int64) error {
 		return errors.New(res.Err)
 	}
 	return nil
+}
+
+func lookupVerifiedTestExecutable(socket, path string) (outputHash string, size int64, ok bool) {
+	conn, err := dialCacheEndpoint(socket)
+	if err != nil {
+		return "", 0, false
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte{cacheConnVerified}); err != nil {
+		return "", 0, false
+	}
+	if err := json.NewEncoder(conn).Encode(struct{ Path string }{path}); err != nil {
+		return "", 0, false
+	}
+	var res struct {
+		OutputHash string `json:",omitempty"`
+		Size       int64  `json:",omitempty"`
+	}
+	if err := json.NewDecoder(conn).Decode(&res); err != nil || !validCacheHex(res.OutputHash) || res.Size < 0 {
+		return "", 0, false
+	}
+	return res.OutputHash, res.Size, true
 }
 
 func actionIDPrefix(actionID []byte) string {
