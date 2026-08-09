@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -397,6 +398,7 @@ type statusData struct {
 
 	Packages []packageData
 	Issues   []testIssueData
+	Slowest  []slowTestData
 }
 
 // packageData is the html/template frozen version of a [packageStatus].
@@ -419,6 +421,12 @@ type testIssueData struct {
 	Flaky    bool
 	Output   string
 	Attempts int
+}
+
+type slowTestData struct {
+	Name     string
+	Duration time.Duration
+	Cached   bool
 }
 
 func (s *Server) statusData() *statusData {
@@ -500,6 +508,9 @@ func (s *Server) statusData() *statusData {
 				if ts.done {
 					pd.NumTestsDone++
 					d.TestsDone++
+					d.Slowest = append(d.Slowest, slowTestData{
+						Name: importPath + "." + testName, Duration: testDuration(ts), Cached: ts.cached,
+					})
 					if ts.cached {
 						d.TestsCached++
 					} else {
@@ -546,8 +557,26 @@ func (s *Server) statusData() *statusData {
 	}
 	d.BinarySize = formatByteSize(binaryBytes)
 	slices.SortFunc(d.Issues, func(a, b testIssueData) int { return strings.Compare(a.Name, b.Name) })
+	slices.SortFunc(d.Slowest, func(a, b slowTestData) int {
+		if c := cmp.Compare(b.Duration, a.Duration); c != 0 {
+			return c
+		}
+		return strings.Compare(a.Name, b.Name)
+	})
+	d.Slowest = d.Slowest[:min(50, len(d.Slowest))]
 
 	return d
+}
+
+func testDuration(ts *testStatus) time.Duration {
+	if ts.passed {
+		return ts.passedIn
+	}
+	var total time.Duration
+	for _, failure := range ts.fails {
+		total += failure.dur
+	}
+	return total
 }
 
 func formatAge(now, changed time.Time) string {

@@ -18,6 +18,8 @@
         .live button { cursor: pointer; font-size: .8rem; padding: .15rem .45rem; }
         .live button:disabled { cursor: default; opacity: .45; }
         .run-meta { color: #64748b; margin: .65rem 0; }
+        .jump { margin: -.2rem 0 .65rem; }
+        .jump a { color: #2563eb; }
         .summary { border: 1px solid color-mix(in srgb, CanvasText 17%, Canvas); border-radius: .45rem; display: inline-grid; font-size: .9rem; grid-template-columns: minmax(11rem, auto) repeat(5, minmax(7.5rem, auto)); margin: .8rem 0 1.1rem; overflow: hidden; }
         .summary > div { border-bottom: 1px solid color-mix(in srgb, CanvasText 12%, Canvas); padding: .35rem .65rem; }
         .summary > div:not(:nth-child(6n+1)) { text-align: right; }
@@ -38,6 +40,11 @@
         td:nth-child(2), th:nth-child(2) { text-align: right; }
         td:last-child, th:last-child { white-space: nowrap; }
         .issues { display: grid; gap: .45rem; }
+        .cached-result { color: #64748b; font-style: italic; }
+        .slowest { counter-reset: slow-test; list-style: none; margin: 0; max-width: 70rem; padding: 0; }
+        .slowest li { border-bottom: 1px solid color-mix(in srgb, CanvasText 12%, Canvas); counter-increment: slow-test; display: grid; gap: .75rem; grid-template-columns: 2.5rem 1fr auto; padding: .32rem .5rem; }
+        .slowest li::before { color: #64748b; content: counter(slow-test) "."; text-align: right; }
+        .duration { font-variant-numeric: tabular-nums; }
         details { border: 1px solid color-mix(in srgb, CanvasText 17%, Canvas); border-radius: .4rem; }
         summary { cursor: pointer; padding: .45rem .6rem; }
         pre { background: color-mix(in srgb, CanvasText 7%, Canvas); margin: 0; max-height: 40rem; overflow: auto; padding: .75rem; white-space: pre-wrap; word-break: break-word; }
@@ -48,9 +55,10 @@
         <h1>gotst</h1>
         <span class="live"><span id="connection-status" class="connection connecting">Connecting…</span><button id="stop-live" type="button" title="Stop reconnecting">🛑 STOP</button><button id="start-live" type="button" title="Resume reconnecting" disabled>▶️ PLAY</button></span>
         <p class="run-meta">Started at {{ .StartedAt }} ({{ .StartedAgo }}) · Phase: <b>{{ .Phase }}</b> · Last exit: <b class="{{ .ExitClass }}">{{ .ExitStatus }}</b></p>
+        <nav class="jump" aria-label="Page sections"><a href="#summary">Summary</a>{{ if .Issues }} &middot; <a href="#issues">Failures</a>{{ end }} &middot; <a href="#packages">Packages</a> &middot; <a href="#slowest">Slowest</a></nav>
     </header>
 
-    <section class="summary" aria-label="Overall statistics">
+    <section id="summary" class="summary" aria-label="Overall statistics">
         <div class="head">Object</div><div class="head">Total</div><div class="head">Done</div><div class="head">Cached</div><div class="head">Afresh</div><div class="head">Remain</div>
         <div class="kind">Package binaries</div><div><b>{{ .PackagesTotal }}</b></div><div><b>{{ .PackagesLinked }}</b></div><div><b>{{ .PackagesLinkCache }}</b></div><div><b>{{ .PackagesLinkFresh }}</b></div><div><b>{{ .LinksRemaining }}</b></div>
         <div class="kind">Packages tested</div><div><b>{{ .PackagesTotal }}</b></div><div><b>{{ .PackagesDone }}</b></div><div><b>{{ .PackagesTestCache }}</b></div><div><b>{{ .PackagesTestFresh }}</b></div><div><b>{{ .PackagesRemaining }}</b></div>
@@ -60,7 +68,7 @@
     </section>
 
     {{ if .Issues }}
-    <section>
+    <section id="issues">
         <h2>Failures and flakes ({{ len .Issues }})</h2>
         <div class="issues">
             {{ range .Issues }}
@@ -73,7 +81,7 @@
     </section>
     {{ end }}
 
-    <section>
+    <section id="packages-section">
         <h2>Test packages</h2>
         <table id="packages">
             <thead>
@@ -95,6 +103,19 @@
                 {{ end }}
             </tbody>
         </table>
+    </section>
+
+    <section id="slowest">
+        <h2>Slowest Tests</h2>
+        {{ if .Slowest }}
+        <ol class="slowest">
+            {{ range .Slowest }}
+            <li{{ if .Cached }} class="cached-result"{{ end }}><span>{{ .Name }}{{ if .Cached }} <small>(cached)</small>{{ end }}</span><strong class="duration">{{ .Duration }}</strong></li>
+            {{ end }}
+        </ol>
+        {{ else }}
+        <p class="subtle">No completed tests yet.</p>
+        {{ end }}
     </section>
     <script src="/live.js"></script>
 </body>

@@ -143,9 +143,9 @@ func TestStatusDataAndFailureOutput(t *testing.T) {
 			runIn:    time.Second,
 			changed:  now.Add(-4 * time.Second),
 			tests: map[string]*testStatus{
-				"TestPass":  {done: true, passed: true, changed: now},
-				"TestFlaky": {done: true, passed: true, attempts: 2, changed: now, fails: []failInfo{{out: "flaky output"}}},
-				"TestFail":  {done: true, attempts: 4, changed: now, fails: []failInfo{{out: strings.Repeat("x", webFailureOutputLimit+100)}}},
+				"TestPass":  {done: true, passed: true, passedIn: time.Second, cached: true, changed: now},
+				"TestFlaky": {done: true, passed: true, passedIn: 3 * time.Second, attempts: 2, changed: now, fails: []failInfo{{dur: time.Second, out: "flaky output"}}},
+				"TestFail":  {done: true, attempts: 4, changed: now, fails: []failInfo{{dur: 2 * time.Second, out: strings.Repeat("x", webFailureOutputLimit+100)}}},
 			},
 		},
 	}
@@ -160,11 +160,14 @@ func TestStatusDataAndFailureOutput(t *testing.T) {
 	if d.Packages[0].LastChanged != "4s ago" {
 		t.Fatalf("last changed = %q; want 4s ago", d.Packages[0].LastChanged)
 	}
-	if d.PackagesLinked != 1 || d.PackagesLinkFresh != 1 || d.PackagesTestFresh != 1 || d.BinarySize != "2.0 MiB" || d.TestsDone != 3 || d.TestsPassed != 2 || d.TestsFresh != 3 || d.TestsFailed != 1 || d.TestsFlaky != 1 || d.BuildDepsTotal != 321 {
+	if d.PackagesLinked != 1 || d.PackagesLinkFresh != 1 || d.PackagesTestFresh != 1 || d.BinarySize != "2.0 MiB" || d.TestsDone != 3 || d.TestsPassed != 2 || d.TestsCached != 1 || d.TestsFresh != 2 || d.TestsFailed != 1 || d.TestsFlaky != 1 || d.BuildDepsTotal != 321 {
 		t.Fatalf("status data = %+v", d)
 	}
 	if len(d.Issues) != 2 {
 		t.Fatalf("issues = %d; want 2", len(d.Issues))
+	}
+	if len(d.Slowest) != 3 || d.Slowest[0].Name != "example.com/pkg.TestFlaky" || d.Slowest[0].Duration != 3*time.Second {
+		t.Fatalf("slowest = %+v", d.Slowest)
 	}
 	for _, issue := range d.Issues {
 		if len(issue.Output) > webFailureOutputLimit {
@@ -178,7 +181,7 @@ func TestStatusDataAndFailureOutput(t *testing.T) {
 	if strings.Contains(html, "example.com/notests") || !strings.Contains(html, "example.com/pkg") {
 		t.Fatalf("rendered package filtering is wrong: %q", html)
 	}
-	for _, want := range []string{"Package binaries", "Build dependencies", "321", "2.0 MiB", "4s ago", "FAILED", "FLAKY", "flaky output", `data-sort="changed"`, "▶️ PLAY"} {
+	for _, want := range []string{"Package binaries", "Build dependencies", "321", "2.0 MiB", "4s ago", "FAILED", "FLAKY", "flaky output", `data-sort="changed"`, "▶️ PLAY", `href="#slowest"`, "Slowest Tests", "3s", "cached-result", "(cached)"} {
 		if !strings.Contains(html, want) {
 			t.Errorf("rendered status missing %q", want)
 		}
