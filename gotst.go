@@ -67,6 +67,12 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) >= 3 && os.Args[1] == toolExecArg {
+		if err := runToolExec(); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	if dir := os.Getenv("GOTST_EXEC_DEST"); dir != "" {
 		// We're running as a test binary under "go test -exec".
 		// Just capture our output to the given directory and exit.
@@ -166,6 +172,12 @@ type Server struct {
 	pkgs              map[string]*packageStatus // test package import path -> status
 	pkgsWithTests     int
 	buildDepsTotal    int
+	buildDepsFresh    int
+	buildDepsCached   int
+	buildDepFresh     map[string]bool
+	buildDepCached    map[string]bool
+	buildActionToPkg  map[string]string
+	buildActionMapDir string
 	phase             runPhase
 	testsTotal        int
 	cacheChecks       int
@@ -261,17 +273,21 @@ func NewServer(profile runProfile, tests testSelection) *Server {
 		log.Fatalf("invalid -history value %q; want local, off, or an http(s) URL", *historyConfig)
 	}
 	return &Server{
-		start:           time.Now(),
-		cacheDir:        mustNewCacheDir(),
-		ctx:             ctx,
-		cancel:          cancel,
-		profile:         profile,
-		tests:           tests,
-		testCache:       cache,
-		history:         historyStore,
-		execSem:         make(chan bool, *jobs),
-		debugSeedErrors: make(map[string]string),
-		histories:       make(map[string]*history.History),
+		start:             time.Now(),
+		cacheDir:          mustNewCacheDir(),
+		ctx:               ctx,
+		cancel:            cancel,
+		profile:           profile,
+		tests:             tests,
+		testCache:         cache,
+		history:           historyStore,
+		execSem:           make(chan bool, *jobs),
+		debugSeedErrors:   make(map[string]string),
+		buildDepFresh:     make(map[string]bool),
+		buildDepCached:    make(map[string]bool),
+		buildActionToPkg:  make(map[string]string),
+		buildActionMapDir: filepath.Join(mustCacheRoot(), "build-actions", "v1"),
+		histories:         make(map[string]*history.History),
 	}
 }
 
@@ -614,6 +630,56 @@ func (s *Server) learnBuildDependencyCount(pkgs []string) error {
 	return nil
 }
 
+func (s *Server) recordToolExec(ev toolExecEvent) {
+	if ev.Tool != "compile" || ev.ImportPath == "" {
+		return
+	}
+	s.mu.Lock()
+	if s.buildDepFresh == nil {
+		s.buildDepFresh = make(map[string]bool)
+	}
+	if !s.buildDepFresh[ev.ImportPath] {
+		s.buildDepFresh[ev.ImportPath] = true
+		s.buildDepsFresh++
+	}
+	if prefix := strings.SplitN(ev.BuildID, "/", 2)[0]; prefix != "" {
+		s.buildActionToPkg[prefix] = ev.ImportPath
+		s.mu.Unlock()
+		_ = writeCacheFile(filepath.Join(s.buildActionMapDir, prefix[:min(2, len(prefix))], prefix), []byte(ev.ImportPath+"\n"), 0600)
+		return
+	}
+	s.mu.Unlock()
+}
+
+func (s *Server) recordCacheLookup(ev cacheLookupEvent) {
+	if !ev.Hit {
+		return
+	}
+	prefix := actionIDPrefix(ev.ActionID)
+	if prefix == "" {
+		return
+	}
+	s.mu.Lock()
+	pkg := s.buildActionToPkg[prefix]
+	s.mu.Unlock()
+	if pkg == "" {
+		data, err := os.ReadFile(filepath.Join(s.buildActionMapDir, prefix[:2], prefix))
+		if err != nil {
+			return
+		}
+		pkg = strings.TrimSpace(string(data))
+	}
+	if pkg == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.buildDepCached[pkg] && !s.buildDepFresh[pkg] {
+		s.buildDepCached[pkg] = true
+		s.buildDepsCached++
+	}
+}
+
 // TestEvent is the text2json representation of a test event,
 // as documented in $GO/src/cmd/test2json/main.go, unioned with
 // the fields (well field singular) of BuildEvent, as "go test -json"
@@ -755,6 +821,7 @@ func (s *Server) buildAllTestBinaries() error {
 		"--tags=" + strings.Join(s.profile.Tags, ","),
 		"--json",
 		"--exec=" + selfExe,
+		"--toolexec=" + quoteCacheProgArg(selfExe) + " " + toolExecArg,
 	}
 	args = append(args, pkgs...)
 	cmd := exec.Command(goCmd(), args...)
@@ -789,6 +856,8 @@ func (s *Server) buildAllTestBinaries() error {
 			cacheShimSocketEnv+"="+shim.endpoint,
 		)
 	}
+	shim.toolExec = s.recordToolExec
+	shim.cacheLookup = s.recordCacheLookup
 	err = processCmdOutput(cmd, func(r io.Reader) error {
 
 		var errs []error

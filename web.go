@@ -390,6 +390,10 @@ type statusData struct {
 	TestsRunning      int
 	TestsRemaining    int
 	BuildDepsTotal    int
+	BuildDepsFresh    int
+	BuildDepsCached   int
+	BuildDepsObserved int
+	BuildDepsRemain   int
 
 	Packages []packageData
 	Issues   []testIssueData
@@ -400,6 +404,7 @@ type packageData struct {
 	ImportPath      string // import path
 	NumTestsKnown   bool   // whether test binary has been listed and tests enumerated
 	NumTests        int    // number of runnable top-level tests
+	NumTestsDone    int
 	Status          string
 	Passed          bool // whether all tests passed
 	Failed          bool // whether any tests failed
@@ -429,6 +434,8 @@ func (s *Server) statusData() *statusData {
 		TestsTotal:        s.testsTotal,
 		TestCacheDisabled: testCountSet,
 		BuildDepsTotal:    s.buildDepsTotal,
+		BuildDepsFresh:    s.buildDepsFresh,
+		BuildDepsCached:   s.buildDepsCached,
 	}
 	switch s.phase {
 	case phaseDone:
@@ -491,6 +498,7 @@ func (s *Server) statusData() *statusData {
 					d.TestsRunning++
 				}
 				if ts.done {
+					pd.NumTestsDone++
 					d.TestsDone++
 					if ts.cached {
 						d.TestsCached++
@@ -520,11 +528,16 @@ func (s *Server) statusData() *statusData {
 				}
 			}
 		}
+		if ps.pkgState == pkgStateTesting {
+			pd.Status = fmt.Sprintf("testing; %d/%d", pd.NumTestsDone, pd.NumTests)
+		}
 		d.Packages = append(d.Packages, pd)
 	}
 	d.PackagesRemaining = max(0, d.PackagesTotal-d.PackagesDone)
 	d.LinksRemaining = max(0, d.PackagesTotal-d.PackagesLinked)
 	d.TestsRemaining = max(0, d.TestsTotal-d.TestsDone-d.TestsRunning)
+	d.BuildDepsRemain = max(0, d.BuildDepsTotal-d.BuildDepsFresh-d.BuildDepsCached)
+	d.BuildDepsObserved = d.BuildDepsFresh + d.BuildDepsCached
 	var binaryBytes int64
 	for _, ps := range s.pkgs {
 		if ps.glp.hasTests() && ps.exeHash != "" {

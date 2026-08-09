@@ -62,12 +62,18 @@ per test. Package columns are sorted in the browser, initially by most recent
 change, without altering the server's deterministic document order.
 
 The summary also counts the distinct package nodes in the selected test build
-graph, discovered with `go list -deps -test`. This is only a total. Go 1.26's
-structured build stream reports build output and failures, but not successful
-package compiles or cache hits, so gotst cannot truthfully show live
-done/cached/afresh dependency counts from `go test -json`. Obtaining those
-would require observing tool invocations (for example through `-toolexec`) or
-a richer cmd/go event protocol.
+graph, discovered with `go list -deps -test`. Go 1.26's structured build stream
+reports build output and failures, but not successful package compiles or cache
+hits. Gotst therefore installs itself as a transparent `-toolexec` wrapper and
+uses `TOOLEXEC_IMPORTPATH` to count distinct compile actions that actually run.
+This supplies the `afresh` count. The wrapper also records a persistent mapping
+from the compiler's build-ID action prefix to its package identity. On later
+runs, the cache broker uses that mapping to attribute cache hits. Previously
+unseen cached actions cannot be named, so the displayed remainder is the
+graph-only portion rather than proof those packages need compilation. It also
+includes `go list -test` identities that cmd/go replaces with test-specific
+compile identities and special nodes such as `unsafe` that have no compiler
+invocation.
 
 At the end of `Server.Run`, after setting the terminal `done` or `failed`
 phase, gotst sends a final patch to every connected browser. Browsers
@@ -79,7 +85,7 @@ defer in `main`.
 
 ## Process roles
 
-The gotst executable has four entry modes. `main` selects the three child modes
+The gotst executable has five entry modes. `main` selects the four child modes
 before parsing normal command-line flags.
 
 1. **Runner.** The normal command owns configuration, discovery, compilation,
@@ -94,8 +100,12 @@ before parsing normal command-line flags.
 4. **Local build-cache helper.** With the private `-gotst-local-cache-prog`
    argument, gotst serves the standard cache protocol from its persistent local
    store with read-through fallback to the ordinary Go disk cache.
+5. **Tool-execution wrapper.** With the private `-gotst-toolexec` argument,
+   gotst reports compiler invocations to the runner-owned broker and then
+   transparently executes cmd/go's requested tool with the same arguments and
+   standard streams.
 
-Using one binary for all three roles means `go test -exec` and `GOCACHEPROG`
+Using one binary for all roles means `go test -exec`, `-toolexec`, and `GOCACHEPROG`
 do not require separately installed helper programs.
 
 ## Run pipeline

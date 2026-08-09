@@ -206,6 +206,55 @@ func TestStatusTestSummaryOmitsZeroIssuesAndShowsDisabledCache(t *testing.T) {
 	}
 }
 
+func TestBuildDependencyActionMapping(t *testing.T) {
+	actionID := []byte("0123456789abcdef0123456789abcdef")
+	prefix := actionIDPrefix(actionID)
+	s := &Server{
+		buildDepFresh:     make(map[string]bool),
+		buildDepCached:    make(map[string]bool),
+		buildActionToPkg:  make(map[string]string),
+		buildActionMapDir: t.TempDir(),
+	}
+	s.recordToolExec(toolExecEvent{ImportPath: "example.com/dep", Tool: "compile", BuildID: prefix + "/content"})
+	if s.buildDepsFresh != 1 {
+		t.Fatalf("fresh dependencies = %d; want 1", s.buildDepsFresh)
+	}
+
+	s2 := &Server{
+		buildDepFresh:     make(map[string]bool),
+		buildDepCached:    make(map[string]bool),
+		buildActionToPkg:  make(map[string]string),
+		buildActionMapDir: s.buildActionMapDir,
+	}
+	s2.recordCacheLookup(cacheLookupEvent{ActionID: actionID, Hit: true})
+	if s2.buildDepsCached != 1 || !s2.buildDepCached["example.com/dep"] {
+		t.Fatalf("cached dependencies = %d, map %v; want example.com/dep", s2.buildDepsCached, s2.buildDepCached)
+	}
+}
+
+func TestTestingPackageStatusIncludesProgress(t *testing.T) {
+	s := NewServer(runProfile{}, testSelection{})
+	defer s.Cleanup()
+	s.pkgs = map[string]*packageStatus{
+		"example.com/pkg": {
+			glp:      &goListPackage{ImportPath: "example.com/pkg", TestGoFiles: []string{"pkg_test.go"}},
+			pkgState: pkgStateTesting,
+			tests: map[string]*testStatus{
+				"TestDone":    {done: true, passed: true},
+				"TestRunning": {running: true},
+				"TestQueued":  {},
+				"BenchmarkX":  {},
+			},
+		},
+	}
+	s.pkgsWithTests = 1
+	s.testsTotal = 3
+	d := s.statusData()
+	if len(d.Packages) != 1 || d.Packages[0].Status != "testing; 1/3" {
+		t.Fatalf("packages = %+v; want testing; 1/3", d.Packages)
+	}
+}
+
 func TestLiveWebSocketUpdatesAndFinalFlush(t *testing.T) {
 	s := NewServer(runProfile{}, testSelection{})
 	defer s.Cleanup()

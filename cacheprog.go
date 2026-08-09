@@ -38,6 +38,7 @@ const (
 	cacheConnCmdGo     = byte('C')
 	cacheConnRegister  = byte('R')
 	cacheConnVerified  = byte('V')
+	cacheConnToolExec  = byte('T')
 )
 
 type cacheProgCommand string
@@ -249,6 +250,17 @@ type verifiedExecutable struct {
 	Size       int64
 }
 
+type toolExecEvent struct {
+	ImportPath string
+	Tool       string
+	BuildID    string
+}
+
+type cacheLookupEvent struct {
+	ActionID []byte
+	Hit      bool
+}
+
 type cacheShim struct {
 	downstream        *cacheProgClient
 	execDir           string
@@ -267,6 +279,8 @@ type cacheShim struct {
 	uploaded     map[string]bool
 	execHit      map[string]bool               // SHA-256 output ID of each executable cache hit
 	verifiedExec map[string]verifiedExecutable // cleaned executable path -> verified metadata
+	toolExec     func(toolExecEvent)
+	cacheLookup  func(cacheLookupEvent)
 }
 
 // runCacheShim runs in the child process started by cmd/go. The gotst parent
@@ -456,7 +470,13 @@ func (s *cacheShim) forward(ctx context.Context, req cacheProgRequest) (*cachePr
 	}
 	if res.Miss {
 		s.recordMiss(req.ActionID)
+		if s.cacheLookup != nil {
+			s.cacheLookup(cacheLookupEvent{ActionID: append([]byte(nil), req.ActionID...)})
+		}
 		return res, nil
+	}
+	if s.cacheLookup != nil {
+		s.cacheLookup(cacheLookupEvent{ActionID: append([]byte(nil), req.ActionID...), Hit: true})
 	}
 	if looksLikeExecutable(res.DiskPath) {
 		path, ok := s.materializeExecutable(req.ActionID, res)
@@ -570,6 +590,13 @@ func (s *cacheShim) acceptLoop() {
 				_ = json.NewEncoder(conn).Encode(&res)
 				return
 			}
+			if kind[0] == cacheConnToolExec {
+				var ev toolExecEvent
+				if json.NewDecoder(conn).Decode(&ev) == nil && s.toolExec != nil {
+					s.toolExec(ev)
+				}
+				return
+			}
 			if kind[0] != cacheConnRegister {
 				return
 			}
@@ -586,6 +613,18 @@ func (s *cacheShim) acceptLoop() {
 			_ = json.NewEncoder(conn).Encode(&res)
 		}()
 	}
+}
+
+func reportToolExec(socket string, ev toolExecEvent) {
+	conn, err := dialCacheEndpoint(socket)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte{cacheConnToolExec}); err != nil {
+		return
+	}
+	_ = json.NewEncoder(conn).Encode(ev)
 }
 
 func (s *cacheShim) close() error {
