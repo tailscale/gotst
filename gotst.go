@@ -16,8 +16,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -30,6 +28,7 @@ import (
 	"time"
 
 	"github.com/tailscale/gotst/history"
+	"tailscale.com/client/local"
 )
 
 var (
@@ -134,11 +133,14 @@ func main() {
 	}
 	defer s.Cleanup()
 	if *flagListen != "" {
-		ln, err := net.Listen("tcp", *flagListen)
+		lns, statusURL, err := startStatusListeners(s.ctx, *flagListen, s, &local.Client{})
 		if err != nil {
 			log.Fatalf("listening on %q: %v", *flagListen, err)
 		}
-		go http.Serve(ln, s)
+		defer closeListeners(lns)
+		if statusURL != "" {
+			fmt.Fprintf(os.Stderr, "# Status: %s\n", statusURL)
+		}
 	}
 	if err := s.Run(); err != nil {
 		log.Fatal(err)

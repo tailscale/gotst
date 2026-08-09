@@ -314,8 +314,9 @@ Web UI and usability:
   WebSocket (with reconnect/resynchronization behavior), rather than coupling
   the HTTP handlers directly to mutable scheduler internals. The web listener
   should remain optional and should not imply a persistent daemon.
-- [ ] Shut down the HTTP listener cleanly and define whether it remains alive
-  after a run for interactive inspection.
+- [x] Close the HTTP listeners when the run exits. The page currently remains
+  available after a run only when `-extra-sleep` is used; a persistent daemon
+  remains out of scope.
 - [ ] Expand README.md with installation, examples, supported behavior, and an
   explicit experimental-status warning.
 

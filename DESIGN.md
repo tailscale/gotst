@@ -602,9 +602,13 @@ rates. The final snapshot is always printed, even when periodic progress is
 disabled.
 
 The optional HTTP server calls the same `Server` state through `statusData` and
-renders `root.tmpl.html`. It is currently a polling snapshot view, not an API or
-event stream, and its presentation state is intentionally secondary to the
-runner state.
+renders `root.tmpl.html`. It starts on the configured address and, when the
+local Tailscale daemon reports a running node, also binds the same port on each
+assigned Tailscale IP and advertises `Self.DNSName`. LocalAPI lookup and
+additional-listener failures are soft; the explicitly configured listener
+remains authoritative. The page is currently a polling snapshot view, not an
+API or event stream, and its presentation state is intentionally secondary to
+the runner state.
 
 ## Source map
 

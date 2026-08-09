@@ -63,6 +63,20 @@ and compilation. `test_flags` are passed to captured test binaries; common
 `-testing.*` spellings are normalized to the test binary's `-test.*` flags.
 `-config=PATH` selects an explicit configuration file.
 
+## Status page
+
+Gotst serves its live HTML status page on `127.0.0.1:5525` by default. When a
+local Tailscale daemon is running, it also listens on every assigned Tailscale
+IP and prints the MagicDNS URL to stderr, for example:
+
+```text
+# Status: http://braid.corp.ts.net:5525
+```
+
+Use `-listen=ADDRESS` to change the configured listener, or `-listen=` to
+disable the status server and Tailscale discovery. Failure to reach the local
+Tailscale daemon does not affect the test run.
+
 ## Test result caching
 
 gotst disables cmd/go's package test-result cache with `go test -count=1` and
