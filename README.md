@@ -1,3 +1,9 @@
+> [!WARNING]
+> # EXPERIMENTAL: NOTHING TO SEE HERE, MOVE ALONG
+>
+> `gotst` is an internal experiment. It is not ready for users. Please do not
+> use or depend on it yet.
+
 # gotst
 
 `gotst` is a wrapper around `go test` designed for both humans and CI.
