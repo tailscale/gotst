@@ -292,3 +292,30 @@ func TestOrderTestTasksByHistory(t *testing.T) {
 		t.Fatalf("ordered tests = %q; want %q", got, want)
 	}
 }
+
+func TestPrepareTestEstimatesUsesMedianForUnknownTests(t *testing.T) {
+	oldCount := *testCount
+	*testCount = 1
+	t.Cleanup(func() { *testCount = oldCount })
+	profile := runProfile{}
+	bin := capturedTestBinary{pkg: "example.com/p", absBin: "/cache/hash", workDir: "/checkout/p"}
+	tasks := []testTask{{bin: bin, test: "TestSlow"}, {bin: bin, test: "TestFast"}, {bin: bin, test: "TestUnknown"}}
+	s := &Server{profile: profile, histories: make(map[string]*history.History)}
+	now := time.Now().UTC()
+	add := func(task testTask, duration time.Duration, attempts int) {
+		key := historyKeyForTask(task, profile)
+		s.histories[key.ID()] = &history.History{Observations: []history.Observation{{
+			ID: task.test, Key: key, ObservedAt: now, Duration: duration, Attempts: attempts,
+		}}}
+	}
+	add(tasks[0], 20*time.Second, 2) // 10s per attempt.
+	add(tasks[1], 2*time.Second, 1)
+	s.prepareTestEstimates(tasks)
+	if got, want := s.testEstimateBase, 6*time.Second; got != want {
+		t.Fatalf("median estimate = %v; want %v", got, want)
+	}
+	unknown := s.testEstimates["example.com/p\x00TestUnknown"]
+	if unknown.duration != 6*time.Second || unknown.known {
+		t.Fatalf("unknown estimate = %+v; want 6s median fallback", unknown)
+	}
+}

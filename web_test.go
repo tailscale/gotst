@@ -152,15 +152,21 @@ func TestStatusDataAndFailureOutput(t *testing.T) {
 	s.pkgsWithTests = 1
 	s.testsTotal = 3
 	s.buildDepsTotal = 321
+	s.testEstimateReady = true
+	s.testEstimateBase = 40 * time.Millisecond
+	s.testSchedule = []string{"example.com/pkg\x00TestETAUnknown"}
+	s.testEstimates = map[string]testEstimate{"example.com/pkg\x00TestETAUnknown": {duration: 2 * time.Second}}
+	s.pkgs["example.com/pkg"].tests["TestETAUnknown"] = &testStatus{}
+	s.testsTotal++
 
 	d := s.statusData()
-	if len(d.Packages) != 1 || d.Packages[0].NumTests != 3 {
-		t.Fatalf("packages = %+v; want one package with 3 tests", d.Packages)
+	if len(d.Packages) != 1 || d.Packages[0].NumTests != 4 {
+		t.Fatalf("packages = %+v; want one package with 4 tests", d.Packages)
 	}
 	if d.Packages[0].LastChanged != "4s ago" {
 		t.Fatalf("last changed = %q; want 4s ago", d.Packages[0].LastChanged)
 	}
-	if d.PackagesLinked != 1 || d.PackagesLinkFresh != 1 || d.PackagesTestFresh != 1 || d.BinarySize != "2.0 MiB" || d.TestsDone != 3 || d.TestsPassed != 2 || d.TestsCached != 1 || d.TestsFresh != 2 || d.TestsFailed != 1 || d.TestsFlaky != 1 || d.BuildDepsTotal != 321 {
+	if d.PackagesLinked != 1 || d.PackagesLinkFresh != 1 || d.PackagesTestFresh != 1 || d.BinarySize != "2.0 MiB" || d.TestsDone != 3 || d.TestsPassed != 2 || d.TestsCached != 1 || d.TestsFresh != 2 || d.TestsFailed != 1 || d.TestsFlaky != 1 || d.BuildDepsTotal != 321 || d.TestETA != "2s" || d.ETAUnknown != 1 {
 		t.Fatalf("status data = %+v", d)
 	}
 	if len(d.Issues) != 2 {
@@ -181,7 +187,7 @@ func TestStatusDataAndFailureOutput(t *testing.T) {
 	if strings.Contains(html, "example.com/notests") || !strings.Contains(html, "example.com/pkg") {
 		t.Fatalf("rendered package filtering is wrong: %q", html)
 	}
-	for _, want := range []string{"Package binaries", "Build dependencies", "321", "2.0 MiB", "4s ago", "FAILED", "FLAKY", "flaky output", `data-sort="changed"`, "▶️ PLAY", `href="#slowest"`, "Slowest Tests", "3s", "cached-result", "(cached)"} {
+	for _, want := range []string{"Package binaries", "Build dependencies", "Estimated remaining", "2s", "1 unknown at &lt;1s median", "321", "2.0 MiB", "4s ago", "FAILED", "FLAKY", "flaky output", `data-sort="changed"`, "▶️ PLAY", `href="#slowest"`, "Slowest Tests", "3s", "cached-result", "(cached)"} {
 		if !strings.Contains(html, want) {
 			t.Errorf("rendered status missing %q", want)
 		}

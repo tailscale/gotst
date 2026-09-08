@@ -54,7 +54,7 @@
     <header>
         <h1>gotst</h1>
         <span class="live"><span id="connection-status" class="connection connecting">Connecting…</span><button id="stop-live" type="button" title="Stop reconnecting">🛑 STOP</button><button id="start-live" type="button" title="Resume reconnecting" disabled>▶️ PLAY</button></span>
-        <p class="run-meta">Started at {{ .StartedAt }} ({{ .StartedAgo }}) · Phase: <b>{{ .Phase }}</b> · Last exit: <b class="{{ .ExitClass }}">{{ .ExitStatus }}</b></p>
+        <p class="run-meta">Started at {{ .StartedAt }} ({{ .StartedAgo }}) · Phase: <b>{{ .Phase }}</b>{{ if .ETAAvailable }} · Estimated remaining: <b>{{ .TestETA }}</b>{{ if .ETAUnknown }} <span class="subtle">({{ .ETAUnknown }} unknown at {{ .ETAMedian }} median)</span>{{ end }}{{ end }} · Last exit: <b class="{{ .ExitClass }}">{{ .ExitStatus }}</b></p>
         <nav class="jump" aria-label="Page sections"><a href="#summary">Summary</a>{{ if .Issues }} &middot; <a href="#issues">Failures</a>{{ end }} &middot; <a href="#packages">Packages</a> &middot; <a href="#slowest">Slowest</a></nav>
     </header>
 

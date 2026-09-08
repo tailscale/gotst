@@ -33,7 +33,13 @@ const (
 	localHistoryLimit     = 32
 	historyRequestLimit   = 32
 	historyRequestTimeout = 5 * time.Second
+	defaultTestEstimate   = 100 * time.Millisecond
 )
+
+type testEstimate struct {
+	duration time.Duration
+	known    bool
+}
 
 var errHistoryNotFound = errors.New("test history not found")
 
@@ -526,6 +532,60 @@ func (s *Server) orderTestTasksByHistory(tasks []testTask) {
 		}
 		return strings.Compare(a.test, b.test)
 	})
+}
+
+// prepareTestEstimates freezes the scheduling estimates used for this run.
+// Unknown tests use the median newest duration among selected tests. The
+// estimate is advisory and deliberately independent of correctness decisions.
+func (s *Server) prepareTestEstimates(tasks []testTask) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	known := make([]time.Duration, 0, len(tasks))
+	estimates := make(map[string]testEstimate, len(tasks))
+	for _, task := range tasks {
+		id := task.bin.pkg + "\x00" + task.test
+		h := s.histories[historyKeyForTask(task, s.profile).ID()]
+		if h == nil || len(h.Observations) == 0 {
+			continue
+		}
+		latest := h.Observations[0]
+		for _, obs := range h.Observations[1:] {
+			if compareHistoryObservations(obs, latest) < 0 {
+				latest = obs
+			}
+		}
+		if latest.Duration <= 0 {
+			continue
+		}
+		// Flaky/failing observations include failed attempts, but the common
+		// next-run case is one successful attempt. Use their average attempt
+		// duration rather than pessimistically predicting every old retry.
+		perRun := latest.Duration / time.Duration(max(1, latest.Attempts))
+		duration := perRun * time.Duration(*testCount)
+		estimates[id] = testEstimate{duration: duration, known: true}
+		known = append(known, perRun)
+	}
+	median := defaultTestEstimate
+	if len(known) != 0 {
+		slices.Sort(known)
+		mid := len(known) / 2
+		median = known[mid]
+		if len(known)%2 == 0 {
+			median = known[mid-1] + (known[mid]-known[mid-1])/2
+		}
+	}
+	median *= time.Duration(*testCount)
+	s.testSchedule = s.testSchedule[:0]
+	for _, task := range tasks {
+		id := task.bin.pkg + "\x00" + task.test
+		s.testSchedule = append(s.testSchedule, id)
+		if _, ok := estimates[id]; !ok {
+			estimates[id] = testEstimate{duration: median}
+		}
+	}
+	s.testEstimates = estimates
+	s.testEstimateBase = median
+	s.testEstimateReady = true
 }
 
 func (s *Server) recordHistory(task testTask, outcome history.Outcome, duration time.Duration, attempts int, deps []cacheDependency) {

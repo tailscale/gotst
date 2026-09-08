@@ -39,8 +39,9 @@ func TestProgressLine(t *testing.T) {
 				Phase: phaseTesting, PackagesDone: 12, PackagesTotal: 80,
 				TestsDone: 345, TestsTotal: 1000, TestsRunning: 4,
 				TestsFlaky: 2, CacheEnabled: true, CacheChecks: 400, CacheHits: 300,
+				ETAAvailable: true, TestETA: 12 * time.Second, ETAUnknown: 7, ETAMedian: 40 * time.Millisecond,
 			},
-			want: []string{"testing", "12/80 test pkgs", "345/1000 tests", "4 running", "2 flaky", "cache hits 300/400 (75.0%)"},
+			want: []string{"testing", "12/80 test pkgs", "345/1000 tests", "4 running", "2 flaky", "cache hits 300/400 (75.0%)", "ETA 12s", "7 unknown at <1s median"},
 		},
 		{
 			name: "done cache off",
@@ -64,5 +65,32 @@ func TestProgressLine(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestTestETA(t *testing.T) {
+	oldJobs := *jobs
+	*jobs = 2
+	t.Cleanup(func() { *jobs = oldJobs })
+	now := time.Now()
+	s := &Server{
+		phase: phaseTesting, testEstimateReady: true,
+		testSchedule: []string{"p\x00running", "p\x00queued-slow", "p\x00queued-unknown", "p\x00done"},
+		testEstimates: map[string]testEstimate{
+			"p\x00running":        {duration: 10 * time.Second, known: true},
+			"p\x00queued-slow":    {duration: 8 * time.Second, known: true},
+			"p\x00queued-unknown": {duration: 4 * time.Second},
+			"p\x00done":           {duration: time.Hour, known: true},
+		},
+		pkgs: map[string]*packageStatus{"p": {tests: map[string]*testStatus{
+			"running":        {running: true, started: now.Add(-3 * time.Second)},
+			"queued-slow":    {},
+			"queued-unknown": {},
+			"done":           {done: true},
+		}}},
+	}
+	eta, unknown, ok := s.testETALocked(now)
+	if eta != 11*time.Second || unknown != 1 || !ok {
+		t.Fatalf("ETA = %v, unknown=%d, available=%v; want 11s, 1, true", eta, unknown, ok)
 	}
 }

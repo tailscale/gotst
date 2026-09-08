@@ -80,6 +80,9 @@ Tailscale daemon does not affect the test run.
 The page updates incrementally over a compressed WebSocket, at most once every
 500 milliseconds. At the end of a run, gotst sends the final state to connected
 browsers and briefly waits for them to apply and acknowledge it before exiting.
+During test execution, terminal progress and the status page show an estimated
+time remaining based on recent per-test history and the configured parallelism;
+new tests use the median known test duration until they establish history.
 
 ## Test result caching
 

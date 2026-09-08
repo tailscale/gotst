@@ -189,6 +189,10 @@ type Server struct {
 	historyLoaded     bool
 	histories         map[string]*history.History
 	historyPending    []history.Observation
+	testSchedule      []string
+	testEstimates     map[string]testEstimate
+	testEstimateBase  time.Duration
+	testEstimateReady bool
 }
 
 type packageStatus struct {
@@ -217,6 +221,7 @@ type testStatus struct {
 	fails    []failInfo
 	attempts int
 	attrs    map[string]string
+	started  time.Time
 	changed  time.Time
 }
 
@@ -1171,6 +1176,7 @@ func (s *Server) runAllTests() error {
 	tasks := s.allTestTasks()
 	s.loadHistory(tasks)
 	s.orderTestTasksByHistory(tasks)
+	s.prepareTestEstimates(tasks)
 	if *verbose {
 		log.Printf("Running %d tests in %d packages with up to %d concurrent processes...", len(tasks), len(bins), *jobs)
 	}
@@ -1367,6 +1373,7 @@ func (s *Server) runTest(task testTask) error {
 	now := time.Now()
 	ps.changed = now
 	ps.tests[task.test].running = true
+	ps.tests[task.test].started = now
 	ps.tests[task.test].changed = now
 	s.mu.Unlock()
 

@@ -39,6 +39,10 @@ type progressSnapshot struct {
 	TestsDone    int
 	TestsRunning int
 	TestsFlaky   int
+	TestETA      time.Duration
+	ETAMedian    time.Duration
+	ETAUnknown   int
+	ETAAvailable bool
 
 	CacheEnabled bool
 	CacheChecks  int
@@ -96,7 +100,63 @@ func (s *Server) progressSnapshot() progressSnapshot {
 			}
 		}
 	}
+	p.TestETA, p.ETAUnknown, p.ETAAvailable = s.testETALocked(time.Now())
+	p.ETAMedian = s.testEstimateBase
 	return p
+}
+
+// testETALocked simulates the remaining scheduler work across -j worker slots.
+// Running tests first occupy slots with their estimated residual time; queued
+// tests are then assigned in dispatch order to the next available slot.
+func (s *Server) testETALocked(now time.Time) (time.Duration, int, bool) {
+	if !s.testEstimateReady || (s.phase != phaseTesting && s.phase != phaseDone && s.phase != phaseFailed) {
+		return 0, 0, false
+	}
+	slots := make([]time.Duration, max(1, *jobs))
+	running := 0
+	unknown := 0
+	var queued []time.Duration
+	for _, id := range s.testSchedule {
+		pkg, test, ok := strings.Cut(id, "\x00")
+		if !ok || s.pkgs[pkg] == nil || s.pkgs[pkg].tests[test] == nil {
+			continue
+		}
+		ts := s.pkgs[pkg].tests[test]
+		if ts.done {
+			continue
+		}
+		estimate := s.testEstimates[id]
+		if !estimate.known {
+			unknown++
+		}
+		remaining := estimate.duration
+		if ts.running {
+			remaining = max(0, remaining-now.Sub(ts.started))
+			// Once a test exceeds its estimate, retain a small non-zero tail
+			// rather than claiming the whole run is about to finish.
+			if remaining == 0 {
+				remaining = max(time.Second, estimate.duration/2)
+			}
+			if running < len(slots) {
+				slots[running] = remaining
+				running++
+			} else {
+				queued = append(queued, remaining)
+			}
+			continue
+		}
+		queued = append(queued, remaining)
+	}
+	for _, duration := range queued {
+		i := 0
+		for j := 1; j < len(slots); j++ {
+			if slots[j] < slots[i] {
+				i = j
+			}
+		}
+		slots[i] += duration
+	}
+	return slices.Max(slots), unknown, true
 }
 
 func (p progressSnapshot) line() string {
@@ -130,9 +190,25 @@ func (p progressSnapshot) line() string {
 			pct := 100 * float64(p.CacheHits) / float64(p.CacheChecks)
 			fmt.Fprintf(&b, "; cache hits %d/%d (%.1f%%)", p.CacheHits, p.CacheChecks, pct)
 		}
+		if p.ETAAvailable {
+			fmt.Fprintf(&b, "; ETA %s", formatEstimate(p.TestETA))
+			if p.ETAUnknown != 0 {
+				fmt.Fprintf(&b, " (%d unknown at %s median)", p.ETAUnknown, formatEstimate(p.ETAMedian))
+			}
+		}
 	}
 	fmt.Fprintf(&b, "; %s", p.Elapsed)
 	return b.String()
+}
+
+func formatEstimate(d time.Duration) string {
+	if d <= 0 {
+		return "0s"
+	}
+	if d < time.Second {
+		return "<1s"
+	}
+	return d.Round(time.Second).String()
 }
 
 func (p progressSnapshot) writeBuildProgress(b *strings.Builder) {

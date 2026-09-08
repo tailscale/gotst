@@ -395,6 +395,10 @@ type statusData struct {
 	BuildDepsCached   int
 	BuildDepsObserved int
 	BuildDepsRemain   int
+	TestETA           string
+	ETAMedian         string
+	ETAUnknown        int
+	ETAAvailable      bool
 
 	Packages []packageData
 	Issues   []testIssueData
@@ -445,6 +449,11 @@ func (s *Server) statusData() *statusData {
 		BuildDepsFresh:    s.buildDepsFresh,
 		BuildDepsCached:   s.buildDepsCached,
 	}
+	eta, unknown, available := s.testETALocked(now)
+	d.TestETA = formatEstimate(eta)
+	d.ETAMedian = formatEstimate(s.testEstimateBase)
+	d.ETAUnknown = unknown
+	d.ETAAvailable = available
 	switch s.phase {
 	case phaseDone:
 		d.ExitStatus, d.ExitClass = "success", "passed"

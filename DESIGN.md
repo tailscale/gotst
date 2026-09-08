@@ -376,6 +376,23 @@ the chance that a slow test becomes a straggler after other workers go idle.
 History remains advisory: missing or unavailable history falls back to stable
 package-and-test ordering and never changes the result of a run.
 
+The same newest-observation durations feed the test-phase time-remaining
+estimate shown in terminal progress and the live status page. For an
+observation containing multiple attempts, gotst estimates one execution from
+the average observed attempt duration and scales it by the requested
+`-count`. A selected test without usable history receives the median per-test
+duration among selected tests with history; when none have history, the
+initial fallback is 100 milliseconds per execution. Progress reports how many
+unfinished tests use this fallback.
+
+The ETA estimates scheduler makespan rather than summing CPU time. Running
+tests occupy simulated `-j` worker slots with elapsed time subtracted from
+their estimate, and queued tests are assigned in dispatch order to the next
+available slot. An overrun retains a small non-zero tail rather than falsely
+reporting zero. This is deliberately an estimate: retries, cache validation,
+unreported changes in test duration, and shared-resource contention can move
+the actual completion time in either direction.
+
 ### Identity and observations
 
 A history key contains the package import path, top-level test name, GOOS,
