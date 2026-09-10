@@ -32,7 +32,7 @@ import (
 )
 
 var (
-	flagListen = flag.String("listen", "127.0.0.1:5525", "if non-empty, run HTTP server on this address and serve status")
+	flagListen = flag.String("listen", "127.0.0.1:5525", "if non-empty, run HTTP server on this address and serve status; the special value \"tailcat\" serves it over an ephemeral tailcat server instead")
 	configFile = flag.String("config", "", "path to .gotst.yml (default: search parent directories)")
 
 	extraSleep = flag.Duration("extra-sleep", 0, "[dev] if non-zero, sleep this long before exiting after all tests complete, to give time to explore the web UI")
@@ -142,7 +142,21 @@ func main() {
 		log.Printf("# cacheDir is %v", s.cacheDir)
 	}
 	defer s.Cleanup()
-	if *flagListen != "" {
+	switch *flagListen {
+	case "":
+	case tailcatListenValue:
+		tcAddr, cleanup, err := startTailcatStatus(s)
+		if err != nil {
+			log.Fatalf("starting tailcat status server: %v", err)
+		}
+		defer cleanup()
+		fmt.Fprintf(os.Stderr, "# gotst status: tailcat browse %s\n", tcAddr)
+		if os.Getenv("GITHUB_ACTIONS") == "true" {
+			// A GitHub Actions annotation, rendered prominently
+			// on the workflow logs page.
+			fmt.Printf("::notice title=gotst status::tailcat browse %s\n", tcAddr)
+		}
+	default:
 		lns, statusURL, err := startStatusListeners(s.ctx, *flagListen, s, &local.Client{})
 		if err != nil {
 			log.Fatalf("listening on %q: %v", *flagListen, err)

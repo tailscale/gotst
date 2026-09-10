@@ -94,6 +94,20 @@ Use `-listen=ADDRESS` to change the configured listener, or `-listen=` to
 disable the status server and Tailscale discovery. Failure to reach the local
 Tailscale daemon does not affect the test run.
 
+Use `-listen=tailcat` to serve the status page over an ephemeral
+[tailcat](https://github.com/tailscale/tailcat) server on port 80 instead of a
+local TCP listener. This makes the page reachable from other machines without
+any open inbound ports, which is useful on CI runners. Gotst prints the
+command to view it to stderr:
+
+```text
+# gotst status: tailcat browse tcomFwWC…
+```
+
+When running under GitHub Actions, gotst also emits the same command as a
+`::notice` workflow annotation so it is rendered prominently on the workflow
+logs page.
+
 The page updates incrementally over a compressed WebSocket, at most once every
 500 milliseconds. At the end of a run, gotst sends the final state to connected
 browsers and briefly waits for them to apply and acknowledge it before exiting.
