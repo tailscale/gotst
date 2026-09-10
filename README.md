@@ -60,14 +60,25 @@ profiles:
     packages: [./integration/vmtests]
     timeout: 60m
     test_flags: [-run-vm-tests]
+
+  race:
+    include: [default]
+    race: true
 ```
 
 Included profiles are merged in order. List fields are appended and
-deduplicated; `short` and `timeout` are inherited and can be overridden by the
-including profile. `tags` is one build-tag set passed to both package discovery
-and compilation. `test_flags` are passed to captured test binaries; common
-`-testing.*` spellings are normalized to the test binary's `-test.*` flags.
-`-config=PATH` selects an explicit configuration file.
+deduplicated; `short`, `race`, and `timeout` are inherited and can be
+overridden by the including profile. `tags` is one build-tag set passed to
+both package discovery and compilation. `test_flags` are passed to captured
+test binaries; common `-testing.*` spellings are normalized to the test
+binary's `-test.*` flags. `-config=PATH` selects an explicit configuration
+file.
+
+A profile with `race: true` builds its test binaries with the race detector,
+as does the `-race` command-line flag with any profile. Prefer these over
+putting `-race` in GOFLAGS: GOFLAGS leaks into every child `go` invocation,
+including ones that tests themselves run, where an inherited bare `-race` can
+break builds (for example, ones that disable cgo).
 
 ## Status page
 

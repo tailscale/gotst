@@ -38,6 +38,7 @@ var (
 	extraSleep = flag.Duration("extra-sleep", 0, "[dev] if non-zero, sleep this long before exiting after all tests complete, to give time to explore the web UI")
 
 	tags          = flag.String("tags", "", "comma-separated list of build tags to pass to 'go test' when building and running tests")
+	raceFlag      = flag.Bool("race", false, "build test binaries with the race detector enabled")
 	verbose       = flag.Bool("vlog", false, "verbose gotst debug logging")
 	jobs          = flag.Int("j", min(runtime.NumCPU(), 4), "maximum concurrent build or test processes")
 	maxOutput     = flag.Int64("max-output", 4<<20, "maximum bytes of failure output retained per package")
@@ -128,6 +129,9 @@ func main() {
 	profile := inv.profile
 	if *tags != "" {
 		profile.Tags = appendUnique(profile.Tags, splitCommaList(*tags)...)
+	}
+	if *raceFlag {
+		profile.Race = true
 	}
 	if *verbose {
 		log.Printf("Using profile %q from %s", profile.Name, profile.Root)
@@ -827,6 +831,9 @@ func (s *Server) buildAllTestBinaries() error {
 		"--json",
 		"--exec=" + selfExe,
 		"--toolexec=" + quoteCacheProgArg(selfExe) + " " + toolExecArg,
+	}
+	if s.profile.Race {
+		args = append(args, "--race")
 	}
 	args = append(args, pkgs...)
 	cmd := exec.Command(goCmd(), args...)

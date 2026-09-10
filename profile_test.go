@@ -26,6 +26,7 @@ profiles:
     exclude_packages: [./slow/...]
     tags: [one]
     short: true
+    race: true
     timeout: 2m
     test_flags: [-custom]
   platform:
@@ -57,6 +58,9 @@ profiles:
 	}
 	if p.Short || !p.shortSet {
 		t.Errorf("Short = %v, shortSet = %v; want false, true", p.Short, p.shortSet)
+	}
+	if !p.Race || !p.raceSet {
+		t.Errorf("Race = %v, raceSet = %v; want true, true", p.Race, p.raceSet)
 	}
 	if p.Timeout != 3*time.Minute {
 		t.Errorf("Timeout = %v; want 3m", p.Timeout)

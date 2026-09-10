@@ -30,6 +30,7 @@ type rawProfile struct {
 	Tags            []string `yaml:"tags"`
 	TestFlags       []string `yaml:"test_flags"`
 	Short           *bool    `yaml:"short"`
+	Race            *bool    `yaml:"race"`
 	Timeout         *string  `yaml:"timeout"`
 }
 
@@ -42,8 +43,10 @@ type runProfile struct {
 	Tags            []string
 	TestFlags       []string
 	Short           bool
+	Race            bool
 	Timeout         time.Duration
 	shortSet        bool
+	raceSet         bool
 }
 
 type profileDefinitions struct {
@@ -207,6 +210,10 @@ func mergeRunProfile(dst *runProfile, src runProfile) {
 		dst.Short = src.Short
 		dst.shortSet = true
 	}
+	if src.raceSet {
+		dst.Race = src.Race
+		dst.raceSet = true
+	}
 	if src.Timeout != 0 {
 		dst.Timeout = src.Timeout
 	}
@@ -220,6 +227,10 @@ func mergeRawProfile(dst *runProfile, src rawProfile) error {
 	if src.Short != nil {
 		dst.Short = *src.Short
 		dst.shortSet = true
+	}
+	if src.Race != nil {
+		dst.Race = *src.Race
+		dst.raceSet = true
 	}
 	if src.Timeout != nil {
 		d, err := time.ParseDuration(*src.Timeout)
