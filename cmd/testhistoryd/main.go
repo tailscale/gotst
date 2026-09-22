@@ -24,6 +24,7 @@ var (
 	scopeID     = flag.String("scope-id", os.Getenv("TESTHISTORYD_SCOPE_ID"), "UUID isolating one repository/tenant (or TESTHISTORYD_SCOPE_ID)")
 	bearerToken = flag.String("token", os.Getenv("TESTHISTORYD_TOKEN"), "bearer token; empty disables authentication (or TESTHISTORYD_TOKEN)")
 	maxConns    = flag.Int("max-conns", 16, "maximum PostgreSQL connections")
+	rdsEndpoint = flag.String("rds-iam-auth-endpoint", os.Getenv("TESTHISTORYD_RDS_IAM_AUTH_ENDPOINT"), "RDS endpoint (host or host:port) to sign IAM database auth tokens for; defaults to the DSN host when that is an RDS name without a password (or TESTHISTORYD_RDS_IAM_AUTH_ENDPOINT)")
 )
 
 func main() {
@@ -51,6 +52,15 @@ func main() {
 	}
 	config.MaxConns = int32(*maxConns)
 	config.ConnConfig.RuntimeParams["application_name"] = "testhistoryd"
+	hook, endpoint, err := iamAuthHook(ctx, *rdsEndpoint, config.ConnConfig)
+	if err != nil {
+		logger.Error("configuring RDS IAM database authentication", "error", err)
+		os.Exit(1)
+	}
+	if hook != nil {
+		config.BeforeConnect = hook
+		logger.Info("using RDS IAM database authentication", "endpoint", endpoint)
+	}
 	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
 		logger.Error("opening PostgreSQL", "error", err)

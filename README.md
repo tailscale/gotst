@@ -241,6 +241,18 @@ other than 17. `GET /healthz` is unauthenticated; history requests require the
 configured token. In production, terminate TLS before the daemon and use a
 TLS-enabled PostgreSQL DSN.
 
+Against AWS RDS or Aurora, omit the password from the DSN. The daemon then uses
+[IAM database authentication](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/UsingWithRDS.IAMDBAuth.html)
+and mints a fresh token for each new connection. This needs AWS credentials in
+the environment and an `rds-db:connect` grant for the DSN's user, and it reads
+the cluster's region from the endpoint hostname. A password in the DSN turns
+IAM authentication off, and a user holding the `rds_iam` role cannot
+authenticate by password at all.
+
+Set `TESTHISTORYD_RDS_IAM_AUTH_ENDPOINT` to the cluster's own `host:port` when a
+TCP proxy stands in front of it. RDS verifies a token against its own endpoint
+name, which is not the name that the daemon dials through a proxy.
+
 For local development, `docker-compose.testhistoryd.yml` runs PostgreSQL 17 and
 the daemon on loopback ports 55432 and 58080. PostgreSQL data is a bind mount at
 `.testhistoryd-postgres/`, not an anonymous Docker volume. Set
