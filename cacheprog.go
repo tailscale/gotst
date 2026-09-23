@@ -261,26 +261,31 @@ type cacheLookupEvent struct {
 	Hit      bool
 }
 
-type cacheShim struct {
-	downstream        *cacheProgClient
-	execDir           string
+// cacheShimOptions is immutable once the broker starts accepting connections.
+type cacheShimOptions struct {
 	directExecutables bool // downstream paths are gotst-owned and executable
-	listener          net.Listener
-	socket            string
-	endpoint          string
-	socketDir         string
-	acceptDone        chan struct{}
-	connWG            sync.WaitGroup
-	execHits          atomic.Int64
-	execPuts          atomic.Int64
+	toolExec          func(toolExecEvent)
+	cacheLookup       func(cacheLookupEvent)
+}
+
+type cacheShim struct {
+	cacheShimOptions
+	downstream *cacheProgClient
+	execDir    string
+	listener   net.Listener
+	socket     string
+	endpoint   string
+	socketDir  string
+	acceptDone chan struct{}
+	connWG     sync.WaitGroup
+	execHits   atomic.Int64
+	execPuts   atomic.Int64
 
 	mu           sync.Mutex
 	misses       map[string][]byte // 120-bit build-ID prefix -> full action ID
 	uploaded     map[string]bool
 	execHit      map[string]bool               // SHA-256 output ID of each executable cache hit
 	verifiedExec map[string]verifiedExecutable // cleaned executable path -> verified metadata
-	toolExec     func(toolExecEvent)
-	cacheLookup  func(cacheLookupEvent)
 }
 
 // runCacheShim runs in the child process started by cmd/go. The gotst parent
@@ -310,7 +315,7 @@ func runCacheShim() error {
 	return err
 }
 
-func startCacheShim(command, socket string, helperEnv ...string) (*cacheShim, error) {
+func startCacheShim(command, socket string, opts cacheShimOptions, helperEnv ...string) (*cacheShim, error) {
 	downstream, err := startCacheProgClient(command, helperEnv...)
 	if err != nil {
 		return nil, err
@@ -328,7 +333,8 @@ func startCacheShim(command, socket string, helperEnv ...string) (*cacheShim, er
 		return nil, err
 	}
 	shim := &cacheShim{
-		downstream: downstream, execDir: execDir, listener: ln, socket: socket, endpoint: socket,
+		cacheShimOptions: opts,
+		downstream:       downstream, execDir: execDir, listener: ln, socket: socket, endpoint: socket,
 		misses: make(map[string][]byte), uploaded: make(map[string]bool), execHit: make(map[string]bool),
 		verifiedExec: make(map[string]verifiedExecutable),
 	}
@@ -337,7 +343,7 @@ func startCacheShim(command, socket string, helperEnv ...string) (*cacheShim, er
 	return shim, nil
 }
 
-func startRunCacheShim(command string, helperEnv ...string) (*cacheShim, error) {
+func startRunCacheShim(command string, opts cacheShimOptions, helperEnv ...string) (*cacheShim, error) {
 	if runtime.GOOS == "windows" {
 		downstream, err := startCacheProgClient(command, helperEnv...)
 		if err != nil {
@@ -355,7 +361,8 @@ func startRunCacheShim(command string, helperEnv ...string) (*cacheShim, error) 
 			return nil, err
 		}
 		shim := &cacheShim{
-			downstream: downstream, execDir: execDir, listener: ln,
+			cacheShimOptions: opts,
+			downstream:       downstream, execDir: execDir, listener: ln,
 			endpoint: "tcp:" + ln.Addr().String(), socketDir: execDir,
 			misses: make(map[string][]byte), uploaded: make(map[string]bool), execHit: make(map[string]bool),
 			verifiedExec: make(map[string]verifiedExecutable),
@@ -369,7 +376,7 @@ func startRunCacheShim(command string, helperEnv ...string) (*cacheShim, error) 
 		return nil, err
 	}
 	socket := filepath.Join(dir, "cache.sock")
-	shim, err := startCacheShim(command, socket, helperEnv...)
+	shim, err := startCacheShim(command, socket, opts, helperEnv...)
 	if err != nil {
 		_ = os.RemoveAll(dir)
 		return nil, err

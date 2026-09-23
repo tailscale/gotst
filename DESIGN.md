@@ -39,9 +39,9 @@ Neither environment is a fallback for the other. Features and defaults should
 not require a remote cache to provide good laptop behavior, and local-only
 optimizations should not assume a warm persistent disk on ephemeral workers.
 
-Gotst does not currently distribute work between machines, batch multiple
-top-level tests into one process, or provide a remote test-result cache. Those
-are possible extensions, not properties of the current architecture.
+Gotst can distribute individual top-level tests between machines. It does not
+batch multiple top-level tests into one process or provide a remote test-result
+cache.
 
 ## Live status page
 
@@ -85,8 +85,8 @@ defer in `main`.
 
 ## Process roles
 
-The gotst executable has five entry modes. `main` selects the four child modes
-before parsing normal command-line flags.
+The gotst executable has six entry modes. `main` selects the four internal
+child modes before parsing normal command-line flags.
 
 1. **Runner.** The normal command owns configuration, discovery, compilation,
    scheduling, result caching, progress, and the optional HTTP server.
@@ -104,6 +104,9 @@ before parsing normal command-line flags.
    gotst reports compiler invocations to the runner-owned broker and then
    transparently executes cmd/go's requested tool with the same arguments and
    standard streams.
+6. **Distributed helper.** With `-helper=TAILCAT_ADDRESS`, gotst requests work
+   from a leader, prepares assigned binaries through cmd/go, and returns test
+   results. It starts no dashboard and does not discover its own test selection.
 
 Using one binary for all roles means `go test -exec`, `-toolexec`, and `GOCACHEPROG`
 do not require separately installed helper programs.
@@ -584,11 +587,70 @@ about 71.3 seconds. The additional scheduler, output parsing, dependency
 validation, fallback, and reporting complexity was not justified by that gain,
 so gotst continues to run one top-level test per process.
 
-This result does not rule out batching forever, but distributed execution over
-multiple ephemeral VMs is expected to provide a substantially larger win and
-is the preferred next scheduling direction. History durations and outcomes can
-be used to balance work across those machines and reduce the final straggler
-edge without coupling correctness to advisory history.
+This result does not rule out batching forever. Distributed execution now uses
+history durations to balance work across ephemeral VMs and reduce the final
+straggler edge without coupling correctness to advisory history. Work batches
+reduce network round trips while each top-level test still gets its own process.
+
+## Distributed scheduler and work protocol
+
+`-dist` starts a separate ephemeral tailcat server on TCP port 5526. Possession
+of its address grants access to the worker protocol; it is intended for trusted
+helper machines. The existing status server exposes no worker endpoints.
+Address distribution and provisioning are outside this protocol.
+
+The connection carries sequential JSON request/response pairs. The versioned
+hello announces the helper's name, slots, GOOS, and GOARCH. The leader assigns
+a short session ID and returns build flags and execution policy. A helper's
+500 ms exchanges carry lease states, newly prepared binary hashes, and completed
+results. Responses carry a batch of assignments, canceled lease IDs, and run
+completion or helper rejection. Network I/O runs separately from the helper's
+execution loop, so queued work proceeds while an exchange is in flight.
+Each exchange has a 15-second connection deadline.
+
+The leader builds and lists all selected binaries before opening the shared
+queue. In distributed mode, duration estimates take precedence over the
+ordinary local scheduler's failure-first grouping. Unknown durations use the
+same median estimate as the ETA. Local worker slots and helpers take work from
+this one queue. Affinity may advance a prepared binary at most four positions,
+and only if its estimate is within 20% of the longest eligible test. Responses
+contain at most ten tests and target three seconds per slot, with at most ten
+queued assignments beyond a helper's slots. Existing assignments count toward
+that target, preventing repeated polls from hoarding the long tests.
+
+Each assignment has a unique lease. Disconnect removes that session's leases
+and makes unfinished tasks eligible again. Once no unassigned work remains,
+another machine can duplicate an assignment older than `max(10s, 3*estimate)`.
+The age includes binary preparation and queuing, and a task has at most two
+live copies. First completion commits the result atomically under `Server.mu`:
+test state, package state, counters, attributes, failure diagnostics, and one
+history observation. Losing leases are revoked. Late or repeated results have
+no effect, and fail-fast revokes remaining work without counting canceled
+siblings as failures. Infrastructure errors retire a helper and release all
+its work; local infrastructure errors fail the run.
+
+Both local and remote distributed executions call the ordinary `runTest`
+implementation through an isolated per-assignment `Server`. This reuses retry,
+count, test-log, attribute, and result-cache behavior while deferring authoritative
+state changes to the leader. Temporary test logs are isolated between leases.
+Result-cache lookup and dependency validation happen on the executing machine;
+machine-specific result-cache entries are never imported into the leader.
+Only accepted executions contribute history, with identity supplied by the
+leader and portable dependency shapes supplied by the executor.
+
+Helpers lazily prepare packages with the existing cmd/go capture and cache
+broker path. Build invocations are serialized per helper; prepared binaries
+remain available for the session while tests run concurrently with later
+builds. Binary hashes must match the leader's before execution. The shared
+`GOCACHEPROG`, rather than the work connection, transfers linked executables.
+Package paths and effective arguments cross the wire; absolute checkout and
+working directories do not. Helpers resolve those locally with `go list`.
+
+The dashboard projects worker names, short IDs, status, per-worker result
+counts, accumulated duration, and each active lease. ETA capacity includes
+connected helpers' slots. Before final status publication, the leader gives
+helpers up to two seconds to receive completion and disconnect. Helpers exit
+on connection loss and can be restarted to join with a new session ID.
 
 ## External Go build-cache broker
 
@@ -684,6 +746,8 @@ the runner state.
 | File | Responsibility |
 | --- | --- |
 | `gotst.go` | Entry modes, `Server`, phase pipeline, discovery, capture, listing, scheduler, retries, and argument normalization |
+| `distributed.go` | Fleet queue, leases, affinity, speculative execution, result acceptance, and worker status |
+| `worker.go` | Tailcat work listener, helper protocol, lazy binary preparation, and helper execution loop |
 | `profile.go` | Configuration discovery, strict YAML decoding, includes, and resolved profiles |
 | `invocation.go` | Positional package/profile/test interpretation and selection matching |
 | `cache.go` | Per-run directories and cleanup of abandoned runs |

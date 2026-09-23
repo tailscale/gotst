@@ -115,6 +115,71 @@ During test execution, terminal progress and the status page show an estimated
 time remaining based on recent per-test history and the configured parallelism;
 new tests use the median known test duration until they establish history.
 
+## Distributed execution
+
+Start the leader with `-dist` to accept helper VMs over a separate ephemeral
+tailcat listener. The leader still builds and lists all selected packages
+before dispatching tests, and runs tests locally using its own `-j` slots:
+
+```sh
+gotst -dist -j=4 ./...
+```
+
+It prints a command containing the helper listener's address:
+
+```text
+# gotst helpers: gotst -helper=tcom…
+```
+
+Pass that address to your VMs using your own provisioning mechanism. In each
+helper's checkout, run:
+
+```sh
+gotst -helper=tcom… -helper-name=vm-west-2 -j=8
+```
+
+Helpers must have the same source, Go toolchain, OS/architecture, and build
+environment as the leader. Checkout paths can differ. Each helper locates
+packages in its own checkout, builds or restores assigned binaries using the
+existing build-cache broker, and verifies their hashes against the leader's
+binaries. Configure the same shared `GOCACHEPROG` on all machines to reuse
+linked executables. Source files and executable bytes are not sent through the
+work protocol. A binary mismatch or helper build error removes that helper
+from scheduling and returns its work to the fleet.
+
+The leader supplies tags, race mode, effective test arguments, repetition,
+retry, fail-fast, and result-cache policy. `-j`, `-cache-dir`, and environment
+variables remain machine-local. The helper uses the nearest `.gotst.yml` (or
+`-config`) to find the checkout root; its profile settings do not override the
+leader. Helpers do not run a status server or publish history themselves.
+
+Distributed scheduling orders the entire fleet's queue from slowest to fastest
+using history estimates, with a small preference for binaries already prepared
+on a helper. A response contains at most ten tests, aiming to keep roughly
+three seconds of estimated work per worker slot available. Queued tests keep
+running while the helper exchanges results and requests more work.
+
+Connections exchange heartbeats at least every 500 ms and time out after 15
+seconds without an exchange. Disconnected work is requeued immediately. When
+there is no unassigned work, an idle machine can duplicate an assignment that
+has exceeded the greater of ten seconds or three times its estimate, including
+time spent preparing the binary. There are at most two live copies of a test.
+The first completed result wins; other copies are canceled and late results
+are ignored. Tests can therefore execute more than once, including on multiple
+machines. Retries and flakes are tracked within the accepted execution.
+
+The leader's status page shows every worker's short ID, announced name,
+execution slots, completed/cached/failed counts, accumulated test time, and
+queued, building, or running tests. Fail-fast and run completion cancel helpers'
+remaining work. A disconnected helper exits; it can be restarted to join again
+under a new ID. The leader can complete a run without any helpers joining.
+
+Only share the helper address with trusted machines: joining helpers execute
+tests and supply results for the run. Address discovery and VM provisioning
+remain external. `-dist` cannot be combined with `-build-only` or
+`-debug-uncached`. The normal status listener, including `-listen=tailcat`,
+is independent of the helper listener.
+
 ## Test result caching
 
 gotst disables cmd/go's package test-result cache with `go test -count=1` and

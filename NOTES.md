@@ -234,9 +234,15 @@ Scheduler, retries, and distribution:
   each binary. If `-test.skip` is useful, reserve it for excluding known tests
   from broad batch invocations rather than for discovery; compare that with
   constructing an explicit `-test.run` expression for each batch.
-- [ ] Define a stable work-item/artifact protocol suitable for machine shards.
-- [ ] Ensure sharding is deterministic and balanced using duration estimates.
-- [ ] Determine how binaries and required runtime files reach remote workers.
+- [x] Implement a versioned work protocol for helper machines. `-dist` leaders
+  and `-helper` workers exchange leases and results over a separate tailcat
+  listener; address distribution and provisioning remain external.
+- [x] Balance fleet work using duration estimates, bounded batches, small
+  binary-affinity preferences, and speculative copies of overdue assignments.
+  Assignment order depends on which workers request work and complete first.
+- [x] Restore helper binaries through the existing shared `GOCACHEPROG` broker,
+  verifying their hashes against the leader. Runtime files come from the
+  helper's matching checkout and locally configured environment.
 - [ ] Integrate a statistics store for duration and flakiness trends.
 
 Build tags and caching:
