@@ -67,6 +67,27 @@
         <div class="kind">Binary size</div><div><b>{{ .BinarySize }}</b></div><div class="subtle">—</div><div class="subtle">—</div><div class="subtle">—</div><div class="subtle">—</div>
     </section>
 
+    {{ if .Workers }}
+    <section id="workers">
+        <h2>Workers</h2>
+        <table>
+            <thead><tr><th>Worker</th><th>Slots</th><th>Status</th><th>Completed</th><th>Test time</th><th>Current work</th></tr></thead>
+            <tbody>
+                {{ range .Workers }}
+                <tr>
+                    <td>{{ .ID }} <span class="subtle">{{ .Name }}</span></td>
+                    <td>{{ .Slots }}</td>
+                    <td>{{ .Status }}{{ if .Error }}: {{ .Error }}{{ end }}</td>
+                    <td>{{ .Completed }} ({{ .Cached }} cached, {{ .Failed }} failed)</td>
+                    <td>{{ .Duration }}</td>
+                    <td>{{ range .Work }}<div>{{ . }}</div>{{ else }}—{{ end }}</td>
+                </tr>
+                {{ end }}
+            </tbody>
+        </table>
+    </section>
+    {{ end }}
+
     {{ if .Issues }}
     <section id="issues">
         <h2>Failures and flakes ({{ len .Issues }})</h2>

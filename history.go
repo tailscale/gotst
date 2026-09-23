@@ -589,7 +589,7 @@ func (s *Server) prepareTestEstimates(tasks []testTask) {
 }
 
 func (s *Server) recordHistory(task testTask, outcome history.Outcome, duration time.Duration, attempts int, deps []cacheDependency) {
-	if s.history == nil {
+	if s.history == nil && !s.captureHistory {
 		return
 	}
 	key := historyKeyForTask(task, s.profile)

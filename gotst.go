@@ -52,6 +52,9 @@ var (
 	debugUncached = flag.Bool("debug-uncached", false, "run a cache-seeding pass, then diagnose tests that do not reuse it")
 	jsonSummary   = flag.Bool("json-summary", false, "emit a machine-readable flaky-test summary including testing.T attributes")
 	historyConfig = flag.String("history", "local", "history store: local, off, or an http(s) base URL")
+	distributed   = flag.Bool("dist", false, "accept helper VMs on a separate ephemeral tailcat listener")
+	helperAddr    = flag.String("helper", "", "join the leader at this tailcat address and execute assigned tests")
+	helperName    = flag.String("helper-name", "", "helper display name (default: hostname)")
 	testCountSet  bool
 )
 
@@ -117,6 +120,18 @@ func main() {
 	}
 	log.SetPrefix("gotst: ")
 	log.SetFlags(log.Flags() | log.Lmsgprefix)
+	if *helperAddr != "" {
+		if *distributed || *buildOnly || *debugUncached || len(flag.Args()) != 0 {
+			log.Fatal("-helper cannot be combined with -dist, -build-only, -debug-uncached, or package/profile/test arguments")
+		}
+		if err := runHelper(*helperAddr, *helperName); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+	if *distributed && (*buildOnly || *debugUncached) {
+		log.Fatal("-dist cannot be combined with -build-only or -debug-uncached")
+	}
 
 	defs, err := loadProfileDefinitions(*configFile)
 	if err != nil {
@@ -142,6 +157,15 @@ func main() {
 		log.Printf("# cacheDir is %v", s.cacheDir)
 	}
 	defer s.Cleanup()
+	if *distributed {
+		s.fleet = newFleet(s)
+		addr, cleanup, err := startTailcatWorkers(s.fleet)
+		if err != nil {
+			log.Fatalf("starting helper listener: %v", err)
+		}
+		defer cleanup()
+		fmt.Fprintf(os.Stderr, "# gotst helpers: gotst -helper=%s\n", addr)
+	}
 	switch *flagListen {
 	case "":
 	case tailcatListenValue:
@@ -180,6 +204,10 @@ type Server struct {
 	tests     testSelection
 	testCache testResultCache
 	history   history.Store
+	// Isolated executions collect history and output for the leader to commit.
+	captureHistory bool
+	quiet          bool
+	fleet          *fleet
 
 	execSem chan bool // buffered chan semaphore to limit subprocesses
 	outMu   sync.Mutex
@@ -319,6 +347,9 @@ func (s *Server) Run() (retErr error) {
 	stopProgress := s.startProgressReporter()
 	defer func() {
 		stopProgress()
+		if s.fleet != nil {
+			s.fleet.shutdown()
+		}
 		if retErr != nil {
 			s.setPhase(phaseFailed)
 		} else {
@@ -505,7 +536,7 @@ func (s *Server) resolveQualifiedTests() error {
 	for i := range s.tests.qualified {
 		q := &s.tests.qualified[i]
 		args := []string{"list", "-buildvcs=false", "--tags=" + strings.Join(s.profile.Tags, ","), "-f={{.ImportPath}}", q.packageSpec}
-		cmd := exec.Command(goCmd(), args...)
+		cmd := exec.CommandContext(s.ctx, goCmd(), args...)
 		cmd.Dir = s.profile.Root
 		out, err := cmd.CombinedOutput()
 		if err != nil {
@@ -538,7 +569,7 @@ func (s *Server) learnPackagesWithTests() error {
 	// status, which would invalidate cached tests that inspect the source tree.
 	args := []string{"list", "-buildvcs=false", "--tags=" + strings.Join(s.profile.Tags, ","), "--json"}
 	args = append(args, s.profile.Packages...)
-	cmd := exec.Command(goCmd(), args...)
+	cmd := exec.CommandContext(s.ctx, goCmd(), args...)
 	cmd.Dir = s.profile.Root
 	return processCmdOutput(cmd, func(r io.Reader) error {
 		jd := json.NewDecoder(r)
@@ -600,7 +631,7 @@ func (s *Server) resolveExcludedPackages() (map[string]bool, error) {
 	}
 	args := []string{"list", "-buildvcs=false", "--tags=" + strings.Join(s.profile.Tags, ","), "-f={{.ImportPath}}"}
 	args = append(args, s.profile.ExcludePackages...)
-	cmd := exec.Command(goCmd(), args...)
+	cmd := exec.CommandContext(s.ctx, goCmd(), args...)
 	cmd.Dir = s.profile.Root
 	var out bytes.Buffer
 	cmd.Stdout = &out
@@ -637,7 +668,7 @@ func (s *Server) learnBuildDependencyCount(pkgs []string) error {
 		"--tags=" + strings.Join(s.profile.Tags, ","), "-f={{.ImportPath}}",
 	}
 	args = append(args, pkgs...)
-	cmd := exec.Command(goCmd(), args...)
+	cmd := exec.CommandContext(s.ctx, goCmd(), args...)
 	cmd.Dir = s.profile.Root
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -850,12 +881,13 @@ func (s *Server) buildAllTestBinaries() error {
 		args = append(args, "--race")
 	}
 	args = append(args, pkgs...)
-	cmd := exec.Command(goCmd(), args...)
+	cmd := exec.CommandContext(s.ctx, goCmd(), args...)
 	cmd.Dir = s.profile.Root
 	cmd.Env = append(envWithout(os.Environ(), "GOTST_EXEC_DEST"), "GOTST_EXEC_DEST="+s.cacheDir)
 	var shim *cacheShim
+	shimOpts := cacheShimOptions{toolExec: s.recordToolExec, cacheLookup: s.recordCacheLookup}
 	if realCacheProg := os.Getenv("GOCACHEPROG"); realCacheProg != "" {
-		shim, err = startRunCacheShim(realCacheProg)
+		shim, err = startRunCacheShim(realCacheProg, shimOpts)
 		if err != nil {
 			return fmt.Errorf("starting GOCACHEPROG shim: %w", err)
 		}
@@ -869,21 +901,19 @@ func (s *Server) buildAllTestBinaries() error {
 			return fmt.Errorf("locating Go build cache: %w", err)
 		}
 		localDir := filepath.Join(mustCacheRoot(), "build-cache", "v1")
-		shim, err = startRunCacheShim(quoteCacheProgArg(selfExe)+" "+localCacheProgArg,
+		shimOpts.directExecutables = true
+		shim, err = startRunCacheShim(quoteCacheProgArg(selfExe)+" "+localCacheProgArg, shimOpts,
 			localCacheDirEnv+"="+localDir,
 			stockGoCacheDirEnv+"="+stockCache,
 		)
 		if err != nil {
 			return fmt.Errorf("starting local build cache: %w", err)
 		}
-		shim.directExecutables = true
 		cmd.Env = append(envWithout(cmd.Env, "GOCACHEPROG", cacheShimSocketEnv),
 			"GOCACHEPROG="+quoteCacheProgArg(selfExe)+" "+cacheShimArg,
 			cacheShimSocketEnv+"="+shim.endpoint,
 		)
 	}
-	shim.toolExec = s.recordToolExec
-	shim.cacheLookup = s.recordCacheLookup
 	err = processCmdOutput(cmd, func(r io.Reader) error {
 
 		var errs []error
@@ -1198,6 +1228,9 @@ func (s *Server) runAllTests() error {
 	s.loadHistory(tasks)
 	s.orderTestTasksByHistory(tasks)
 	s.prepareTestEstimates(tasks)
+	if s.fleet != nil {
+		return s.fleet.run(tasks)
+	}
 	if *verbose {
 		log.Printf("Running %d tests in %d packages with up to %d concurrent processes...", len(tasks), len(bins), *jobs)
 	}
@@ -1485,7 +1518,7 @@ func (s *Server) runTestAttempt(task testTask, key testCacheKey, baseArgs []stri
 	attrOut.max = 1 << 20
 	logPath := filepath.Join(s.cacheDir, fmt.Sprintf("testlog-%s-%d-%d", key.id(), repetition, retry))
 	args := setTestArg(baseArgs, "-test.run", "^"+regexp.QuoteMeta(task.test)+"$")
-	captureDeps := s.testCache != nil || s.history != nil
+	captureDeps := s.testCache != nil || s.history != nil || s.captureHistory
 	if captureDeps {
 		args = setTestArg(args, "-test.testlogfile", logPath)
 	}
@@ -1612,6 +1645,10 @@ func (s *Server) stopRunningTest(task testTask) {
 func (s *Server) finishTest(task testTask, passed bool, d time.Duration, failures []failInfo, err error, cached bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.finishTestLocked(task, passed, d, failures, err, cached)
+}
+
+func (s *Server) finishTestLocked(task testTask, passed bool, d time.Duration, failures []failInfo, err error, cached bool) {
 	ps := s.pkgs[task.bin.pkg]
 	ts := ps.tests[task.test]
 	now := time.Now()
@@ -1645,7 +1682,7 @@ func (s *Server) finishTest(task testTask, passed bool, d time.Duration, failure
 }
 
 func (s *Server) printTestResult(task testTask, d time.Duration, cached, passed bool, output string) {
-	if passed && !*verbose {
+	if s.quiet || (passed && !*verbose) {
 		return
 	}
 	s.outMu.Lock()

@@ -130,7 +130,7 @@ func TestCacheShimLifecycle(t *testing.T) {
 	t.Setenv("GOTST_TEST_CACHE_HELPER_LOG", logPath)
 	socket := filepath.Join(temp, "cache.sock")
 	command := fmt.Sprintf("%s -test.run=^TestCacheProgHelper$", quoteCacheProgArg(testExe))
-	shim, err := startCacheShim(command, socket)
+	shim, err := startCacheShim(command, socket, cacheShimOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

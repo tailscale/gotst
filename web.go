@@ -403,6 +403,7 @@ type statusData struct {
 	Packages []packageData
 	Issues   []testIssueData
 	Slowest  []slowTestData
+	Workers  []workerData
 }
 
 // packageData is the html/template frozen version of a [packageStatus].
@@ -450,6 +451,7 @@ func (s *Server) statusData() *statusData {
 		BuildDepsCached:   s.buildDepsCached,
 	}
 	eta, unknown, available := s.testETALocked(now)
+	d.Workers = s.workerDataLocked(now)
 	d.TestETA = formatEstimate(eta)
 	d.ETAMedian = formatEstimate(s.testEstimateBase)
 	d.ETAUnknown = unknown

@@ -47,6 +47,7 @@ type progressSnapshot struct {
 	CacheEnabled bool
 	CacheChecks  int
 	CacheHits    int
+	Helpers      int
 }
 
 func (s *Server) setPhase(phase runPhase) {
@@ -102,6 +103,13 @@ func (s *Server) progressSnapshot() progressSnapshot {
 	}
 	p.TestETA, p.ETAUnknown, p.ETAAvailable = s.testETALocked(time.Now())
 	p.ETAMedian = s.testEstimateBase
+	if s.fleet != nil {
+		for _, w := range s.fleet.workers {
+			if w.ID != "leader" && w.Connected && w.Error == "" {
+				p.Helpers++
+			}
+		}
+	}
 	return p
 }
 
@@ -112,7 +120,15 @@ func (s *Server) testETALocked(now time.Time) (time.Duration, int, bool) {
 	if !s.testEstimateReady || (s.phase != phaseTesting && s.phase != phaseDone && s.phase != phaseFailed) {
 		return 0, 0, false
 	}
-	slots := make([]time.Duration, max(1, *jobs))
+	capacity := max(1, *jobs)
+	if s.fleet != nil {
+		for _, w := range s.fleet.workers {
+			if w.ID != "leader" && w.Connected && w.Error == "" {
+				capacity += w.Slots
+			}
+		}
+	}
+	slots := make([]time.Duration, capacity)
 	running := 0
 	unknown := 0
 	var queued []time.Duration
@@ -198,6 +214,9 @@ func (p progressSnapshot) line() string {
 		}
 	}
 	fmt.Fprintf(&b, "; %s", p.Elapsed)
+	if p.Helpers != 0 {
+		fmt.Fprintf(&b, "; %d helpers", p.Helpers)
+	}
 	return b.String()
 }
 
