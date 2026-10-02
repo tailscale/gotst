@@ -53,6 +53,7 @@ var (
 	jsonSummary   = flag.Bool("json-summary", false, "emit a machine-readable flaky-test summary including testing.T attributes")
 	historyConfig = flag.String("history", "local", "history store: local, off, or an http(s) base URL")
 	distributed   = flag.Bool("dist", false, "accept helper VMs on a separate ephemeral tailcat listener")
+	distKey       = flag.String("dist-key", "", "with -dist, path to a *.private.json from \"tailcat genkey --fixed-region\" to use for the helper listener instead of an ephemeral key, so helpers can be given its address before the leader starts")
 	helperAddr    = flag.String("helper", "", "join the leader at this tailcat address and execute assigned tests")
 	helperName    = flag.String("helper-name", "", "helper display name (default: hostname)")
 	testCountSet  bool
@@ -132,6 +133,9 @@ func main() {
 	if *distributed && (*buildOnly || *debugUncached) {
 		log.Fatal("-dist cannot be combined with -build-only or -debug-uncached")
 	}
+	if *distKey != "" && !*distributed {
+		log.Fatal("-dist-key requires -dist")
+	}
 
 	defs, err := loadProfileDefinitions(*configFile)
 	if err != nil {
@@ -159,7 +163,7 @@ func main() {
 	defer s.Cleanup()
 	if *distributed {
 		s.fleet = newFleet(s)
-		addr, cleanup, err := startTailcatWorkers(s.fleet)
+		addr, cleanup, err := startTailcatWorkers(s.fleet, *distKey)
 		if err != nil {
 			log.Fatalf("starting helper listener: %v", err)
 		}

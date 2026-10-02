@@ -131,8 +131,11 @@ It prints a command containing the helper listener's address:
 # gotst helpers: gotst -helper=tcom…
 ```
 
-Pass that address to your VMs using your own provisioning mechanism. In each
-helper's checkout, run:
+Pass that address to your VMs using your own provisioning mechanism. If the
+helpers need the address before the leader starts (for example, parallel CI
+jobs), make a key ahead of time with `tailcat genkey --fixed-region`, give
+the printed address to the helpers, and pass the key file to the leader with
+`-dist-key=FILE.private.json`. In each helper's checkout, run:
 
 ```sh
 gotst -helper=tcom… -helper-name=vm-west-2 -j=8

@@ -23,7 +23,10 @@ import (
 
 const workerPort = 5526
 
-func startTailcatWorkers(f *fleet) (tailcat.Addr, func(), error) {
+// startTailcatWorkers starts the leader's helper listener. If keyFile is
+// non-empty, it names a key written by "tailcat genkey" to use instead of a
+// new ephemeral key.
+func startTailcatWorkers(f *fleet, keyFile string) (tailcat.Addr, func(), error) {
 	logf := logger.Discard
 	if *verbose {
 		logf = log.Printf
@@ -37,6 +40,22 @@ func startTailcatWorkers(f *fleet) (tailcat.Addr, func(), error) {
 			return func(c net.Conn) { go f.serveWorker(c) }
 		},
 		ServedTCPPorts: []filter.PortRange{{First: workerPort, Last: workerPort}},
+	}
+	if keyFile != "" {
+		j, err := os.ReadFile(keyFile)
+		if err != nil {
+			return "", nil, err
+		}
+		var k tailcat.PrivateKey
+		if err := json.Unmarshal(j, &k); err != nil {
+			return "", nil, fmt.Errorf("parsing %s: %w", keyFile, err)
+		}
+		if k.Private.IsZero() {
+			return "", nil, fmt.Errorf("%s has no private key", keyFile)
+		}
+		srv.Key = k.Private
+		srv.PresharedKey = k.Public.PresharedKey
+		srv.RegionID = k.Public.RegionID
 	}
 	if err := srv.Start(); err != nil {
 		return "", nil, err
