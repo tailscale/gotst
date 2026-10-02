@@ -46,6 +46,8 @@ type fleetWorker struct {
 	Slots     int
 	Connected bool
 	LastSeen  time.Time
+	Joined    time.Time
+	Left      time.Time // zero while connected
 	Completed int
 	Cached    int
 	Failed    int
@@ -151,11 +153,12 @@ func (f *fleet) addWorker(name string, slots int, local bool) *fleetWorker {
 	f.s.mu.Lock()
 	defer f.s.mu.Unlock()
 	id := fmt.Sprintf("h%d", len(f.workers)+1)
+	now := time.Now()
 	if local {
 		id = "leader"
 	}
 	w := &fleetWorker{
-		ID: id, Name: name, Slots: slots, Connected: true, LastSeen: time.Now(),
+		ID: id, Name: name, Slots: slots, Connected: true, LastSeen: now, Joined: now,
 		binaries: make(map[string]bool), leases: make(map[uint64]*workLease),
 	}
 	f.workers = append(f.workers, w)
@@ -198,6 +201,7 @@ func (f *fleet) updateRunningLocked(t *fleetTask) {
 func (f *fleet) disconnect(w *fleetWorker, err error) {
 	f.s.mu.Lock()
 	w.Connected = false
+	w.Left = time.Now()
 	if err != nil {
 		w.Error = err.Error()
 	}

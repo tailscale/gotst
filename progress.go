@@ -50,9 +50,16 @@ type progressSnapshot struct {
 	Helpers      int
 }
 
+// phaseStart records when a run entered a phase.
+type phaseStart struct {
+	phase runPhase
+	at    time.Time
+}
+
 func (s *Server) setPhase(phase runPhase) {
 	s.mu.Lock()
 	s.phase = phase
+	s.phaseStarts = append(s.phaseStarts, phaseStart{phase, time.Now()})
 	s.mu.Unlock()
 }
 

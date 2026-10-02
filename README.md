@@ -173,7 +173,11 @@ machines. Retries and flakes are tracked within the accepted execution.
 
 The leader's status page shows every worker's short ID, announced name,
 execution slots, completed/cached/failed counts, accumulated test time, and
-queued, building, or running tests. Fail-fast and run completion cancel helpers'
+queued, building, or running tests. At the end of the run, the leader prints
+how long each phase took and a table of the same per-worker counts, when each
+worker joined, and how busy its slots were during the testing phase. Under
+GitHub Actions, it also appends that summary as Markdown to the job summary
+(`$GITHUB_STEP_SUMMARY`). Fail-fast and run completion cancel helpers'
 remaining work. A disconnected helper exits; it can be restarted to join again
 under a new ID. The leader can complete a run without any helpers joining.
 

@@ -229,6 +229,7 @@ type Server struct {
 	buildActionToPkg  map[string]string
 	buildActionMapDir string
 	phase             runPhase
+	phaseStarts       []phaseStart // in order; the last is the current phase
 	testsTotal        int
 	cacheChecks       int
 	cacheHits         int
@@ -362,6 +363,7 @@ func (s *Server) Run() (retErr error) {
 		s.flushFinalLiveStatus()
 		s.printProgress()
 		s.printFlakySummary()
+		s.printFleetSummary()
 		s.flushHistory()
 	}()
 
