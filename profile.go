@@ -21,6 +21,16 @@ const profileConfigName = ".gotst.yml"
 type profileFile struct {
 	Version  int                   `yaml:"version"`
 	Profiles map[string]rawProfile `yaml:"profiles"`
+	Remote   *remoteConfig         `yaml:"remote"`
+}
+
+// remoteConfig is the remote section of .gotst.yml, configuring -remote.
+type remoteConfig struct {
+	// Command is the remote shell command and its arguments. A relative
+	// program path containing a slash is relative to the config file.
+	Command []string `yaml:"command"`
+	// Machines is the default number of machines for -remote.
+	Machines int `yaml:"machines"`
 }
 
 type rawProfile struct {
@@ -54,6 +64,7 @@ type profileDefinitions struct {
 	root     string
 	profiles map[string]rawProfile
 	implicit bool
+	remote   *remoteConfig // nil if not configured
 }
 
 func loadProfileDefinitions(configPath string) (*profileDefinitions, error) {
@@ -101,10 +112,25 @@ func loadProfileDefinitions(configPath string) (*profileDefinitions, error) {
 	if pf.Version != 1 {
 		return nil, fmt.Errorf("profile config %q has version %d; only version 1 is supported", absConfig, pf.Version)
 	}
-	if len(pf.Profiles) == 0 {
-		return nil, fmt.Errorf("profile config %q defines no profiles", absConfig)
+	if r := pf.Remote; r != nil && (r.Machines < 0 || r.Machines > 64) {
+		return nil, fmt.Errorf("profile config %q: remote.machines must be from 0 to 64", absConfig)
 	}
-	return &profileDefinitions{path: absConfig, root: filepath.Dir(absConfig), profiles: pf.Profiles}, nil
+	if len(pf.Profiles) == 0 {
+		if pf.Remote == nil {
+			return nil, fmt.Errorf("profile config %q defines no profiles", absConfig)
+		}
+		// A config with only remote settings keeps the implicit
+		// default profile, rooted at the working directory.
+		wd, err := os.Getwd()
+		if err != nil {
+			return nil, err
+		}
+		return &profileDefinitions{
+			path: absConfig, root: wd, implicit: true, remote: pf.Remote,
+			profiles: map[string]rawProfile{"default": {Packages: []string{"./..."}}},
+		}, nil
+	}
+	return &profileDefinitions{path: absConfig, root: filepath.Dir(absConfig), profiles: pf.Profiles, remote: pf.Remote}, nil
 }
 
 func (d *profileDefinitions) resolve(name string) (runProfile, error) {

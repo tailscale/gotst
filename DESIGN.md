@@ -108,6 +108,20 @@ child modes before parsing normal command-line flags.
    from a leader, prepares assigned binaries through cmd/go, and returns test
    results. It starts no dashboard and does not discover its own test selection.
 
+With `-remote`, the runner role instead delegates the whole invocation to
+other machines (`remote.go`, `remote_run.sh`). It snapshots the working tree as
+a commit in a temporary index, bundles the commits that `origin` lacks, and
+runs a user-supplied remote shell command per machine, streaming each a tar of
+the guest script, its settings, and that bundle. The script syncs a reused or
+fresh checkout, installs or receives gotst, and starts the leader (`-dist`) or
+a helper. The local process watches the leader's stderr for its helper address
+and writes it to each helper's still-open standard input, so helpers provision
+in parallel with the leader. Only source and gotst itself cross those
+connections; build artifacts move between machines through their shared
+`GOCACHEPROG`. Machine provisioning, source access, and environment policy
+belong to the remote shell command, so gotst knows nothing about any
+particular VM service.
+
 Using one binary for all roles means `go test -exec`, `-toolexec`, and `GOCACHEPROG`
 do not require separately installed helper programs.
 
@@ -747,6 +761,7 @@ the runner state.
 | --- | --- |
 | `gotst.go` | Entry modes, `Server`, phase pipeline, discovery, capture, listing, scheduler, retries, and argument normalization |
 | `distributed.go` | Fleet queue, leases, affinity, speculative execution, result acceptance, and worker status |
+| `remote.go`, `remote_run.sh` | `-remote` checkout snapshot, remote shell protocol, guest setup, and output relay |
 | `worker.go` | Tailcat work listener, helper protocol, lazy binary preparation, and helper execution loop |
 | `profile.go` | Configuration discovery, strict YAML decoding, includes, and resolved profiles |
 | `invocation.go` | Positional package/profile/test interpretation and selection matching |

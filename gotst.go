@@ -121,6 +121,9 @@ func main() {
 	}
 	log.SetPrefix("gotst: ")
 	log.SetFlags(log.Flags() | log.Lmsgprefix)
+	if remoteRun.on {
+		mainRemote()
+	}
 	if *helperAddr != "" {
 		if *distributed || *buildOnly || *debugUncached || len(flag.Args()) != 0 {
 			log.Fatal("-helper cannot be combined with -dist, -build-only, -debug-uncached, or package/profile/test arguments")

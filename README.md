@@ -187,6 +187,58 @@ remain external. `-dist` cannot be combined with `-build-only` or
 `-debug-uncached`. The normal status listener, including `-listen=tailcat`,
 is independent of the helper listener.
 
+## Remote execution
+
+`-remote` runs an invocation on other Linux machines instead of locally, using
+the distributed mode above:
+
+```sh
+gotst -remote ./...      # remote.machines from .gotst.yml, else 4
+gotst -remote=8 ./...
+```
+
+The first machine runs the `-dist` leader and the others join it as helpers,
+each with `-j` defaulting to its CPU count. Other flags and arguments are
+passed to the leader, which prints its output and determines gotst's exit
+status. Helpers' output is prefixed with their names. The leader's status page
+uses `-listen=tailcat` unless `-listen` is given.
+
+The local machine does not build anything. It records the working tree,
+including uncommitted and untracked (but not ignored) files, as a temporary
+commit, and sends each machine a git bundle of whatever is not on the `origin`
+remote's branches as known locally. Each machine shallow-fetches the rest from
+`origin` (anonymously over https for GitHub), checks out the same tree, and
+changes to the same subdirectory. Configure a shared `GOCACHEPROG` on the
+remote machines so they reuse each other's build outputs; build-cache traffic
+never passes through the local machine. Each machine installs the gotst
+version the local binary was built from with `go install`, using the
+checkout's `tool/go` if present. A gotst built from a modified checkout must
+instead give `-remote-gotst=FILE`, a linux/amd64 gotst to upload.
+
+Gotst reaches machines through a remote shell command, configured with
+`-remote-cmd` (split on spaces), `$GOTST_REMOTE_CMD`, or `.gotst.yml`:
+
+```yaml
+version: 1
+remote:
+  command: [./tool/gotst-remote]  # relative to this file
+  machines: 5
+```
+
+A `.gotst.yml` with only a `remote` section keeps the implicit default
+profile. Gotst runs the command once per machine with one more argument, a
+POSIX shell command. The command must run it on a fresh (or reusable) Linux
+machine with standard input, output, and error connected, and exit with its
+status, as `ssh HOST` does; `-remote-cmd='ssh -T buildhost'` works for a single
+host. It may prefix the shell command with environment settings: `GOTST_SRC_URL`
+to fetch commits from elsewhere, `GOTST_BIN` to use an installed gotst,
+`GOTST_REMOTE_DIR` for the checkout and cache directory (default
+`~/.cache/gotst-remote`), and anything the build needs, such as `GOCACHEPROG`.
+Its environment has `GOTST_REMOTE_PROTOCOL=1`, `GOTST_REMOTE_INDEX` (0 is the
+leader), `GOTST_REMOTE_COUNT`, `GOTST_REMOTE_REPO_URL` (the local origin URL),
+and `GOTST_REMOTE_REPO` (`owner/name` on GitHub, else empty), so it can choose
+or name machines and rewrite source URLs.
+
 ## Test result caching
 
 gotst disables cmd/go's package test-result cache with `go test -count=1` and
