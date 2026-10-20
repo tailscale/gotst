@@ -62,6 +62,21 @@ go=go
 if [ -x "$src/tool/go" ]; then
 	go="$src/tool/go"
 fi
+# gotst is built with the Go version its go.mod asks for, not the
+# checkout's toolchain: a fork such as Tailscale's adds build tags
+# (tailscale_go) that can break it. Switching toolchains unpacks one into
+# the module cache, so use a private writable one, in case the default is
+# read-only (as with gomodfs).
+gotstenv() {
+	env GOMODCACHE="$base/gotst-modcache" GOFLAGS="${GOFLAGS:+$GOFLAGS }-modcacherw" "$@"
+}
+# modtoolchain GOMOD prints the GOTOOLCHAIN for the Go version that go.mod
+# file asks for.
+modtoolchain() {
+	t=$(sed -n 's/^toolchain \([^ ]*\).*/\1/p' "$1" | head -n 1)
+	[ -n "$t" ] || t="go$(sed -n 's/^go \([^ ]*\).*/\1/p' "$1" | head -n 1)"
+	echo "$t"
+}
 if [ -n "${GOTST_BIN:-}" ]; then
 	gotst=$GOTST_BIN
 elif [ -n "$GOTST_REF" ]; then
@@ -77,7 +92,7 @@ elif [ -n "$GOTST_REF" ]; then
 	gotst="$bin/gotst"
 	if [ ! -x "$gotst" ]; then
 		say "installing gotst $GOTST_REF ($rev)"
-		(cd "$gs" && GOBIN="$bin" "$go" install .) >"$dir/gotst-install.log" 2>&1 ||
+		(cd "$gs" && gotstenv GOTOOLCHAIN="$(modtoolchain go.mod)" GOBIN="$bin" "$go" install .) >"$dir/gotst-install.log" 2>&1 ||
 			{ cat "$dir/gotst-install.log"; fail "installing gotst"; }
 	fi
 else
@@ -88,7 +103,9 @@ else
 	gotst="$bin/gotst"
 	if [ ! -x "$gotst" ]; then
 		say "installing github.com/tailscale/gotst@$GOTST_VERSION"
-		(cd "$base" && GOBIN="$bin" "$go" install "github.com/tailscale/gotst@$GOTST_VERSION") >"$dir/gotst-install.log" 2>&1 ||
+		(cd "$base" &&
+			mod=$(gotstenv "$go" mod download -json "github.com/tailscale/gotst@$GOTST_VERSION" | sed -n 's/^[[:space:]]*"GoMod": "\(.*\)",*$/\1/p') &&
+			gotstenv GOTOOLCHAIN="$(modtoolchain "$mod")" GOBIN="$bin" "$go" install "github.com/tailscale/gotst@$GOTST_VERSION") >"$dir/gotst-install.log" 2>&1 ||
 			{ cat "$dir/gotst-install.log"; fail "installing gotst; for an unpublished build, push it to a branch and use -remote-gotst=BRANCH"; }
 	fi
 fi
