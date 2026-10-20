@@ -15,6 +15,7 @@ import (
 	"maps"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"net/netip"
 	"slices"
 	"strconv"
@@ -161,7 +162,28 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "/live-ws":
 		s.serveLiveWS(w, r)
 	default:
+		if strings.HasPrefix(r.URL.Path, "/debug/pprof/") {
+			// The status page is only served to trusted viewers.
+			servePprof(w, r)
+			return
+		}
 		http.NotFound(w, r)
+	}
+}
+
+// servePprof serves net/http/pprof's handlers below /debug/pprof/.
+func servePprof(w http.ResponseWriter, r *http.Request) {
+	switch name := strings.TrimPrefix(r.URL.Path, "/debug/pprof/"); name {
+	case "cmdline":
+		pprof.Cmdline(w, r)
+	case "profile":
+		pprof.Profile(w, r)
+	case "symbol":
+		pprof.Symbol(w, r)
+	case "trace":
+		pprof.Trace(w, r)
+	default:
+		pprof.Index(w, r)
 	}
 }
 
