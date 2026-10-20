@@ -124,7 +124,10 @@ tests using its own `-j` slots. Each machine takes batches of packages to build
 (or restore from the shared `GOCACHEPROG`) and list, smaller as fewer remain,
 and their tests can start as soon as they are listed, preferably on the machine
 that built them. A build failure on any machine stops the run, but tests may
-already have run by then:
+already have run by then. By default the leader builds everything in one
+cmd/go invocation, which is fastest when the build cache is warm, while helpers
+build batches from the other end, which helps when it is cold;
+`-dist-build=batches` or `-dist-build=leader` change that for profiling:
 
 ```sh
 gotst -dist -j=4 ./...
@@ -264,7 +267,11 @@ maintains its own per-top-level-test cache. Successful results are stored below
 different cache root.
 
 When `GOCACHEPROG` is set, results are also stored in and looked up from it, so
-machines sharing a cache server share test results, as they do build outputs.
+machines sharing a cache server share test results, as they do build outputs. Like `go test`'s own cache, gotst then also avoids obtaining test binaries
+whose results may all be cached: it records what each linked test binary
+contains, and later builds skip downloading and listing binaries it already
+knows, fetching one only if a test needs to run. `-link-skip=false` turns this
+off, for comparison.
 This needs identical checkout paths, as on alike-provisioned CI or `-remote`
 machines.
 

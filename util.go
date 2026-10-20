@@ -126,3 +126,25 @@ func pidStillrunning(pid int) bool {
 	err = proc.Signal(os.Signal(syscall.Signal(0)))
 	return err == nil
 }
+
+// keyedMutex is a set of mutexes by key.
+type keyedMutex struct {
+	mu sync.Mutex
+	m  map[string]*sync.Mutex
+}
+
+// lock locks key's mutex and returns its unlock function.
+func (k *keyedMutex) lock(key string) func() {
+	k.mu.Lock()
+	if k.m == nil {
+		k.m = make(map[string]*sync.Mutex)
+	}
+	m := k.m[key]
+	if m == nil {
+		m = new(sync.Mutex)
+		k.m[key] = m
+	}
+	k.mu.Unlock()
+	m.Lock()
+	return m.Unlock
+}

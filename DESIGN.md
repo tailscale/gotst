@@ -641,15 +641,22 @@ completion or helper rejection. Network I/O runs separately from the helper's
 execution loop, so queued work proceeds while an exchange is in flight.
 Each exchange has a 15-second connection deadline.
 
-With `-dist`, the leader does not build or list packages itself in one step.
-After discovery, preparing each selected test package (building its test
-binary, or restoring it from the build cache, and running `-test.list`) is work
-in the same fleet as tests. The leader's own preparer and its helpers take
-batches of packages from one queue by guided self-scheduling: a batch is the
-unassigned count divided by four times the number of machines, between one and
-eight packages, so early cmd/go invocations amortize package loading and cache
-lookups while the end of the queue is spread one package at a time. A machine
-alone takes the whole queue in one invocation, as an ordinary build would. A
+With `-dist`, preparing each selected test package (building its test binary,
+or restoring it from the build cache, and running `-test.list`) is work shared
+by the fleet. Helpers take batches of packages from one queue by guided
+self-scheduling: a batch is the unassigned count divided by four times the
+number of machines, between one and eight packages, so early cmd/go
+invocations amortize package loading and cache lookups while the end of the
+queue is spread one package at a time. Every cmd/go invocation recomputes
+action IDs for its packages' dependency graph, which for large module graphs is
+most of a warm build's cost, so the default `-dist-build=hybrid` has the leader
+build every package in a single invocation, reusing its own discovery, and
+prepare each package as cmd/go reports it, while helpers take batches from the
+other end of the queue. When the build cache is warm the leader's invocation
+finishes about as fast as a stock `go test`; when it is cold, helpers'
+batches fill the shared cache ahead of it. `-dist-build=batches` makes the
+leader take batches like a helper, and `-dist-build=leader` leaves preparation
+to the leader alone; both exist for comparison and profiling. A
 helper reports each package's binary SHA-256, size, captured arguments, listed
 tests, or build failure; a disconnected helper's batch returns to the queue,
 and a second report for a package is ignored. The machine that prepares a
@@ -721,6 +728,34 @@ The leader runs cmd/go and test executables through `nice -n 10` where
 available. They can saturate the machine, and the leader process itself must
 keep serving helper exchanges and the status page, both over its userspace
 tailcat network stack.
+
+## Skipping test binaries
+
+Stock cmd/go avoids even linking a test binary when the test's result is
+cached. Gotst keys results by the binary's SHA-256, so it would otherwise have
+to restore every binary (hundreds of megabytes for a large module) and run it
+with `-test.list` before it could look up a single result. With an external
+`GOCACHEPROG`, result caching, and `-link-skip` (the default), it avoids that:
+
+- After capturing and listing a binary, gotst stores a *link record* in
+  `GOCACHEPROG` under an action ID derived from the binary's link action ID,
+  which the broker learned from cmd/go's `get` (or, for a fresh link, from the
+  executable's build ID). The record holds the binary's SHA-256, size, Go
+  build ID, and listed tests.
+- During later builds the broker first looks up a link record for every
+  `get` (cmd/go does not say which are link actions; for others the extra
+  lookup is a small miss). On a hit it answers with a placeholder: a small
+  file holding the raw build ID, which cmd/go reads from cached link outputs,
+  followed by the record. The response carries the real output ID and the
+  placeholder's size, which cmd/go checks against the file.
+- The `-exec` capture wrapper recognizes the placeholder and reports the real
+  hash and tests without capturing anything, so the package is not listed.
+- A test that misses the result cache fetches the real executable by its link
+  action ID from `GOCACHEPROG` (outside cmd/go) and verifies its SHA-256.
+
+The record is a function of the link action, so it cannot describe a
+different binary; a fetched binary must still match its recorded hash.
+`-link-skip=false` disables both writing and using records.
 
 ## External Go build-cache broker
 
@@ -824,6 +859,7 @@ the runner state.
 | `cache.go` | Per-run directories and cleanup of abandoned runs |
 | `testcache.go` | Persistent result-cache interface, disk backend, test-log parsing, and dependency fingerprints |
 | `testcache_prog.go` | Result-cache layer sharing entries through `GOCACHEPROG` |
+| `linkskip.go` | Link records, test-binary placeholders, and fetching skipped binaries |
 | `history/history.go` | Public advisory-history model, store interface, and versioned HTTP wire types |
 | `history.go` | Gotst integration, portable dependency shapes, and local/HTTP store implementations |
 | `cmd/testhistoryd` | PostgreSQL 17 history service, embedded schema, and HTTP handlers |

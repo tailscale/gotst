@@ -7,6 +7,7 @@ import (
 	"cmp"
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"os"
 	"os/exec"
@@ -18,6 +19,8 @@ import (
 
 	"github.com/tailscale/gotst/history"
 )
+
+var distBuild = flag.String("dist-build", "hybrid", "with -dist, how test packages are prepared (built and listed): hybrid (the leader builds them all in one cmd/go invocation while helpers take batches from the other end), batches (every machine, the leader included, takes batches), or leader (only the leader, in one invocation)")
 
 const (
 	workerProtocolVersion = 3
@@ -119,6 +122,7 @@ type workerConfig struct {
 	History    bool
 	FailFast   bool
 	JSON       bool
+	LinkSkip   bool
 }
 
 type workerRequest struct {
@@ -287,11 +291,20 @@ func (f *fleet) nextPrepLocked(w *fleetWorker, now time.Time) []string {
 	if !f.preparing || len(w.prep) != 0 || w.Error != "" {
 		return nil
 	}
+	mode := *distBuild
+	if mode == "leader" && w.ID != "leader" {
+		return nil
+	}
 	var unassigned []*prepItem
 	for _, it := range f.prep {
 		if !it.done && it.worker == nil {
 			unassigned = append(unassigned, it)
 		}
+	}
+	if mode == "hybrid" {
+		// The leader builds everything from the front, in cmd/go's order;
+		// helpers start from the back, to overlap with it last.
+		slices.Reverse(unassigned)
 	}
 	if len(unassigned) == 0 {
 		return nil
@@ -324,6 +337,9 @@ func (f *fleet) applyPrepared(w *fleetWorker, pp preparedPackage) {
 		}
 	}
 	w.prep = slices.DeleteFunc(w.prep, func(it *prepItem) bool { return it.pkg == pp.Package })
+	if pp.Binary != "" {
+		w.binaries[pp.Binary] = true
+	}
 	if item == nil || item.done {
 		s.mu.Unlock()
 		return
@@ -420,7 +436,14 @@ func (f *fleet) runDistributed(pkgs []string) error {
 	}
 
 	var wg sync.WaitGroup
-	wg.Go(func() { f.localPreparer(local) })
+	switch *distBuild {
+	case "batches":
+		wg.Go(func() { f.localPreparer(local) })
+	case "hybrid", "leader":
+		wg.Go(func() { f.leaderBuild(local, pkgs) })
+	default:
+		return fmt.Errorf("invalid -dist-build %q; want hybrid, batches, or leader", *distBuild)
+	}
 	err := f.run(local)
 	wg.Wait()
 	s.mu.Lock()
@@ -431,6 +454,76 @@ func (f *fleet) runDistributed(pkgs []string) error {
 		return fmt.Errorf("building test binaries: %s", strings.Join(slices.Compact(buildErrs), "\n"))
 	}
 	return err
+}
+
+// leaderBuild builds all of pkgs on the leader in one cmd/go invocation,
+// preparing each package as cmd/go reports it rather than after the whole
+// build. Packages helpers already prepared are ignored, but the leader
+// keeps its own binaries for its tests.
+func (f *fleet) leaderBuild(w *fleetWorker, pkgs []string) {
+	s := f.s
+	// Reuse the leader's discovery rather than repeating go list.
+	build := &Server{
+		ctx: s.ctx, cacheDir: s.cacheDir, profile: s.profile, scratch: true, linkSkip: s.linkSkip,
+		buildDepFresh: make(map[string]bool), buildDepCached: make(map[string]bool),
+		buildActionToPkg: make(map[string]string), buildActionMapDir: s.buildActionMapDir,
+		pkgs: make(map[string]*packageStatus),
+	}
+	s.mu.Lock()
+	for _, pkg := range pkgs {
+		build.pkgs[pkg] = &packageStatus{glp: s.pkgs[pkg].glp}
+		build.pkgsWithTests++
+	}
+	s.mu.Unlock()
+	captured := make(chan string, len(pkgs))
+	build.onTestBinary = func(pkg string) { captured <- pkg } // with build.mu held
+	var lists sync.WaitGroup
+	sem := make(chan bool, max(1, *jobs))
+	lists.Go(func() {
+		for pkg := range captured {
+			var bin capturedTestBinary
+			for _, b := range build.capturedTestBinaries() {
+				if b.pkg == pkg {
+					bin = b
+				}
+			}
+			build.mu.Lock()
+			ps := build.pkgs[pkg]
+			pp := preparedPackage{
+				Package: pkg, Binary: binHash(bin.absBin), Size: ps.exeSize, Cached: ps.exeCached,
+				Args: slices.Clone(ps.exeArgs), Tests: ps.stubTests,
+			}
+			build.mu.Unlock()
+			f.local.mu.Lock()
+			f.local.bins[pkg] = bin
+			f.local.mu.Unlock()
+			lists.Go(func() {
+				if pp.Tests == nil {
+					sem <- true
+					tests, err := listTests(s.ctx, pkg, bin.absBin, bin.workDir)
+					<-sem
+					if err != nil {
+						pp.Error = err.Error()
+					} else {
+						pp.Tests = tests
+						build.recordLinkRecord(bin, tests)
+					}
+				}
+				f.applyPrepared(w, pp)
+				f.finishPreparingIfDone()
+			})
+		}
+	})
+	err := build.buildAllTestBinaries()
+	close(captured)
+	lists.Wait()
+	if err != nil && s.ctx.Err() == nil {
+		s.mu.Lock()
+		f.buildErrs = append(f.buildErrs, err.Error())
+		s.mu.Unlock()
+		s.cancel()
+	}
+	f.notify()
 }
 
 // localPreparer prepares packages on the leader until none remain.

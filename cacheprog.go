@@ -264,6 +264,7 @@ type cacheLookupEvent struct {
 // cacheShimOptions is immutable once the broker starts accepting connections.
 type cacheShimOptions struct {
 	directExecutables bool // downstream paths are gotst-owned and executable
+	linkSkip          bool // answer link actions with link records as placeholders (see linkskip.go)
 	toolExec          func(toolExecEvent)
 	cacheLookup       func(cacheLookupEvent)
 }
@@ -280,12 +281,57 @@ type cacheShim struct {
 	connWG     sync.WaitGroup
 	execHits   atomic.Int64
 	execPuts   atomic.Int64
+	execStubs  atomic.Int64 // executables answered with placeholders
 
 	mu           sync.Mutex
 	misses       map[string][]byte // 120-bit build-ID prefix -> full action ID
 	uploaded     map[string]bool
 	execHit      map[string]bool               // SHA-256 output ID of each executable cache hit
 	verifiedExec map[string]verifiedExecutable // cleaned executable path -> verified metadata
+	linkActions  map[string]string             // SHA-256 of an executable -> hex link action ID
+}
+
+// linkActionFor returns the hex link action ID that produced the executable
+// with SHA-256 outputHash in this build, if known.
+func (s *cacheShim) linkActionFor(outputHash string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.linkActions[outputHash]
+}
+
+func (s *cacheShim) noteLinkAction(outputHash string, actionID []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.linkActions == nil {
+		s.linkActions = make(map[string]string)
+	}
+	s.linkActions[outputHash] = hex.EncodeToString(actionID)
+}
+
+// linkStub answers get(actionID) with a placeholder if actionID is a link
+// action with a link record, or returns nil.
+func (s *cacheShim) linkStub(ctx context.Context, actionID []byte) *cacheProgResponse {
+	rec, err := lookupLinkRecord(ctx, s.downstream, actionID)
+	if err != nil || rec == nil {
+		return nil
+	}
+	data, err := linkStubContents(linkStub{LinkAction: hex.EncodeToString(actionID), linkRecord: *rec})
+	if err != nil {
+		return nil
+	}
+	path := filepath.Join(s.execDir, "stub-"+hex.EncodeToString(actionID))
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		return nil
+	}
+	outputID, _ := hex.DecodeString(rec.OutputID)
+	s.noteLinkAction(rec.OutputID, actionID)
+	s.mu.Lock()
+	s.execHit[rec.OutputID] = true
+	s.mu.Unlock()
+	s.execStubs.Add(1)
+	// cmd/go requires the file's size to match the entry's; it uses the
+	// output ID only to derive content IDs, so it is the real one.
+	return &cacheProgResponse{OutputID: outputID, Size: int64(len(data)), DiskPath: path}
 }
 
 // runCacheShim runs in the child process started by cmd/go. The gotst parent
@@ -457,6 +503,15 @@ func (s *cacheShim) serveCmdGo(r io.Reader, w io.Writer) error {
 }
 
 func (s *cacheShim) forward(ctx context.Context, req cacheProgRequest) (*cacheProgResponse, error) {
+	if req.Command == cacheProgGet && s.linkSkip && s.downstream.can[cacheProgGet] {
+		// Any get may be for a test binary's link action; cmd/go doesn't say.
+		if res := s.linkStub(ctx, req.ActionID); res != nil {
+			if s.cacheLookup != nil {
+				s.cacheLookup(cacheLookupEvent{ActionID: append([]byte(nil), req.ActionID...), Hit: true})
+			}
+			return res, nil
+		}
+	}
 	var res *cacheProgResponse
 	if req.Command == cacheProgGet && !s.downstream.can[cacheProgGet] {
 		// Advertising get lets us observe cmd/go's exact link action ID even
@@ -499,8 +554,9 @@ func (s *cacheShim) forward(ctx context.Context, req cacheProgRequest) (*cachePr
 			s.recordMiss(req.ActionID)
 			return &cacheProgResponse{Miss: true}, nil
 		}
-		s.mu.Lock()
 		outputHash := hex.EncodeToString(res.OutputID)
+		s.noteLinkAction(outputHash, req.ActionID)
+		s.mu.Lock()
 		s.execHit[outputHash] = true
 		s.verifiedExec[filepath.Clean(path)] = verifiedExecutable{
 			OutputHash: outputHash, Size: fi.Size(),
@@ -659,6 +715,9 @@ func (s *cacheShim) registerExecutable(reg executableRegistration) error {
 	s.mu.Lock()
 	actionID := append([]byte(nil), s.misses[parts[0]]...)
 	s.mu.Unlock()
+	if len(actionID) != 0 {
+		s.noteLinkAction(reg.OutputHash, actionID)
+	}
 	if len(actionID) == 0 || !s.downstream.can[cacheProgPut] {
 		return nil
 	}

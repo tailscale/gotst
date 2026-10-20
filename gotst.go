@@ -221,6 +221,11 @@ type Server struct {
 	// built. It is called only after a result-cache miss, so cached
 	// results never need the binary.
 	prepareBinary func(testTask) error
+	// linkSkip says whether builds may skip test binaries (see linkskip.go).
+	linkSkip bool
+	// onTestBinary, if non-nil, is called with s.mu held as each test
+	// binary is captured during buildAllTestBinaries.
+	onTestBinary func(pkg string)
 
 	execSem chan bool // buffered chan semaphore to limit subprocesses
 	outMu   sync.Mutex
@@ -264,13 +269,18 @@ type packageStatus struct {
 	exeHash   string // once known, the sha256 hex of test binary in Server.cacheDir
 	exeSize   int64
 	exeCached bool // executable was restored from the linked-binary cache
-	workDir   string
-	exeArgs   []string
-	tests     map[string]*testStatus
-	numFails  int // number of tests in tests that failed
-	runErr    string
-	runIn     time.Duration
-	changed   time.Time
+	// linkAction is the hex link action ID that produced the executable,
+	// if known. stubTests, if non-nil, are its tests, from its link record:
+	// the executable was skipped and must be fetched before running.
+	linkAction string
+	stubTests  []string
+	workDir    string
+	exeArgs    []string
+	tests      map[string]*testStatus
+	numFails   int // number of tests in tests that failed
+	runErr     string
+	runIn      time.Duration
+	changed    time.Time
 }
 
 type testStatus struct {
@@ -350,6 +360,7 @@ func NewServer(profile runProfile, tests testSelection) *Server {
 		profile:           profile,
 		tests:             tests,
 		testCache:         cache,
+		linkSkip:          linkSkipEnabled(cache != nil),
 		history:           historyStore,
 		execSem:           make(chan bool, *jobs),
 		debugSeedErrors:   make(map[string]string),
@@ -398,6 +409,19 @@ func (s *Server) Run() (retErr error) {
 	}
 	if *buildOnly {
 		return nil
+	}
+
+	if s.linkSkip && s.prepareBinary == nil {
+		bins := make(map[string]capturedTestBinary)
+		for _, bin := range s.capturedTestBinaries() {
+			bins[bin.pkg] = bin
+		}
+		var locks keyedMutex
+		s.prepareBinary = func(task testTask) error {
+			unlock := locks.lock(task.bin.pkg) // one fetch per binary
+			defer unlock()
+			return ensureBinary(s.ctx, bins[task.bin.pkg])
+		}
 	}
 
 	s.setPhase(phaseListing)
@@ -918,6 +942,7 @@ func (s *Server) buildAllTestBinaries() error {
 	var shim *cacheShim
 	shimOpts := cacheShimOptions{toolExec: s.recordToolExec, cacheLookup: s.recordCacheLookup}
 	if realCacheProg := os.Getenv("GOCACHEPROG"); realCacheProg != "" {
+		shimOpts.linkSkip = s.linkSkip
 		shim, err = startRunCacheShim(realCacheProg, shimOpts)
 		if err != nil {
 			return fmt.Errorf("starting GOCACHEPROG shim: %w", err)
@@ -983,7 +1008,11 @@ func (s *Server) buildAllTestBinaries() error {
 						errs = append(errs, fmt.Errorf("unmarshal ExecSnarf JSON from package %q: %w", ev.Package, err))
 						continue
 					}
-					s.addTestBinary(ev.Package, es, shim.executableWasCached(es.ExeHash))
+					linkAction := es.LinkAction
+					if linkAction == "" {
+						linkAction = shim.linkActionFor(es.ExeHash)
+					}
+					s.addTestBinary(ev.Package, es, es.Stub || shim.executableWasCached(es.ExeHash), linkAction)
 				}
 			}
 		}
@@ -1001,7 +1030,7 @@ func (s *Server) buildAllTestBinaries() error {
 	if shim != nil {
 		err = errors.Join(err, shim.close())
 		if *verbose {
-			log.Printf("linked executable cache: %d hit(s), %d put(s)", shim.execHits.Load(), shim.execPuts.Load())
+			log.Printf("linked executable cache: %d hit(s), %d put(s), %d skipped", shim.execHits.Load(), shim.execPuts.Load(), shim.execStubs.Load())
 		}
 	}
 	return err
@@ -1044,7 +1073,7 @@ func (m *outputMap) Get(pkg string) string {
 	return buf.String()
 }
 
-func (s *Server) addTestBinary(pkg string, es ExecSnarf, cached bool) {
+func (s *Server) addTestBinary(pkg string, es ExecSnarf, cached bool, linkAction string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	ps, ok := s.pkgs[pkg]
@@ -1058,6 +1087,18 @@ func (s *Server) addTestBinary(pkg string, es ExecSnarf, cached bool) {
 	ps.workDir = es.WorkingDir
 	ps.exeArgs = slices.Clone(es.Args)
 	ps.changed = time.Now()
+	ps.linkAction = linkAction
+	if es.Stub {
+		ps.exeSize = es.ExeSize
+		ps.stubTests = append([]string{}, es.Tests...)
+		if es.WorkingDir != ps.glp.Dir {
+			log.Fatalf("unexpected pkg %q wd=%q vs golist=%q", pkg, es.WorkingDir, ps.glp.Dir)
+		}
+		if s.onTestBinary != nil {
+			s.onTestBinary(pkg)
+		}
+		return
+	}
 
 	absBin := filepath.Join(s.cacheDir, es.ExeHash)
 	fi, err := os.Stat(absBin)
@@ -1074,6 +1115,9 @@ func (s *Server) addTestBinary(pkg string, es ExecSnarf, cached bool) {
 
 	if es.WorkingDir != ps.glp.Dir {
 		log.Fatalf("unexpected pkg %q wd=%q vs golist=%q", pkg, es.WorkingDir, ps.glp.Dir)
+	}
+	if s.onTestBinary != nil {
+		s.onTestBinary(pkg)
 	}
 }
 
@@ -1093,18 +1137,49 @@ func (s *Server) awaitExecSem(ctx context.Context) bool {
 
 func (s *Server) releaseExecSem() { <-s.execSem }
 
-func (s *Server) listTestsInBinary(pkg, absBin, workDir string) error {
+func (s *Server) listTestsInBinary(bin capturedTestBinary) error {
+	s.mu.Lock()
+	stubTests := s.pkgs[bin.pkg].stubTests
+	s.mu.Unlock()
+	if stubTests != nil {
+		s.setPackageTests(bin.pkg, stubTests)
+		return nil
+	}
 	if !s.awaitExecSem(s.ctx) {
 		return s.ctx.Err()
 	}
 	defer s.releaseExecSem()
 
-	tests, err := listTests(s.ctx, pkg, absBin, workDir)
+	tests, err := listTests(s.ctx, bin.pkg, bin.absBin, bin.workDir)
 	if err != nil {
 		return err
 	}
-	s.setPackageTests(pkg, tests)
+	s.setPackageTests(bin.pkg, tests)
+	s.recordLinkRecord(bin, tests)
 	return nil
+}
+
+// recordLinkRecord stores the link record for bin, listed with tests, so
+// later builds can skip it. Failures only lose that optimization.
+func (s *Server) recordLinkRecord(bin capturedTestBinary, tests []string) {
+	if !s.linkSkip || bin.linkAction == "" || bin.stub {
+		return
+	}
+	if err := putLinkRecord(s.ctx, bin.linkAction, bin.absBin, tests); err != nil && *verbose {
+		log.Printf("storing link record for %s: %v", bin.pkg, err)
+	}
+}
+
+// ensureBinary makes bin's executable available at bin.absBin, fetching it
+// from the build cache if its build skipped it.
+func ensureBinary(ctx context.Context, bin capturedTestBinary) error {
+	if _, err := os.Stat(bin.absBin); err == nil {
+		return nil
+	}
+	if bin.linkAction == "" {
+		return fmt.Errorf("test binary %s is missing", bin.absBin)
+	}
+	return fetchExecutable(ctx, bin.linkAction, binHash(bin.absBin), bin.absBin)
 }
 
 // listTests returns the names test binary absBin lists for package pkg.
@@ -1145,10 +1220,12 @@ func (s *Server) setPackageTests(pkg string, tests []string) {
 }
 
 type capturedTestBinary struct {
-	pkg     string
-	absBin  string
-	workDir string
-	args    []string
+	pkg        string
+	absBin     string // may not exist yet, if stub
+	workDir    string
+	args       []string
+	linkAction string // hex, if known
+	stub       bool   // absBin was skipped; fetch it via linkAction before use
 }
 
 func (s *Server) capturedTestBinaries() []capturedTestBinary {
@@ -1160,10 +1237,12 @@ func (s *Server) capturedTestBinaries() []capturedTestBinary {
 			continue
 		}
 		ret = append(ret, capturedTestBinary{
-			pkg:     pkg,
-			absBin:  filepath.Join(s.cacheDir, ps.exeHash),
-			workDir: ps.workDir,
-			args:    slices.Clone(ps.exeArgs),
+			pkg:        pkg,
+			absBin:     filepath.Join(s.cacheDir, ps.exeHash),
+			workDir:    ps.workDir,
+			args:       slices.Clone(ps.exeArgs),
+			linkAction: ps.linkAction,
+			stub:       ps.stubTests != nil,
 		})
 	}
 	sort.Slice(ret, func(i, j int) bool { return ret[i].pkg < ret[j].pkg })
@@ -1180,7 +1259,7 @@ func (s *Server) listAllTests() error {
 	for _, bin := range bins {
 		bin := bin
 		go func() {
-			errs <- s.listTestsInBinary(bin.pkg, bin.absBin, bin.workDir)
+			errs <- s.listTestsInBinary(bin)
 		}()
 	}
 	var all []error
@@ -1805,6 +1884,13 @@ type ExecSnarf struct {
 	WorkingDir string
 	ExeHash    string   // hex sha256 of os.Args[1] executable
 	Args       []string // go.test args after the binary name
+
+	// Stub reports that os.Args[1] was a link-skip placeholder (see
+	// linkskip.go) rather than the executable, which was not captured.
+	Stub       bool     `json:",omitempty"`
+	LinkAction string   `json:",omitempty"` // hex; with Stub
+	ExeSize    int64    `json:",omitempty"` // with Stub
+	Tests      []string `json:",omitempty"` // with Stub
 }
 
 // storeTestExecBinary runs when our binary is in child process mode, under "go
@@ -1829,6 +1915,19 @@ func storeTestExecBinary(dir string) {
 		log.Fatalf("getting working directory: %v", err)
 	}
 	binPath := os.Args[1]
+	if st, ok, err := readLinkStub(binPath); err != nil {
+		log.Fatal(err)
+	} else if ok {
+		coj, err := json.Marshal(&ExecSnarf{
+			WorkingDir: pwd, ExeHash: st.OutputID, Args: os.Args[2:],
+			Stub: true, LinkAction: st.LinkAction, ExeSize: st.Size, Tests: st.Tests,
+		})
+		if err != nil {
+			log.Fatalf("marshaling capture metadata: %v", err)
+		}
+		fmt.Printf("ExecSnarf:%s\n", coj)
+		return
+	}
 	socket := os.Getenv(cacheShimSocketEnv)
 	exeHash, verifiedSize, verified := lookupVerifiedTestExecutable(socket, binPath)
 	var f *os.File

@@ -70,6 +70,7 @@ func (f *fleet) config(id string) workerConfig {
 		Version: workerProtocolVersion, ID: id, Tags: f.s.profile.Tags, Race: f.s.profile.Race,
 		Count: *testCount, CountSet: testCountSet, MaxRetries: *maxRetries, MaxOutput: *maxOutput,
 		Cache: f.s.testCache != nil, History: f.s.history != nil, FailFast: *failFast, JSON: *jsonSummary,
+		LinkSkip: *linkSkip,
 	}
 }
 
@@ -225,6 +226,7 @@ func runWorkerConnection(c net.Conn, name string, rejoin bool) error {
 	*testCount, testCountSet, *maxRetries = config.Count, config.CountSet, config.MaxRetries
 	*maxOutput, *useCache = config.MaxOutput, config.Cache
 	*failFast, *jsonSummary, *historyConfig = config.FailFast, config.JSON, "off"
+	*linkSkip = config.LinkSkip
 	defs, err := loadProfileDefinitions(*configFile)
 	if err != nil {
 		return err
@@ -252,10 +254,11 @@ type helperExecution struct {
 // uses cmd/go and the existing linked-executable broker, so GOCACHEPROG remains
 // the distribution mechanism for executable bytes.
 type helperBuilder struct {
-	s      *Server
-	leader bool // s is the leader, whose package map is authoritative
-	mu     sync.Mutex
-	bins   map[string]capturedTestBinary
+	s       *Server
+	leader  bool // s is the leader, whose package map is authoritative
+	mu      sync.Mutex
+	bins    map[string]capturedTestBinary
+	fetches keyedMutex // by package, for binaries the build skipped
 }
 
 // buildScratch builds the test binaries of pkgs as base's machine would,
@@ -265,7 +268,7 @@ type helperBuilder struct {
 // Server.
 func buildScratch(base *Server, pkgs []string) (*Server, error) {
 	build := &Server{
-		ctx: base.ctx, cacheDir: base.cacheDir, profile: base.profile, scratch: true,
+		ctx: base.ctx, cacheDir: base.cacheDir, profile: base.profile, scratch: true, linkSkip: base.linkSkip,
 		buildDepFresh: make(map[string]bool), buildDepCached: make(map[string]bool),
 		buildActionToPkg: make(map[string]string), buildActionMapDir: base.buildActionMapDir,
 	}
@@ -328,15 +331,22 @@ func (b *helperBuilder) prepare(pkgs []string) []preparedPackage {
 		ps := build.pkgs[pkg]
 		ret[i].Binary, ret[i].Size, ret[i].Cached = binHash(bin.absBin), ps.exeSize, ps.exeCached
 		ret[i].Args = slices.Clone(ps.exeArgs)
+		stubTests := ps.stubTests
 		build.mu.Unlock()
+		if stubTests != nil {
+			ret[i].Tests = stubTests // from the link record; no binary to list
+			continue
+		}
 		wg.Go(func() {
 			sem <- true
 			defer func() { <-sem }()
 			tests, err := listTests(b.s.ctx, pkg, bin.absBin, bin.workDir)
 			if err != nil {
 				ret[i].Error = err.Error()
+				return
 			}
 			ret[i].Tests = tests
+			build.recordLinkRecord(bin, tests)
 		})
 	}
 	wg.Wait()
@@ -345,20 +355,27 @@ func (b *helperBuilder) prepare(pkgs []string) []preparedPackage {
 
 func (b *helperBuilder) binary(work workerWork) (capturedTestBinary, error) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	bin, ok := b.bins[work.Package]
 	if !ok {
 		build, err := buildScratch(b.s, []string{work.Package})
 		if err != nil {
+			b.mu.Unlock()
 			return capturedTestBinary{}, err
 		}
 		b.adoptLocked(build)
-		if bin, ok = b.bins[work.Package]; !ok {
-			return capturedTestBinary{}, fmt.Errorf("package %q did not produce a test binary", work.Package)
-		}
+		bin, ok = b.bins[work.Package]
+	}
+	b.mu.Unlock()
+	if !ok {
+		return capturedTestBinary{}, fmt.Errorf("package %q did not produce a test binary", work.Package)
 	}
 	if binHash(bin.absBin) != work.Binary {
 		return capturedTestBinary{}, fmt.Errorf("binary mismatch for %s; helper must have the same source, toolchain, and build environment as leader", work.Package)
+	}
+	unlock := b.fetches.lock(work.Package)
+	defer unlock()
+	if err := ensureBinary(b.s.ctx, bin); err != nil {
+		return capturedTestBinary{}, err
 	}
 	return bin, nil
 }
