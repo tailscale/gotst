@@ -441,23 +441,25 @@ func (s *Server) loadHistory(tasks []testTask) {
 	if s.history == nil || len(tasks) == 0 {
 		return
 	}
+	// Each key is looked up at most once, even on a soft backend error.
+	// History is advisory, so the run proceeds rather than repeatedly
+	// delaying execution. Distributed runs look up tests incrementally, as
+	// their packages are prepared.
 	s.mu.Lock()
-	if s.historyLoaded {
-		s.mu.Unlock()
-		return
+	if s.historyLooked == nil {
+		s.historyLooked = make(map[string]bool)
 	}
-	// Mark the one lookup attempted even on a soft backend error. History is
-	// advisory, so the run proceeds rather than repeatedly delaying execution.
-	s.historyLoaded = true
-	s.mu.Unlock()
 	keys := make([]history.Key, 0, len(tasks))
-	seen := make(map[string]bool)
 	for _, task := range tasks {
 		key := historyKeyForTask(task, s.profile)
-		if id := key.ID(); !seen[id] {
-			seen[id] = true
+		if id := key.ID(); !s.historyLooked[id] {
+			s.historyLooked[id] = true
 			keys = append(keys, key)
 		}
+	}
+	s.mu.Unlock()
+	if len(keys) == 0 {
+		return
 	}
 	histories, err := s.history.Lookup(s.ctx, keys, history.LookupOptions{RecentPerKey: historyRequestLimit})
 	if err != nil {
@@ -586,6 +588,32 @@ func (s *Server) prepareTestEstimates(tasks []testTask) {
 	s.testEstimates = estimates
 	s.testEstimateBase = median
 	s.testEstimateReady = true
+}
+
+// estimateLocked returns the scheduling estimate for task in a run whose
+// tests arrive incrementally: its history if known, else the median of the
+// known estimates so far.
+func (s *Server) estimateLocked(task testTask) testEstimate {
+	if s.histories == nil {
+		s.histories = make(map[string]*history.History)
+	}
+	h := s.histories[historyKeyForTask(task, s.profile).ID()]
+	if h != nil && len(h.Observations) > 0 {
+		latest := h.Observations[0]
+		for _, obs := range h.Observations[1:] {
+			if compareHistoryObservations(obs, latest) < 0 {
+				latest = obs
+			}
+		}
+		if latest.Duration > 0 {
+			perRun := latest.Duration / time.Duration(max(1, latest.Attempts))
+			s.knownPerRun = append(s.knownPerRun, perRun)
+			known := slices.Sorted(slices.Values(s.knownPerRun))
+			s.testEstimateBase = known[len(known)/2] * time.Duration(*testCount)
+			return testEstimate{duration: perRun * time.Duration(*testCount), known: true}
+		}
+	}
+	return testEstimate{duration: s.testEstimateBase}
 }
 
 func (s *Server) recordHistory(task testTask, outcome history.Outcome, duration time.Duration, attempts int, deps []cacheDependency) {

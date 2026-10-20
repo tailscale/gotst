@@ -48,9 +48,6 @@ type progressSnapshot struct {
 	CacheChecks  int
 	CacheHits    int
 	Helpers      int
-	// Distributed build progress, in test packages; PrebuildTotal is 0
-	// when there is no distributed build.
-	Prebuilt, PrebuildTotal int
 }
 
 // phaseStart records when a run entered a phase.
@@ -114,7 +111,6 @@ func (s *Server) progressSnapshot() progressSnapshot {
 	p.TestETA, p.ETAUnknown, p.ETAAvailable = s.testETALocked(time.Now())
 	p.ETAMedian = s.testEstimateBase
 	if s.fleet != nil {
-		p.Prebuilt, p.PrebuildTotal = s.fleet.prebuiltPkgs, s.fleet.prebuildTotal
 		for _, w := range s.fleet.workers {
 			if w.ID != "leader" && w.Connected && w.Error == "" {
 				p.Helpers++
@@ -194,6 +190,10 @@ func (p progressSnapshot) line() string {
 		fmt.Fprintf(&b, "%d pkgs matched; %d with tests", p.PackagesDiscovered, p.PackagesTotal)
 	case phaseBuilding:
 		p.writeBuildProgress(&b)
+		if p.TestsTotal > 0 {
+			// Distributed runs test packages as soon as they are listed.
+			fmt.Fprintf(&b, "; %d/%d tests listed so far done; %d running", p.TestsDone, p.TestsTotal, p.TestsRunning)
+		}
 	case phaseListing:
 		fmt.Fprintf(&b, "%d pkgs matched, %d with tests; %d/%d test pkgs listed; %d tests found", p.PackagesDiscovered, p.PackagesTotal, p.PackagesListed, p.PackagesTotal, p.TestsTotal)
 	case phaseDone, phaseFailed:
@@ -243,9 +243,6 @@ func formatEstimate(d time.Duration) string {
 
 func (p progressSnapshot) writeBuildProgress(b *strings.Builder) {
 	fmt.Fprintf(b, "%d/%d test pkgs; ", p.PackagesTotal, p.PackagesDiscovered)
-	if p.PrebuildTotal > 0 {
-		fmt.Fprintf(b, "%d/%d built across machines, ", p.Prebuilt, p.PrebuildTotal)
-	}
 	fmt.Fprintf(b, "%d/%d built", p.PackagesBuilt, p.PackagesTotal)
 	if p.PackagesBuilt == 0 {
 		fmt.Fprintf(b, " (%d cached)", p.PackagesCached)

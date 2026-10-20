@@ -150,7 +150,7 @@ invocation + profile
 
 The corresponding `runPhase` values are `discovering`, `building`, `listing`,
 `testing`, and then `done` or `failed`. A compilation failure stops the run
-before any test executes. This is intentional: build errors should be reported
+before any test executes (distributed runs, described below, relax this). This is intentional: build errors should be reported
 as build errors, rather than appearing after unrelated tests have run.
 
 With `-build-only`, a successful run stops after the build-and-capture phase.
@@ -641,26 +641,36 @@ completion or helper rejection. Network I/O runs separately from the helper's
 execution loop, so queued work proceeds while an exchange is in flight.
 Each exchange has a 15-second connection deadline.
 
-The leader builds and lists all selected binaries before opening the shared
-queue. If helpers are connected when its build phase starts, it first
-distributes the build: the sorted test packages are split into contiguous
-chunks (about three per machine, at most 16 packages each, so neighbouring
-packages that share dependencies build together), and the leader and helpers
-each take one chunk at a time, helpers through their exchanges. Each machine
-builds its chunk with an ordinary cmd/go capture build, which fills the shared
-`GOCACHEPROG`; helpers keep the captured binaries for later assignments and
-report their hashes for affinity. A disconnected helper's chunk returns to the
-queue. Once no chunk is left to take, the leader waits for chunks other machines
-are still building, up to the longer of 30 seconds or twice its own longest
-chunk, and then runs its normal full build, which restores what the fleet
-built and builds anything left. Build failures are not reported from chunks;
-the full build reports them as usual. Without helpers the leader builds
-everything in one invocation as before. In distributed mode, duration estimates take precedence over the
+With `-dist`, the leader does not build or list packages itself in one step.
+After discovery, preparing each selected test package (building its test
+binary, or restoring it from the build cache, and running `-test.list`) is work
+in the same fleet as tests. The leader's own preparer and its helpers take
+batches of packages from one queue by guided self-scheduling: a batch is the
+unassigned count divided by four times the number of machines, between one and
+eight packages, so early cmd/go invocations amortize package loading and cache
+lookups while the end of the queue is spread one package at a time. A machine
+alone takes the whole queue in one invocation, as an ordinary build would. A
+helper reports each package's binary SHA-256, size, captured arguments, listed
+tests, or build failure; a disconnected helper's batch returns to the queue,
+and a second report for a package is ignored. The machine that prepares a
+package defines its binary hash, which every other machine must reproduce.
+
+Tests become work as soon as their package is prepared, so testing overlaps the
+rest of the build. A build failure, from any machine, cancels the run and is
+reported as a build failure; tests that already completed are reported too, so
+unlike a local run, a distributed run does not guarantee that no test runs
+before a compilation error is known. Requested test names are validated once
+every package is prepared. The phase is `building` until then and `testing`
+afterwards; there is no separate `listing` phase.
+
+In distributed mode, duration estimates take precedence over the
 ordinary local scheduler's failure-first grouping. Unknown durations use the
 same median estimate as the ETA. Local worker slots and helpers take work from
-this one queue. Affinity may advance a prepared binary at most four positions,
-and only if its estimate is within 20% of the longest eligible test. Responses
-contain at most ten tests and target three seconds per slot, with at most ten
+this one queue. A machine prefers tests whose binaries it already has, from
+anywhere in the queue, provided its estimate is within 20% of the longest
+eligible test; so tests mostly run where their packages were prepared, and
+another machine takes them only when it has nothing better. Responses
+contain at most 64 tests and target three seconds per slot, with at most 64
 queued assignments beyond a helper's slots. Existing assignments count toward
 that target, preventing repeated polls from hoarding the long tests.
 
@@ -685,16 +695,22 @@ the leader over the work protocol.
 Only accepted executions contribute history, with identity supplied by the
 leader and portable dependency shapes supplied by the executor.
 
-Helpers lazily prepare packages with the existing cmd/go capture and cache
-broker path. Build invocations are serialized per helper; prepared binaries
-remain available for the session while tests run concurrently with later
-builds. Binary hashes must match the leader's before execution. The shared
+A test's result-cache lookup needs only its binary's hash, which the leader
+sends, so a machine checks the result cache before obtaining the binary and a
+hit never needs it. After a miss, a machine without the binary, the leader
+included, prepares it with the existing cmd/go capture and cache broker path,
+usually restoring it from the shared cache. Build invocations are serialized
+per machine; prepared binaries remain available for the session while tests
+run concurrently with later builds. Binary hashes must match the preparing
+machine's before execution. The shared
 `GOCACHEPROG`, rather than the work connection, transfers linked executables.
 Package paths and effective arguments cross the wire; absolute checkout and
 working directories do not. Helpers resolve those locally with `go list`.
 
 The dashboard projects worker names, short IDs, status, per-worker result
-counts, accumulated duration, and each active lease. ETA capacity includes
+counts, accumulated duration, and each active lease or batch of packages being
+prepared. Accumulated test time excludes result-cache hits, whose durations are
+from the original runs, so the summary's slot utilization reflects work done. ETA capacity includes
 connected helpers' slots. Before final status publication, the leader gives
 helpers up to two seconds to receive completion and disconnect. A helper that
 loses its connection redials and rejoins with a new session ID and a fresh

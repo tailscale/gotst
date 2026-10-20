@@ -58,6 +58,18 @@ func TestFleetBatchAndAffinity(t *testing.T) {
 			t.Fatalf("overfilled busy helper: %+v", more)
 		}
 	})
+	t.Run("prepared package anywhere in the queue", func(t *testing.T) {
+		durations := make([]time.Duration, 20)
+		for i := range durations {
+			durations[i] = time.Second
+		}
+		f := testFleet(t, durations...)
+		w := f.addWorker("vm", 1, false)
+		w.binaries["hash17"] = true
+		if got := f.assignLocked(w, 1, time.Now()); len(got) != 1 || got[0].Package != "p17" {
+			t.Fatalf("batch = %+v", got)
+		}
+	})
 	t.Run("small locality bias", func(t *testing.T) {
 		f := testFleet(t, 5*time.Second, 4*time.Second, time.Second)
 		w := f.addWorker("vm", 1, false)
@@ -73,15 +85,15 @@ func TestFleetBatchAndAffinity(t *testing.T) {
 			t.Fatalf("batch length = %d; want 3", len(got))
 		}
 	})
-	t.Run("ten short tests", func(t *testing.T) {
-		durations := make([]time.Duration, 25)
+	t.Run("many short tests", func(t *testing.T) {
+		durations := make([]time.Duration, 100)
 		for i := range durations {
 			durations[i] = time.Millisecond
 		}
 		f := testFleet(t, durations...)
 		w := f.addWorker("vm", 2, false)
 		res := f.exchange(w, workerRequest{})
-		if len(res.Work) != 10 {
+		if len(res.Work) != workerBatchLimit {
 			t.Fatalf("batch length = %d", len(res.Work))
 		}
 		res = f.exchange(w, workerRequest{})
@@ -229,7 +241,14 @@ func TestFleetLocalExecution(t *testing.T) {
 		tasks = append(tasks, testTask{bin: capturedTestBinary{pkg: "fixture", absBin: self}, test: name})
 		s.testEstimates["fixture\x00"+name] = testEstimate{duration: time.Second}
 	}
-	if err := f.run(tasks); err != nil {
+	s.mu.Lock()
+	w := f.leaderWorkerLocked()
+	for _, task := range tasks {
+		f.work = append(f.work, &fleetTask{task: task, estimate: time.Second, leases: make(map[uint64]*workLease)})
+	}
+	f.ready = true
+	s.mu.Unlock()
+	if err := f.run(w); err != nil {
 		t.Fatal(err)
 	}
 	if f.done != 2 || f.workers[0].Completed != 2 || !f.stopped {

@@ -118,13 +118,13 @@ new tests use the median known test duration until they establish history.
 ## Distributed execution
 
 Start the leader with `-dist` to accept helper VMs over a separate ephemeral
-tailcat listener. The leader builds and lists all selected packages before
-dispatching tests, and runs tests locally using its own `-j` slots. If helpers
-are connected when it starts building, it first spreads the build among them:
-each machine, the leader included, builds chunks of the selected test
-packages, filling the shared `GOCACHEPROG` so the leader's own build then
-mostly restores binaries from it, and helpers keep what they built for the
-tests they are later given:
+tailcat listener. The leader and its helpers share building and listing the
+selected test packages as well as running their tests, and the leader also runs
+tests using its own `-j` slots. Each machine takes batches of packages to build
+(or restore from the shared `GOCACHEPROG`) and list, smaller as fewer remain,
+and their tests can start as soon as they are listed, preferably on the machine
+that built them. A build failure on any machine stops the run, but tests may
+already have run by then:
 
 ```sh
 gotst -dist -j=4 ./...
@@ -162,8 +162,9 @@ variables remain machine-local. The helper uses the nearest `.gotst.yml` (or
 leader. Helpers do not run a status server or publish history themselves.
 
 Distributed scheduling orders the entire fleet's queue from slowest to fastest
-using history estimates, with a small preference for binaries already prepared
-on a helper. A response contains at most ten tests, aiming to keep roughly
+using history estimates, preferring, among similarly long tests, ones whose
+binaries a machine already has. A response contains at most 64 tests, aiming to
+keep roughly
 three seconds of estimated work per worker slot available. Queued tests keep
 running while the helper exchanges results and requests more work.
 

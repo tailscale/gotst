@@ -216,6 +216,11 @@ type Server struct {
 	quiet          bool
 	scratch        bool // a separate build of some packages, as by buildScratch
 	fleet          *fleet
+	// prepareBinary, if non-nil, makes task's test binary available at
+	// task.bin.absBin, for tests whose binaries this machine may not have
+	// built. It is called only after a result-cache miss, so cached
+	// results never need the binary.
+	prepareBinary func(testTask) error
 
 	execSem chan bool // buffered chan semaphore to limit subprocesses
 	outMu   sync.Mutex
@@ -241,7 +246,8 @@ type Server struct {
 	debugPass         int
 	debugMisses       int
 	debugSeedErrors   map[string]string // test cache key ID -> why pass 1 did not seed it
-	historyLoaded     bool
+	historyLooked     map[string]bool   // history key IDs looked up
+	knownPerRun       []time.Duration   // known per-run estimates, for estimateLocked
 	histories         map[string]*history.History
 	historyPending    []history.Observation
 	testSchedule      []string
@@ -384,7 +390,8 @@ func (s *Server) Run() (retErr error) {
 
 	s.setPhase(phaseBuilding)
 	if s.fleet != nil {
-		s.fleet.prebuild(s.packagesWithTests())
+		// Building, listing, and testing are all work shared with helpers.
+		return s.fleet.runDistributed(s.packagesWithTests())
 	}
 	if err := s.buildAllTestBinaries(); err != nil {
 		return fmt.Errorf("buildAllTestBinaries: %w", err)
@@ -1092,20 +1099,27 @@ func (s *Server) listTestsInBinary(pkg, absBin, workDir string) error {
 	}
 	defer s.releaseExecSem()
 
+	tests, err := listTests(s.ctx, pkg, absBin, workDir)
+	if err != nil {
+		return err
+	}
+	s.setPackageTests(pkg, tests)
+	return nil
+}
+
+// listTests returns the names test binary absBin lists for package pkg.
+func listTests(ctx context.Context, pkg, absBin, workDir string) ([]string, error) {
 	t0 := time.Now()
-	cmd := lowPriorityCommand(s.ctx, absBin, "-test.list=.")
+	cmd := lowPriorityCommand(ctx, absBin, "-test.list=.")
 	cmd.Dir = workDir
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("listing tests in %q: %w\noutput:\n%s", pkg, err, out)
+		return nil, fmt.Errorf("listing tests in %q: %w\noutput:\n%s", pkg, err, out)
 	}
-	d := time.Since(t0).Round(time.Millisecond)
 	if *verbose {
-		log.Printf("Listed tests in package %q in %v (%s)", pkg, d, absBin)
+		log.Printf("Listed tests in package %q in %v (%s)", pkg, time.Since(t0).Round(time.Millisecond), absBin)
 	}
-	tests := strings.Fields(string(out))
-	s.setPackageTests(pkg, tests)
-	return nil
+	return strings.Fields(string(out)), nil
 }
 
 func (s *Server) setPackageTests(pkg string, tests []string) {
@@ -1252,9 +1266,6 @@ func (s *Server) runAllTests() error {
 	s.loadHistory(tasks)
 	s.orderTestTasksByHistory(tasks)
 	s.prepareTestEstimates(tasks)
-	if s.fleet != nil {
-		return s.fleet.run(tasks)
-	}
 	if *verbose {
 		log.Printf("Running %d tests in %d packages with up to %d concurrent processes...", len(tasks), len(bins), *jobs)
 	}
@@ -1381,7 +1392,10 @@ type testTask struct {
 func (s *Server) packageRoot(pkg string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.pkgs[pkg].glp.Root
+	if ps := s.pkgs[pkg]; ps != nil {
+		return ps.glp.Root
+	}
+	return s.profile.Root
 }
 
 func isRunnableTopLevelTest(name string) bool {
@@ -1437,6 +1451,12 @@ func (s *Server) runTest(task testTask) error {
 			}
 		} else if !errors.Is(err, errTestCacheMiss) && *verbose {
 			log.Printf("cache lookup for %s/%s: %v", bin.pkg, task.test, err)
+		}
+	}
+
+	if s.prepareBinary != nil {
+		if err := s.prepareBinary(task); err != nil {
+			return fmt.Errorf("preparing test binary for %s: %w", bin.pkg, err)
 		}
 	}
 

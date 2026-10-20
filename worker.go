@@ -12,7 +12,9 @@ import (
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 	"runtime"
+	"slices"
 	"sync"
 	"time"
 
@@ -250,9 +252,10 @@ type helperExecution struct {
 // uses cmd/go and the existing linked-executable broker, so GOCACHEPROG remains
 // the distribution mechanism for executable bytes.
 type helperBuilder struct {
-	s    *Server
-	mu   sync.Mutex
-	bins map[string]capturedTestBinary
+	s      *Server
+	leader bool // s is the leader, whose package map is authoritative
+	mu     sync.Mutex
+	bins   map[string]capturedTestBinary
 }
 
 // buildScratch builds the test binaries of pkgs as base's machine would,
@@ -273,12 +276,16 @@ func buildScratch(base *Server, pkgs []string) (*Server, error) {
 	return build, build.buildAllTestBinaries()
 }
 
-// adopt records the binaries build captured as available to this helper.
-// It returns their hashes. b.mu must be held.
-func (b *helperBuilder) adoptLocked(build *Server) []string {
-	var hashes []string
-	for _, bin := range build.capturedTestBinaries() {
+// adoptLocked records the binaries build captured as available to this
+// machine. On a helper, it also records their package metadata. b.mu must
+// be held.
+func (b *helperBuilder) adoptLocked(build *Server) []capturedTestBinary {
+	bins := build.capturedTestBinaries()
+	for _, bin := range bins {
 		b.bins[bin.pkg] = bin
+		if b.leader {
+			continue
+		}
 		build.mu.Lock()
 		ps := build.pkgs[bin.pkg]
 		build.mu.Unlock()
@@ -288,22 +295,52 @@ func (b *helperBuilder) adoptLocked(build *Server) []string {
 		}
 		b.s.pkgs[bin.pkg] = ps
 		b.s.mu.Unlock()
-		hashes = append(hashes, binHash(bin.absBin))
 	}
-	return hashes
+	return bins
 }
 
-// prebuild builds pkgs for the leader's distributed build, keeping the
-// resulting binaries for later tests. It returns the hashes of the
-// binaries it captured; build failures are left for the leader to report.
-func (b *helperBuilder) prebuild(pkgs []string) []string {
+// prepare builds pkgs in one cmd/go invocation and lists their tests,
+// reporting each package's binary and tests, or why it failed.
+func (b *helperBuilder) prepare(pkgs []string) []preparedPackage {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	build, err := buildScratch(b.s, pkgs)
-	if err != nil && *verbose {
-		log.Printf("distributed build of %d packages: %v", len(pkgs), err)
+	build, buildErr := buildScratch(b.s, pkgs)
+	bins := b.adoptLocked(build)
+	b.mu.Unlock()
+	byPkg := make(map[string]capturedTestBinary)
+	for _, bin := range bins {
+		byPkg[bin.pkg] = bin
 	}
-	return b.adoptLocked(build)
+	ret := make([]preparedPackage, len(pkgs))
+	var wg sync.WaitGroup
+	sem := make(chan bool, max(1, *jobs))
+	for i, pkg := range pkgs {
+		ret[i].Package = pkg
+		bin, ok := byPkg[pkg]
+		if !ok {
+			msg := fmt.Sprintf("package %q did not produce a test binary", pkg)
+			if buildErr != nil {
+				msg = buildErr.Error()
+			}
+			ret[i].Error = msg
+			continue
+		}
+		build.mu.Lock()
+		ps := build.pkgs[pkg]
+		ret[i].Binary, ret[i].Size, ret[i].Cached = binHash(bin.absBin), ps.exeSize, ps.exeCached
+		ret[i].Args = slices.Clone(ps.exeArgs)
+		build.mu.Unlock()
+		wg.Go(func() {
+			sem <- true
+			defer func() { <-sem }()
+			tests, err := listTests(b.s.ctx, pkg, bin.absBin, bin.workDir)
+			if err != nil {
+				ret[i].Error = err.Error()
+			}
+			ret[i].Tests = tests
+		})
+	}
+	wg.Wait()
+	return ret
 }
 
 func (b *helperBuilder) binary(work workerWork) (capturedTestBinary, error) {
@@ -341,14 +378,25 @@ func workerLoop(c net.Conn, dec *json.Decoder, enc *json.Encoder, s *Server) err
 	active := make(map[uint64]*helperExecution)
 	var queue []*helperExecution
 	results := make(chan workerResult, *jobs)
-	type prepared struct {
-		lease uint64
-		hash  string
-	}
-	ready := make(chan prepared, *jobs)
-	prebuilt := make(chan []string, 1) // binary hashes of a finished build chunk
-	var chunk []string                 // packages being built for the leader
+	type started struct{ lease uint64 }
+	ready := make(chan started, *jobs)
+	preparedc := make(chan []preparedPackage, 1)
+	preparing := false // a batch of packages is being prepared for the leader
 	running := 0
+	// Tests fetch their binaries only after missing the result cache.
+	var newBinsMu sync.Mutex
+	var newBins []string // hashes of binaries prepared for tests
+	s.prepareBinary = func(task testTask) error {
+		bin, err := builder.binary(workerWork{Package: task.bin.pkg, Binary: binHash(task.bin.absBin)})
+		if err != nil {
+			return err
+		}
+		task.bin.absBin = bin.absBin
+		newBinsMu.Lock()
+		newBins = append(newBins, binHash(bin.absBin))
+		newBinsMu.Unlock()
+		return nil
+	}
 	start := func() {
 		for running < *jobs && len(queue) != 0 {
 			e := queue[0]
@@ -362,20 +410,29 @@ func workerLoop(c net.Conn, dec *json.Decoder, enc *json.Encoder, s *Server) err
 			running++
 			wg.Go(func() {
 				defer jobCancel()
-				bin, err := builder.binary(e.work)
-				r := workerResult{Lease: e.work.Lease}
-				if err != nil {
-					r.Error, r.Infra = err.Error(), true
-				} else if jobCtx.Err() == nil {
-					select {
-					case ready <- prepared{e.work.Lease, binHash(bin.absBin)}:
-					case <-ctx.Done():
-						return
-					}
-					bin.args = e.work.Args
-					r = executeIsolated(jobCtx, s, testTask{bin: bin, test: e.work.Test})
-					r.Lease = e.work.Lease
+				select {
+				case ready <- started{lease: e.work.Lease}:
+				case <-ctx.Done():
+					return
 				}
+				// The binary's path is content-addressed, so this is where
+				// it is or will be prepared, after a result-cache miss.
+				bin := capturedTestBinary{
+					pkg: e.work.Package, absBin: filepath.Join(s.cacheDir, e.work.Binary),
+					workDir: filepath.Join(s.profile.Root, e.work.Dir), args: e.work.Args,
+				}
+				s.mu.Lock()
+				if s.pkgs == nil {
+					s.pkgs = make(map[string]*packageStatus)
+				}
+				if s.pkgs[bin.pkg] == nil {
+					s.pkgs[bin.pkg] = &packageStatus{glp: &goListPackage{
+						ImportPath: bin.pkg, Dir: bin.workDir, Root: filepath.Join(s.profile.Root, e.work.Root),
+					}}
+				}
+				s.mu.Unlock()
+				r := executeIsolated(jobCtx, s, testTask{bin: bin, test: e.work.Test})
+				r.Lease = e.work.Lease
 				select {
 				case results <- r:
 				case <-ctx.Done():
@@ -417,16 +474,21 @@ func workerLoop(c net.Conn, dec *json.Decoder, enc *json.Encoder, s *Server) err
 		}
 	})
 	var pending []workerResult
-	var binaries, built []string
+	var binaries []string
+	var prepared []preparedPackage
 	dirty, inFlight := true, false
 	for {
 		if dirty && !inFlight {
-			req := workerRequest{Active: make(map[uint64]string), Results: pending, Binaries: binaries, Built: built}
+			newBinsMu.Lock()
+			binaries = append(binaries, newBins...)
+			newBins = nil
+			newBinsMu.Unlock()
+			req := workerRequest{Active: make(map[uint64]string), Results: pending, Binaries: binaries, Prepared: prepared}
 			for id, e := range active {
 				req.Active[id] = e.state
 			}
 			requests <- req
-			pending, binaries, built = nil, nil, nil
+			pending, binaries, prepared = nil, nil, nil
 			dirty, inFlight = false, true
 		}
 		select {
@@ -450,13 +512,13 @@ func workerLoop(c net.Conn, dec *json.Decoder, enc *json.Encoder, s *Server) err
 					delete(active, id)
 				}
 			}
-			if len(res.Build) > 0 && chunk == nil {
-				chunk = res.Build
-				pkgs := chunk
+			if len(res.Prepare) > 0 && !preparing {
+				preparing = true
+				pkgs := res.Prepare
 				wg.Go(func() {
-					hashes := builder.prebuild(pkgs)
+					pps := builder.prepare(pkgs)
 					select {
-					case prebuilt <- hashes:
+					case preparedc <- pps:
 					case <-ctx.Done():
 					}
 				})
@@ -468,14 +530,18 @@ func workerLoop(c net.Conn, dec *json.Decoder, enc *json.Encoder, s *Server) err
 			}
 			start()
 		case p := <-ready:
-			binaries = append(binaries, p.hash)
 			if e := active[p.lease]; e != nil {
 				e.state = "running"
 			}
 			dirty = true
-		case hashes := <-prebuilt:
-			built, chunk = chunk, nil
-			binaries = append(binaries, hashes...)
+		case pps := <-preparedc:
+			preparing = false
+			prepared = append(prepared, pps...)
+			for _, pp := range pps {
+				if pp.Binary != "" {
+					binaries = append(binaries, pp.Binary)
+				}
+			}
 			dirty = true
 		case r := <-results:
 			running--

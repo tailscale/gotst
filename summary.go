@@ -27,7 +27,7 @@ type phaseDuration struct {
 type workerSummary struct {
 	ID, Name, Error                  string
 	Slots, Completed, Cached, Failed int
-	Built                            int           // test packages built in the distributed build
+	Built                            int           // test packages it prepared (built and listed)
 	Joined                           time.Duration // since the run started
 	TestTime                         time.Duration
 
@@ -56,7 +56,7 @@ func (s *Server) fleetSummaryLocked(end time.Time) fleetSummary {
 	for _, w := range s.fleet.workers {
 		ws := workerSummary{
 			ID: w.ID, Name: w.Name, Error: w.Error, Slots: w.Slots,
-			Completed: w.Completed, Cached: w.Cached, Failed: w.Failed, Built: w.Prebuilt,
+			Completed: w.Completed, Cached: w.Cached, Failed: w.Failed, Built: w.Built,
 			Joined: w.Joined.Sub(s.start), TestTime: w.Duration, Busy: -1,
 		}
 		from, to := w.Joined, testEnd
