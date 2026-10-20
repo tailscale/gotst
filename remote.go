@@ -7,6 +7,8 @@ import (
 	"archive/tar"
 	"bufio"
 	"bytes"
+	"compress/gzip"
+	"crypto/sha256"
 	_ "embed"
 	"errors"
 	"flag"
@@ -389,10 +391,11 @@ func remoteMeta(m remoteMachine, sn *remoteSnapshot, gotstVersion, jobs string, 
 	return b.String()
 }
 
-// remotePayload returns the tar archive sent to a machine's standard input.
+// remotePayload returns the gzipped tar archive sent to a machine's standard input.
 func remotePayload(meta string, sn *remoteSnapshot, gotstBin []byte) ([]byte, error) {
 	var buf bytes.Buffer
-	tw := tar.NewWriter(&buf)
+	zw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(zw)
 	add := func(name string, mode int64, data []byte) error {
 		if err := tw.WriteHeader(&tar.Header{Name: name, Mode: mode, Size: int64(len(data)), Typeflag: tar.TypeReg}); err != nil {
 			return err
@@ -419,14 +422,22 @@ func remotePayload(meta string, sn *remoteSnapshot, gotstBin []byte) ([]byte, er
 	if err := tw.Close(); err != nil {
 		return nil, err
 	}
+	if err := zw.Close(); err != nil {
+		return nil, err
+	}
 	return buf.Bytes(), nil
 }
 
-// remoteShellCommand returns the shell command a machine runs: it reads
-// exactly n bytes of payload from standard input, leaving any later
-// input (a helper's leader address) for run.sh.
-func remoteShellCommand(n int) string {
-	return fmt.Sprintf(`d=$(mktemp -d /tmp/gotst-remote.XXXXXX) && cd "$d" && head -c %d > payload.tar && tar -xf payload.tar && exec sh ./run.sh`, n)
+// remoteShellCommand returns the shell command a machine runs for payload:
+// it reads exactly that many bytes from standard input, leaving any later
+// input (a helper's leader address) for run.sh, and checks them.
+func remoteShellCommand(payload []byte) string {
+	n := len(payload)
+	sum := sha256.Sum256(payload)
+	return fmt.Sprintf(`d=$(mktemp -d /tmp/gotst-remote.XXXXXX) && cd "$d" && head -c %d > payload.tgz && `+
+		`{ n=$(wc -c < payload.tgz); [ "$n" -eq %d ] || { echo "gotst-remote: received $n of %d payload bytes" >&2; exit 1; }; } && `+
+		`{ echo "%x  payload.tgz" | sha256sum -c --status || { echo "gotst-remote: corrupt payload; does the remote shell's startup read standard input?" >&2; exit 1; }; } && `+
+		`tar -xzf payload.tgz && exec sh ./run.sh`, n, n, n, sum)
 }
 
 // remoteSettings is the resolved -remote configuration.
@@ -530,12 +541,15 @@ func runRemote(defs *profileDefinitions) (int, error) {
 
 	var outMu sync.Mutex
 	type machineProc struct {
-		cmd   *exec.Cmd
-		stdin io.WriteCloser
-		done  chan error
+		cmd  *exec.Cmd
+		done chan error
 	}
 	procs := make([]*machineProc, rs.machines)
 	addrc := make(chan string, 1)
+	// addrReady delivers the leader's helper address to each helper's
+	// stdin writer; noAddr is closed if there will be none.
+	addrReady := make(chan string, rs.machines)
+	noAddr := make(chan struct{})
 	for i := range procs {
 		m := remoteMachine{index: i, name: fmt.Sprintf("m%d", i), leader: i == 0}
 		if m.leader {
@@ -545,7 +559,7 @@ func runRemote(defs *profileDefinitions) (int, error) {
 		if err != nil {
 			return 0, err
 		}
-		cmd := exec.Command(rs.command[0], append(rs.command[1:], remoteShellCommand(len(payload)))...)
+		cmd := exec.Command(rs.command[0], append(rs.command[1:], remoteShellCommand(payload))...)
 		cmd.Env = append(os.Environ(),
 			"GOTST_REMOTE_PROTOCOL=1",
 			fmt.Sprintf("GOTST_REMOTE_INDEX=%d", i),
@@ -568,16 +582,32 @@ func runRemote(defs *profileDefinitions) (int, error) {
 		if err := cmd.Start(); err != nil {
 			return 0, fmt.Errorf("starting remote shell command: %w", err)
 		}
-		p := &machineProc{cmd: cmd, stdin: stdin, done: make(chan error, 1)}
+		p := &machineProc{cmd: cmd, done: make(chan error, 1)}
 		procs[i] = p
-		var wg sync.WaitGroup
-		wg.Add(3)
+		// The only writer to stdin: the payload, then a helper's
+		// leader address once known, then EOF.
 		go func() {
-			defer wg.Done()
-			if _, err := stdin.Write(payload); err == nil && m.leader {
-				stdin.Close()
+			defer stdin.Close()
+			t0 := time.Now()
+			if _, err := stdin.Write(payload); err != nil {
+				return
+			}
+			if len(payload) >= 1<<20 {
+				outMu.Lock()
+				fmt.Fprintf(os.Stderr, "# gotst -remote: sent %s %.1f MiB in %v\n", m.name, float64(len(payload))/(1<<20), time.Since(t0).Round(100*time.Millisecond))
+				outMu.Unlock()
+			}
+			if m.leader {
+				return
+			}
+			select {
+			case addr := <-addrReady:
+				io.WriteString(stdin, addr+"\n")
+			case <-noAddr:
 			}
 		}()
+		var wg sync.WaitGroup
+		wg.Add(2)
 		if m.leader {
 			go func() {
 				defer wg.Done()
@@ -609,26 +639,35 @@ func runRemote(defs *profileDefinitions) (int, error) {
 	var leaderErr error
 	select {
 	case addr := <-addrc:
-		for _, p := range procs[1:] {
-			go func() {
-				io.WriteString(p.stdin, addr+"\n")
-				p.stdin.Close()
-			}()
+		for range procs[1:] {
+			addrReady <- addr
 		}
 		leaderErr = <-leader.done
+		// Helpers exit once the leader completes; don't wait long
+		// for stragglers.
+		close(noAddr)
+		deadline := time.After(5 * time.Second)
+		for _, p := range procs[1:] {
+			select {
+			case <-p.done:
+			case <-deadline:
+				p.cmd.Process.Kill()
+			}
+		}
 	case leaderErr = <-leader.done:
-	}
-
-	// Helpers exit once the leader completes; don't wait long for
-	// stragglers, and release any still waiting for an address.
-	deadline := time.After(5 * time.Second)
-	for _, p := range procs[1:] {
-		p.stdin.Close()
-		select {
-		case <-p.done:
-		case <-deadline:
+		// The leader never started gotst; its output above says why.
+		// Stop the helpers rather than leave them waiting.
+		close(noAddr)
+		for _, p := range procs[1:] {
 			p.cmd.Process.Kill()
 		}
+		for _, p := range procs[1:] {
+			<-p.done
+		}
+		if leaderErr == nil {
+			leaderErr = errors.New("exited before starting gotst")
+		}
+		return 0, fmt.Errorf("leader: %w (see its unprefixed output above)", leaderErr)
 	}
 	if leaderErr != nil {
 		var ee *exec.ExitError
