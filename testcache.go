@@ -20,7 +20,7 @@ import (
 	"time"
 )
 
-const testCacheVersion = 2
+const testCacheVersion = 3
 
 var errTestCacheMiss = errors.New("test result cache miss")
 
@@ -270,7 +270,12 @@ func fingerprintPath(path string, readContent bool) (*fileDependency, error) {
 	if lstatErr == nil {
 		fd.Lstat = fileInfoState(linfo)
 	}
-	if readContent && statErr == nil {
+	// Fingerprints must not depend on modification times, so that entries
+	// remain valid in another checkout of the same files, such as on
+	// another machine sharing the cache. Regular files are therefore
+	// identified by content even when only stat'd, and directories by
+	// their entries' names, modes, and (for regular files) sizes.
+	if statErr == nil {
 		switch {
 		case info.Mode().IsRegular():
 			f, err := os.Open(path)
@@ -287,7 +292,7 @@ func fingerprintPath(path string, readContent bool) (*fileDependency, error) {
 				return nil, closeErr
 			}
 			fd.ContentSHA256 = hex.EncodeToString(h.Sum(nil))
-		case info.IsDir():
+		case info.IsDir() && readContent:
 			entries, err := os.ReadDir(path)
 			if err != nil {
 				return nil, err
@@ -307,9 +312,9 @@ func fingerprintPath(path string, readContent bool) (*fileDependency, error) {
 	canonical, err := json.Marshal(struct {
 		Exists             bool
 		Error              string
-		Stat, Lstat        *fileState
+		Stat, Lstat        string
 		Content, Directory string
-	}{fd.Exists, fd.Error, fd.Stat, fd.Lstat, fd.ContentSHA256, fd.DirectorySHA256})
+	}{fd.Exists, fd.Error, portableState(fd.Stat), portableState(fd.Lstat), fd.ContentSHA256, fd.DirectorySHA256})
 	if err != nil {
 		return nil, err
 	}
@@ -323,8 +328,22 @@ func fileInfoState(info fs.FileInfo) *fileState {
 	}
 }
 
+// portableState summarizes st for a fingerprint, omitting what differs
+// between equivalent checkouts: modification times, and directory sizes,
+// which depend on the file system.
+func portableState(st *fileState) string {
+	if st == nil {
+		return ""
+	}
+	if st.IsDir {
+		return st.Mode + " dir"
+	}
+	return fmt.Sprintf("%s %d", st.Mode, st.Size)
+}
+
+// writeFileState writes a directory entry's portable state to w.
 func writeFileState(w io.Writer, info fs.FileInfo) {
-	fmt.Fprintf(w, "%d %s %s %t\n", info.Size(), info.Mode(), info.ModTime().UTC().Format(time.RFC3339Nano), info.IsDir())
+	fmt.Fprintln(w, portableState(fileInfoState(info)))
 }
 
 func validateDependencies(deps []cacheDependency) (bool, error) {

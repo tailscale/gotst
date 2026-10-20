@@ -307,9 +307,13 @@ func NewServer(profile runProfile, tests testSelection) *Server {
 	var cache testResultCache
 	if *useCache && !testCountSet {
 		var err error
-		cache, err = newDiskTestCache(mustCacheRoot())
+		disk, err := newDiskTestCache(mustCacheRoot())
 		if err != nil {
 			log.Fatalf("initializing test result cache: %v", err)
+		}
+		cache = disk
+		if prog := os.Getenv("GOCACHEPROG"); prog != "" {
+			cache = newProgTestCache(disk, prog)
 		}
 	}
 	var historyStore history.Store
@@ -509,6 +513,11 @@ func (s *Server) verifyDebugCacheTask(task testTask) {
 
 func (s *Server) Cleanup() {
 	s.cancel()
+	if c, ok := s.testCache.(*progTestCache); ok {
+		if err := c.Close(); err != nil && *verbose {
+			log.Printf("closing test result GOCACHEPROG: %v", err)
+		}
+	}
 	if s.cacheDir != "" {
 		t0 := time.Now()
 		if err := os.RemoveAll(s.cacheDir); err != nil {

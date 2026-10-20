@@ -412,3 +412,66 @@ func TestMachineOutputHoldsProvisioning(t *testing.T) {
 		t.Errorf("held %d lines; want %d", len(o2.held), maxHeldLines)
 	}
 }
+
+// TestRemoteSharesTestResults runs gotst -remote twice, each time on fresh
+// "machines" (new checkouts with new mtimes and empty local caches) that
+// share only a GOCACHEPROG, and checks the second run reuses the first's
+// test results. Like TestRemoteEndToEnd, it needs GOTST_TEST_REMOTE=1.
+func TestRemoteSharesTestResults(t *testing.T) {
+	if os.Getenv("GOTST_TEST_REMOTE") != "1" {
+		t.Skip("set GOTST_TEST_REMOTE=1 to run")
+	}
+	tmp := t.TempDir()
+	gotst := filepath.Join(tmp, "gotst")
+	goroot := strings.TrimSpace(string(must(exec.Command("go", "env", "GOROOT").Output())))
+	if out, err := exec.Command("go", "build", "-o", gotst, ".").CombinedOutput(); err != nil {
+		t.Fatalf("building gotst: %v\n%s", err, out)
+	}
+	upstream := filepath.Join(tmp, "upstream")
+	git(t, tmp, "init", "-q", upstream)
+	for name, data := range map[string]string{
+		"go.mod":       "module example.com/proj\n\ngo 1.24\n",
+		"a/a_test.go":  "package a\nimport (\"os\"; \"testing\")\nfunc TestReadsFile(t *testing.T) { if _, err := os.ReadFile(\"testdata/x\"); err != nil { t.Fatal(err) } }\nfunc TestPlain(t *testing.T) {}\n",
+		"a/testdata/x": "x\n",
+		"b/b_test.go":  "package b\nimport \"testing\"\nfunc TestB(t *testing.T) {}\n",
+	} {
+		p := filepath.Join(upstream, name)
+		os.MkdirAll(filepath.Dir(p), 0755)
+		if err := os.WriteFile(p, []byte(data), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	git(t, upstream, "add", "go.mod", "a", "b")
+	git(t, upstream, "commit", "-q", "-m", "one")
+	laptop := filepath.Join(tmp, "laptop")
+	git(t, tmp, "clone", "-q", upstream, laptop)
+
+	shared := filepath.Join(tmp, "shared-cache")
+	provider := filepath.Join(tmp, "provider")
+	cacheProg := quoteCacheProgArg(must(filepath.Abs(os.Args[0]))) + " -test.run=^TestProgTestCacheHelper$"
+	// $RUN selects a fresh set of machine home directories. As on real
+	// fleets, each machine's checkout is at the same path every run, but
+	// the provider deletes it first.
+	if err := os.WriteFile(provider, []byte(`#!/bin/sh
+h="`+tmp+`/run$RUN/machine$GOTST_REMOTE_INDEX"
+rd="`+tmp+`/checkouts$GOTST_REMOTE_INDEX"
+chmod -R u+w "$rd" 2>/dev/null; rm -rf "$rd"
+mkdir -p "$h" && cd "$h" || exit 1
+exec env HOME="$h" GOTST_REMOTE_DIR="$rd" PATH="`+goroot+`/bin:$PATH" GOCACHE="$h/gocache" GOTST_BIN="`+gotst+`" \
+	GOTST_TEST_SHARED_CACHE_DIR="`+shared+`" GOCACHEPROG='`+cacheProg+`' sh -c "$1"
+`), 0755); err != nil {
+		t.Fatal(err)
+	}
+	for run, want := range []string{"cache hits 0/3", "cache hits 3/3"} {
+		cmd := exec.Command(gotst, "-remote=2", "-remote-cmd="+provider, "-history=off", "-listen=", "./...")
+		cmd.Dir = laptop
+		cmd.Env = append(os.Environ(), fmt.Sprintf("RUN=%d", run))
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("run %d: %v\n%s", run, err, out)
+		}
+		if !strings.Contains(string(out), want) {
+			t.Errorf("run %d output lacks %q:\n%s", run, want, out)
+		}
+	}
+}

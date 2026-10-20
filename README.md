@@ -256,10 +256,16 @@ maintains its own per-top-level-test cache. Successful results are stored below
 `-cache=false` to bypass result caching or `-cache-dir=PATH` to select a
 different cache root.
 
+When `GOCACHEPROG` is set, results are also stored in and looked up from it, so
+machines sharing a cache server share test results, as they do build outputs.
+This needs identical checkout paths, as on alike-provisioned CI or `-remote`
+machines.
+
 Cache entries include dependencies observed by Go's test-log support. A result
-is reused only while those environment and filesystem inputs still match.
-Unreported inputs such as network services, time, and randomness cannot
-invalidate an entry automatically.
+is reused only while those environment and filesystem inputs still match, on the
+machine reusing it. Files are compared by content, not modification time, so a
+fresh clone of the same commit matches. Unreported inputs such as network
+services, time, and randomness cannot invalidate an entry automatically.
 
 The current scheduler executes each top-level test in its own process. This
 makes cache entries and invalidation attributable to individual tests, at the

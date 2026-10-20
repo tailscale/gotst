@@ -39,9 +39,9 @@ Neither environment is a fallback for the other. Features and defaults should
 not require a remote cache to provide good laptop behavior, and local-only
 optimizations should not assume a warm persistent disk on ephemeral workers.
 
-Gotst can distribute individual top-level tests between machines. It does not
-batch multiple top-level tests into one process or provide a remote test-result
-cache.
+Gotst can distribute individual top-level tests between machines, and machines
+sharing a `GOCACHEPROG` backend share test results as well as build outputs. It
+does not batch multiple top-level tests into one process.
 
 ## Live status page
 
@@ -324,7 +324,17 @@ The versioned cache key contains:
 - effective test arguments, excluding the per-task `-test.run` value.
 
 Entries are JSON below a versioned `test-results/vN` directory in the cache root and are installed by
-atomic rename. Only a clean, single-repetition pass is written. Explicitly
+atomic rename. When gotst inherits `GOCACHEPROG`, `progTestCache` layers that
+local store over it: a local miss asks `GOCACHEPROG` for an object whose action
+ID is a hash of the cache key, and a write goes to both, so every machine using
+the same cache server (CI workers, `-remote` machines) finds every other's
+results. Gotst starts its own instance of the helper for this on first use, separate
+from the per-build brokers. An entry found remotely is copied into the local
+store and, like a local one, used only after its recorded dependencies
+validate on this machine. A failure to reach the helper falls back to the local
+store. Keys include the absolute working directory, so sharing requires
+identical checkout paths, as machines provisioned alike have; recorded
+dependency paths are absolute for the same reason. Only a clean, single-repetition pass is written. Explicitly
 supplying `-count`, even `-count=1`, disables result-cache reuse so it preserves
 the familiar `go test -count=1` intent.
 
@@ -343,10 +353,19 @@ For an executed test, gotst asks the test binary to write the standard
 runtime:
 
 - `getenv`: presence plus a SHA-256 of the value;
-- `open` on a regular file: stat/lstat metadata and full content hash;
-- `open` on a directory: metadata and a deterministic entry fingerprint; and
-- `stat` and `chdir`: filesystem metadata, resolving relative paths against the
-  working directory as it changes.
+- `open` or `stat` of a regular file: existence, mode, size, and full content
+  hash;
+- `open` on a directory: its mode and a fingerprint of its entries' names,
+  modes, and (for regular files) sizes; and
+- `stat` of a directory and `chdir`: existence and mode, resolving relative
+  paths against the working directory as it changes.
+
+Fingerprints deliberately omit modification times and directory sizes, which
+differ between equivalent checkouts (a fresh clone stamps every file) and file
+systems; this is what lets an entry validate on another machine. A change that
+alters only a file's modification time therefore does not invalidate a result.
+Regular files are hashed even when only stat'd, so a same-size edit is still
+detected.
 
 As in cmd/go's native test cache, `open` and `stat` paths outside the package's
 module, GOPATH, or GOROOT root are not rechecked. This prevents incidental
@@ -647,8 +666,9 @@ Both local and remote distributed executions call the ordinary `runTest`
 implementation through an isolated per-assignment `Server`. This reuses retry,
 count, test-log, attribute, and result-cache behavior while deferring authoritative
 state changes to the leader. Temporary test logs are isolated between leases.
-Result-cache lookup and dependency validation happen on the executing machine;
-machine-specific result-cache entries are never imported into the leader.
+Result-cache lookup and dependency validation happen on the executing machine,
+against its local store and any shared `GOCACHEPROG`; entries are never sent to
+the leader over the work protocol.
 Only accepted executions contribute history, with identity supplied by the
 leader and portable dependency shapes supplied by the executor.
 
@@ -767,6 +787,7 @@ the runner state.
 | `invocation.go` | Positional package/profile/test interpretation and selection matching |
 | `cache.go` | Per-run directories and cleanup of abandoned runs |
 | `testcache.go` | Persistent result-cache interface, disk backend, test-log parsing, and dependency fingerprints |
+| `testcache_prog.go` | Result-cache layer sharing entries through `GOCACHEPROG` |
 | `history/history.go` | Public advisory-history model, store interface, and versioned HTTP wire types |
 | `history.go` | Gotst integration, portable dependency shapes, and local/HTTP store implementations |
 | `cmd/testhistoryd` | PostgreSQL 17 history service, embedded schema, and HTTP handlers |
