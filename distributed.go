@@ -54,6 +54,9 @@ type fleet struct {
 	buildErrs []string       // build failures reported by preparation
 	local     *helperBuilder // the leader's own binaries
 	firstTask time.Time      // when the first test became work
+	// stopLeaderBuild stops the leader's own build, which is redundant
+	// once every package is prepared, wherever that happened.
+	stopLeaderBuild context.CancelFunc
 }
 
 // prepItem is one test package to prepare.
@@ -79,8 +82,9 @@ type fleetWorker struct {
 	Error     string
 	binaries  map[string]bool
 	leases    map[uint64]*workLease
-	prep      []*prepItem // being prepared by this worker
-	Built     int         // packages this worker prepared
+	prep      []*prepItem   // being prepared by this worker
+	Built     int           // packages this worker prepared
+	PrepTime  time.Duration // spent preparing packages
 }
 
 type fleetTask struct {
@@ -130,6 +134,7 @@ type workerRequest struct {
 	Binaries []string          // newly available SHA-256s
 	Results  []workerResult
 	Prepared []preparedPackage
+	PrepTime time.Duration // spent preparing since the previous request
 }
 
 // preparedPackage reports a test package a helper prepared.
@@ -462,9 +467,20 @@ func (f *fleet) runDistributed(pkgs []string) error {
 // keeps its own binaries for its tests.
 func (f *fleet) leaderBuild(w *fleetWorker, pkgs []string) {
 	s := f.s
+	ctx, cancel := context.WithCancel(s.ctx)
+	defer cancel()
+	t0 := time.Now()
+	s.mu.Lock()
+	f.stopLeaderBuild = cancel
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		w.PrepTime += time.Since(t0)
+		s.mu.Unlock()
+	}()
 	// Reuse the leader's discovery rather than repeating go list.
 	build := &Server{
-		ctx: s.ctx, cacheDir: s.cacheDir, profile: s.profile, scratch: true, linkSkip: s.linkSkip,
+		ctx: ctx, cacheDir: s.cacheDir, profile: s.profile, scratch: true, linkSkip: s.linkSkip,
 		buildDepFresh: make(map[string]bool), buildDepCached: make(map[string]bool),
 		buildActionToPkg: make(map[string]string), buildActionMapDir: s.buildActionMapDir,
 		pkgs: make(map[string]*packageStatus),
@@ -500,8 +516,11 @@ func (f *fleet) leaderBuild(w *fleetWorker, pkgs []string) {
 			lists.Go(func() {
 				if pp.Tests == nil {
 					sem <- true
-					tests, err := listTests(s.ctx, pkg, bin.absBin, bin.workDir)
+					tests, err := listTests(ctx, pkg, bin.absBin, bin.workDir)
 					<-sem
+					if ctx.Err() != nil {
+						return // preparation finished elsewhere, or the run ended
+					}
 					if err != nil {
 						pp.Error = err.Error()
 					} else {
@@ -517,7 +536,7 @@ func (f *fleet) leaderBuild(w *fleetWorker, pkgs []string) {
 	err := build.buildAllTestBinaries()
 	close(captured)
 	lists.Wait()
-	if err != nil && s.ctx.Err() == nil {
+	if err != nil && ctx.Err() == nil {
 		s.mu.Lock()
 		f.buildErrs = append(f.buildErrs, err.Error())
 		s.mu.Unlock()
@@ -545,7 +564,12 @@ func (f *fleet) localPreparer(w *fleetWorker) {
 			}
 			continue
 		}
-		for _, pp := range f.local.prepare(pkgs) {
+		t0 := time.Now()
+		pps := f.local.prepare(pkgs)
+		s.mu.Lock()
+		w.PrepTime += time.Since(t0)
+		s.mu.Unlock()
+		for _, pp := range pps {
 			f.applyPrepared(w, pp)
 		}
 		f.finishPreparingIfDone()
@@ -562,7 +586,11 @@ func (f *fleet) finishPreparingIfDone() {
 		return
 	}
 	f.preparing = false
+	stop := f.stopLeaderBuild
 	s.mu.Unlock()
+	if stop != nil {
+		stop()
+	}
 	if err := s.validateSelectedTests(); err != nil {
 		s.mu.Lock()
 		f.buildErrs = append(f.buildErrs, err.Error())
@@ -740,6 +768,11 @@ func (f *fleet) accept(w *fleetWorker, r workerResult) {
 func (f *fleet) exchange(w *fleetWorker, req workerRequest) workerResponse {
 	for _, pp := range req.Prepared {
 		f.applyPrepared(w, pp)
+	}
+	if req.PrepTime > 0 {
+		f.s.mu.Lock()
+		w.PrepTime += req.PrepTime
+		f.s.mu.Unlock()
 	}
 	if len(req.Prepared) > 0 {
 		f.finishPreparingIfDone()

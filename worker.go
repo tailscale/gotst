@@ -397,8 +397,13 @@ func workerLoop(c net.Conn, dec *json.Decoder, enc *json.Encoder, s *Server) err
 	results := make(chan workerResult, *jobs)
 	type started struct{ lease uint64 }
 	ready := make(chan started, *jobs)
-	preparedc := make(chan []preparedPackage, 1)
-	preparing := false // a batch of packages is being prepared for the leader
+	type preparedBatch struct {
+		pps []preparedPackage
+		d   time.Duration
+	}
+	preparedc := make(chan preparedBatch, 1)
+	var prepTime time.Duration // not yet reported
+	preparing := false         // a batch of packages is being prepared for the leader
 	running := 0
 	// Tests fetch their binaries only after missing the result cache.
 	var newBinsMu sync.Mutex
@@ -500,7 +505,8 @@ func workerLoop(c net.Conn, dec *json.Decoder, enc *json.Encoder, s *Server) err
 			binaries = append(binaries, newBins...)
 			newBins = nil
 			newBinsMu.Unlock()
-			req := workerRequest{Active: make(map[uint64]string), Results: pending, Binaries: binaries, Prepared: prepared}
+			req := workerRequest{Active: make(map[uint64]string), Results: pending, Binaries: binaries, Prepared: prepared, PrepTime: prepTime}
+			prepTime = 0
 			for id, e := range active {
 				req.Active[id] = e.state
 			}
@@ -533,9 +539,10 @@ func workerLoop(c net.Conn, dec *json.Decoder, enc *json.Encoder, s *Server) err
 				preparing = true
 				pkgs := res.Prepare
 				wg.Go(func() {
+					t0 := time.Now()
 					pps := builder.prepare(pkgs)
 					select {
-					case preparedc <- pps:
+					case preparedc <- preparedBatch{pps, time.Since(t0)}:
 					case <-ctx.Done():
 					}
 				})
@@ -551,10 +558,11 @@ func workerLoop(c net.Conn, dec *json.Decoder, enc *json.Encoder, s *Server) err
 				e.state = "running"
 			}
 			dirty = true
-		case pps := <-preparedc:
+		case batch := <-preparedc:
 			preparing = false
-			prepared = append(prepared, pps...)
-			for _, pp := range pps {
+			prepTime += batch.d
+			prepared = append(prepared, batch.pps...)
+			for _, pp := range batch.pps {
 				if pp.Binary != "" {
 					binaries = append(binaries, pp.Binary)
 				}

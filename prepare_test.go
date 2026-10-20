@@ -67,7 +67,15 @@ func TestPrepAssignment(t *testing.T) {
 	if len(f.work) != 2 || len(res.Work) != 2 || res.Work[0].Dir != "p1" || !a.binaries["h1"] {
 		t.Fatalf("work %d, assigned %+v", len(f.work), res.Work)
 	}
-	res = f.exchange(a, workerRequest{Prepared: []preparedPackage{{Package: "p2", Binary: "h2", Tests: []string{"TestC"}}}})
+	stopped := false
+	f.stopLeaderBuild = func() { stopped = true }
+	res = f.exchange(a, workerRequest{Prepared: []preparedPackage{{Package: "p2", Binary: "h2", Tests: []string{"TestC"}}}, PrepTime: time.Second})
+	if !stopped {
+		t.Error("finishing preparation didn't stop the leader's build")
+	}
+	if a.PrepTime != time.Second {
+		t.Errorf("a.PrepTime = %v", a.PrepTime)
+	}
 	if f.preparing || f.prepared != 2 || a.Built != 2 || len(f.work) != 3 {
 		t.Fatalf("preparing %v, prepared %d, a.Built %d, work %d", f.preparing, f.prepared, a.Built, len(f.work))
 	}
