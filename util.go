@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -35,6 +36,27 @@ func processCmdOutput(cmd *exec.Cmd, fn func(r io.Reader) error) (err error) {
 		return err
 	}
 	return fn(out)
+}
+
+// niceCmd is the path of nice(1), or "" where it is unavailable.
+var niceCmd = sync.OnceValue(func() string {
+	if runtime.GOOS == "windows" {
+		return ""
+	}
+	p, _ := exec.LookPath("nice")
+	return p
+})
+
+// lowPriorityCommand is like exec.CommandContext, but runs name at a lower
+// CPU scheduling priority where possible. Builds and tests can saturate the
+// machine; gotst's own work, including serving distributed helpers and the
+// status page over its userspace network stack, must stay responsive.
+// nice(1) execs in place, so the process ID and cancellation are unchanged.
+func lowPriorityCommand(ctx context.Context, name string, args ...string) *exec.Cmd {
+	if nice := niceCmd(); nice != "" {
+		return exec.CommandContext(ctx, nice, append([]string{"-n", "10", name}, args...)...)
+	}
+	return exec.CommandContext(ctx, name, args...)
 }
 
 var goCmd = sync.OnceValue(func() string {

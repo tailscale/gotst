@@ -27,6 +27,7 @@ type phaseDuration struct {
 type workerSummary struct {
 	ID, Name, Error                  string
 	Slots, Completed, Cached, Failed int
+	Built                            int           // test packages built in the distributed build
 	Joined                           time.Duration // since the run started
 	TestTime                         time.Duration
 
@@ -55,7 +56,7 @@ func (s *Server) fleetSummaryLocked(end time.Time) fleetSummary {
 	for _, w := range s.fleet.workers {
 		ws := workerSummary{
 			ID: w.ID, Name: w.Name, Error: w.Error, Slots: w.Slots,
-			Completed: w.Completed, Cached: w.Cached, Failed: w.Failed,
+			Completed: w.Completed, Cached: w.Cached, Failed: w.Failed, Built: w.Prebuilt,
 			Joined: w.Joined.Sub(s.start), TestTime: w.Duration, Busy: -1,
 		}
 		from, to := w.Joined, testEnd
@@ -111,10 +112,10 @@ func (sum fleetSummary) phasesString() string {
 func (sum fleetSummary) writeText(w io.Writer) {
 	fmt.Fprintf(w, "  phases: %s\n", sum.phasesString())
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintf(tw, "  WORKER\tNAME\tSLOTS\tJOINED\tTESTS\tCACHED\tFAILED\tTEST TIME\tBUSY\tERROR\n")
+	fmt.Fprintf(tw, "  WORKER\tNAME\tSLOTS\tJOINED\tBUILT\tTESTS\tCACHED\tFAILED\tTEST TIME\tBUSY\tERROR\n")
 	for _, ws := range sum.Workers {
-		fmt.Fprintf(tw, "  %s\t%s\t%d\t%v\t%d\t%d\t%d\t%v\t%s\t%s\n",
-			ws.ID, ws.Name, ws.Slots, roundDuration(ws.Joined), ws.Completed, ws.Cached, ws.Failed,
+		fmt.Fprintf(tw, "  %s\t%s\t%d\t%v\t%d\t%d\t%d\t%d\t%v\t%s\t%s\n",
+			ws.ID, ws.Name, ws.Slots, roundDuration(ws.Joined), ws.Built, ws.Completed, ws.Cached, ws.Failed,
 			roundDuration(ws.TestTime), ws.busyString(), ws.Error)
 	}
 	tw.Flush()
@@ -123,11 +124,11 @@ func (sum fleetSummary) writeText(w io.Writer) {
 func (sum fleetSummary) writeMarkdown(w io.Writer) {
 	fmt.Fprintf(w, "### gotst distributed run\n\n")
 	fmt.Fprintf(w, "Phases: %s\n\n", sum.phasesString())
-	fmt.Fprintf(w, "| Worker | Name | Slots | Joined | Tests | Cached | Failed | Test time | Busy | Error |\n")
-	fmt.Fprintf(w, "|---|---|--:|--:|--:|--:|--:|--:|--:|---|\n")
+	fmt.Fprintf(w, "| Worker | Name | Slots | Joined | Built | Tests | Cached | Failed | Test time | Busy | Error |\n")
+	fmt.Fprintf(w, "|---|---|--:|--:|--:|--:|--:|--:|--:|--:|---|\n")
 	for _, ws := range sum.Workers {
-		fmt.Fprintf(w, "| %s | %s | %d | %v | %d | %d | %d | %v | %s | %s |\n",
-			ws.ID, markdownCell(ws.Name), ws.Slots, roundDuration(ws.Joined), ws.Completed, ws.Cached, ws.Failed,
+		fmt.Fprintf(w, "| %s | %s | %d | %v | %d | %d | %d | %d | %v | %s | %s |\n",
+			ws.ID, markdownCell(ws.Name), ws.Slots, roundDuration(ws.Joined), ws.Built, ws.Completed, ws.Cached, ws.Failed,
 			roundDuration(ws.TestTime), ws.busyString(), markdownCell(ws.Error))
 	}
 	fmt.Fprintln(w)

@@ -48,6 +48,9 @@ type progressSnapshot struct {
 	CacheChecks  int
 	CacheHits    int
 	Helpers      int
+	// Distributed build progress, in test packages; PrebuildTotal is 0
+	// when there is no distributed build.
+	Prebuilt, PrebuildTotal int
 }
 
 // phaseStart records when a run entered a phase.
@@ -111,6 +114,7 @@ func (s *Server) progressSnapshot() progressSnapshot {
 	p.TestETA, p.ETAUnknown, p.ETAAvailable = s.testETALocked(time.Now())
 	p.ETAMedian = s.testEstimateBase
 	if s.fleet != nil {
+		p.Prebuilt, p.PrebuildTotal = s.fleet.prebuiltPkgs, s.fleet.prebuildTotal
 		for _, w := range s.fleet.workers {
 			if w.ID != "leader" && w.Connected && w.Error == "" {
 				p.Helpers++
@@ -238,7 +242,11 @@ func formatEstimate(d time.Duration) string {
 }
 
 func (p progressSnapshot) writeBuildProgress(b *strings.Builder) {
-	fmt.Fprintf(b, "%d/%d test pkgs; %d/%d built", p.PackagesTotal, p.PackagesDiscovered, p.PackagesBuilt, p.PackagesTotal)
+	fmt.Fprintf(b, "%d/%d test pkgs; ", p.PackagesTotal, p.PackagesDiscovered)
+	if p.PrebuildTotal > 0 {
+		fmt.Fprintf(b, "%d/%d built across machines, ", p.Prebuilt, p.PrebuildTotal)
+	}
+	fmt.Fprintf(b, "%d/%d built", p.PackagesBuilt, p.PackagesTotal)
 	if p.PackagesBuilt == 0 {
 		fmt.Fprintf(b, " (%d cached)", p.PackagesCached)
 		return

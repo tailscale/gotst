@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"slices"
@@ -17,7 +18,7 @@ import (
 )
 
 const (
-	workerProtocolVersion = 1
+	workerProtocolVersion = 2
 	workerBatchLimit      = 10
 	workerBatchTarget     = 3 * time.Second
 	workerHeartbeat       = 500 * time.Millisecond
@@ -38,6 +39,23 @@ type fleet struct {
 	done    int
 	infra   []error
 	wake    chan struct{}
+
+	// Distributed build: while prebuildOpen, the leader and helpers take
+	// chunks of the selected test packages to build, filling the shared
+	// build cache before the leader's own build of everything.
+	prebuildOpen  bool
+	chunks        []*buildChunk
+	prebuiltPkgs  int // packages in finished chunks
+	prebuildTotal int
+}
+
+// buildChunk is a group of test packages one machine builds during the
+// distributed build.
+type buildChunk struct {
+	pkgs     []string
+	worker   *fleetWorker // nil if unassigned; the leader's own worker for local builds
+	assigned time.Time
+	done     bool
 }
 
 type fleetWorker struct {
@@ -55,6 +73,8 @@ type fleetWorker struct {
 	Error     string
 	binaries  map[string]bool
 	leases    map[uint64]*workLease
+	chunk     *buildChunk // being built by this worker, or nil
+	Prebuilt  int         // packages this worker built in the distributed build
 }
 
 type fleetTask struct {
@@ -102,11 +122,13 @@ type workerRequest struct {
 	Active   map[uint64]string // queued, building, or running
 	Binaries []string          // newly available SHA-256s
 	Results  []workerResult
+	Built    []string // the packages of a finished build chunk, if any
 }
 
 type workerResponse struct {
 	Work   []workerWork
 	Cancel []uint64
+	Build  []string // test packages to build into the shared cache, if any
 	Done   bool
 	Error  string `json:",omitempty"`
 }
@@ -152,7 +174,13 @@ func (f *fleet) notify() {
 func (f *fleet) addWorker(name string, slots int, local bool) *fleetWorker {
 	f.s.mu.Lock()
 	defer f.s.mu.Unlock()
-	id := fmt.Sprintf("h%d", len(f.workers)+1)
+	helpers := 0
+	for _, w := range f.workers {
+		if w.ID != "leader" {
+			helpers++
+		}
+	}
+	id := fmt.Sprintf("h%d", helpers+1)
 	now := time.Now()
 	if local {
 		id = "leader"
@@ -208,8 +236,145 @@ func (f *fleet) disconnect(w *fleetWorker, err error) {
 	for _, l := range w.leases {
 		f.removeLeaseLocked(l)
 	}
+	f.releaseChunkLocked(w)
 	f.s.mu.Unlock()
 	f.notify()
+}
+
+// releaseChunkLocked returns w's unfinished build chunk, if any, to the
+// queue for another machine.
+func (f *fleet) releaseChunkLocked(w *fleetWorker) {
+	if c := w.chunk; c != nil {
+		w.chunk = nil
+		if !c.done {
+			c.worker = nil
+		}
+	}
+}
+
+// nextChunkLocked assigns w the next unassigned build chunk, or returns nil.
+func (f *fleet) nextChunkLocked(w *fleetWorker, now time.Time) *buildChunk {
+	if !f.prebuildOpen || w.chunk != nil {
+		return nil
+	}
+	for _, c := range f.chunks {
+		if !c.done && c.worker == nil {
+			c.worker, c.assigned, w.chunk = w, now, c
+			return c
+		}
+	}
+	return nil
+}
+
+// finishChunkLocked records that w finished building its chunk.
+func (f *fleet) finishChunkLocked(w *fleetWorker) {
+	c := w.chunk
+	if c == nil {
+		return
+	}
+	w.chunk = nil
+	if !c.done {
+		c.done = true
+		f.prebuiltPkgs += len(c.pkgs)
+		w.Prebuilt += len(c.pkgs)
+	}
+}
+
+// prebuildChunkSize returns how many of n test packages to build per chunk
+// with machines machines: small enough to balance the machines, large
+// enough to amortize each cmd/go invocation's package loading.
+func prebuildChunkSize(n, machines int) int {
+	return min(max((n+3*machines-1)/(3*machines), 1), 16)
+}
+
+// prebuild distributes building the test binaries of pkgs among the
+// leader and its connected helpers, so the leader's subsequent build of
+// everything mostly hits the shared build cache. It does nothing without
+// helpers. Build failures are left for the leader's full build to report.
+func (f *fleet) prebuild(pkgs []string) {
+	s := f.s
+	s.mu.Lock()
+	helpers := 0
+	for _, w := range f.workers {
+		if w.ID != "leader" && w.Connected && w.Error == "" {
+			helpers++
+		}
+	}
+	if helpers == 0 || len(pkgs) < 2 {
+		s.mu.Unlock()
+		return
+	}
+	size := prebuildChunkSize(len(pkgs), helpers+1)
+	for i := 0; i < len(pkgs); i += size {
+		f.chunks = append(f.chunks, &buildChunk{pkgs: pkgs[i:min(i+size, len(pkgs))]})
+	}
+	f.prebuildTotal = len(pkgs)
+	f.prebuildOpen = true
+	local := f.leaderWorkerLocked()
+	s.mu.Unlock()
+	if *verbose {
+		log.Printf("distributing the build of %d test packages in chunks of %d among %d machines", len(pkgs), size, helpers+1)
+	}
+	defer func() {
+		s.mu.Lock()
+		f.prebuildOpen = false
+		s.mu.Unlock()
+	}()
+	var builds []time.Duration
+	for s.ctx.Err() == nil {
+		now := time.Now()
+		s.mu.Lock()
+		c := f.nextChunkLocked(local, now)
+		// With nothing left to take, wait for chunks other machines are
+		// building, unless they are taking much longer than chunks usually
+		// do: then the leader's full build just builds them too.
+		waitFor := false
+		patience := 30 * time.Second
+		if len(builds) > 0 {
+			patience = max(patience, 2*slices.Max(builds))
+		}
+		for _, other := range f.chunks {
+			if !other.done && other.worker != nil && other.worker != local && now.Sub(other.assigned) < patience {
+				waitFor = true
+			}
+		}
+		s.mu.Unlock()
+		if c == nil {
+			if !waitFor {
+				return
+			}
+			select {
+			case <-f.wake:
+			case <-time.After(time.Second):
+			case <-s.ctx.Done():
+			}
+			continue
+		}
+		t0 := time.Now()
+		if _, err := buildScratch(s, c.pkgs); err != nil && *verbose {
+			log.Printf("distributed build of %d packages: %v", len(c.pkgs), err)
+		}
+		builds = append(builds, time.Since(t0))
+		s.mu.Lock()
+		f.finishChunkLocked(local)
+		s.mu.Unlock()
+	}
+}
+
+// leaderWorkerLocked returns the leader's own worker, adding it if needed.
+func (f *fleet) leaderWorkerLocked() *fleetWorker {
+	for _, w := range f.workers {
+		if w.ID == "leader" {
+			return w
+		}
+	}
+	now := time.Now()
+	w := &fleetWorker{
+		ID: "leader", Name: "local", Slots: *jobs, Connected: true, LastSeen: now, Joined: now,
+		binaries: make(map[string]bool), leases: make(map[uint64]*workLease),
+	}
+	f.workers = append(f.workers, w)
+	return w
 }
 
 // nextLocked preserves the global slowest-first queue. Binary affinity may
@@ -364,6 +529,10 @@ func (f *fleet) exchange(w *fleetWorker, req workerRequest) workerResponse {
 	for _, hash := range req.Binaries {
 		w.binaries[hash] = true
 	}
+	if len(req.Built) > 0 {
+		f.finishChunkLocked(w)
+		f.notify()
+	}
 	var res workerResponse
 	for id, state := range req.Active {
 		l := w.leases[id]
@@ -385,6 +554,9 @@ func (f *fleet) exchange(w *fleetWorker, req workerRequest) workerResponse {
 	res.Done = f.stopped || f.s.ctx.Err() != nil || (f.ready && f.done == len(f.work))
 	res.Error = w.Error
 	if !res.Done && res.Error == "" {
+		if c := f.nextChunkLocked(w, now); c != nil {
+			res.Build = c.pkgs
+		}
 		// Keep one short batch queued ahead of the running slots.
 		limit := min(workerBatchLimit, w.Slots+workerBatchLimit-len(w.leases))
 		res.Work = f.assignLocked(w, limit, now)
@@ -394,8 +566,8 @@ func (f *fleet) exchange(w *fleetWorker, req workerRequest) workerResponse {
 
 func (f *fleet) run(tasks []testTask) error {
 	s := f.s
-	w := f.addWorker("local", *jobs, true)
 	s.mu.Lock()
+	w := f.leaderWorkerLocked()
 	for _, task := range tasks {
 		f.work = append(f.work, &fleetTask{
 			task: task, estimate: s.testEstimates[task.bin.pkg+"\x00"+task.test].duration,
@@ -550,6 +722,10 @@ func (s *Server) workerDataLocked(now time.Time) []workerData {
 			d.Status = "unresponsive"
 		case len(w.leases) > 0:
 			d.Status = "working"
+		}
+		if c := w.chunk; c != nil {
+			d.Status = "working"
+			d.Work = append(d.Work, fmt.Sprintf("building %d packages from %s", len(c.pkgs), c.pkgs[0]))
 		}
 		for _, l := range w.leases {
 			d.Work = append(d.Work, l.work.task.bin.pkg+"."+l.work.task.test+" ("+l.state+")")

@@ -642,7 +642,20 @@ execution loop, so queued work proceeds while an exchange is in flight.
 Each exchange has a 15-second connection deadline.
 
 The leader builds and lists all selected binaries before opening the shared
-queue. In distributed mode, duration estimates take precedence over the
+queue. If helpers are connected when its build phase starts, it first
+distributes the build: the sorted test packages are split into contiguous
+chunks (about three per machine, at most 16 packages each, so neighbouring
+packages that share dependencies build together), and the leader and helpers
+each take one chunk at a time, helpers through their exchanges. Each machine
+builds its chunk with an ordinary cmd/go capture build, which fills the shared
+`GOCACHEPROG`; helpers keep the captured binaries for later assignments and
+report their hashes for affinity. A disconnected helper's chunk returns to the
+queue. Once no chunk is left to take, the leader waits for chunks other machines
+are still building, up to the longer of 30 seconds or twice its own longest
+chunk, and then runs its normal full build, which restores what the fleet
+built and builds anything left. Build failures are not reported from chunks;
+the full build reports them as usual. Without helpers the leader builds
+everything in one invocation as before. In distributed mode, duration estimates take precedence over the
 ordinary local scheduler's failure-first grouping. Unknown durations use the
 same median estimate as the ETA. Local worker slots and helpers take work from
 this one queue. Affinity may advance a prepared binary at most four positions,
@@ -683,8 +696,15 @@ working directories do not. Helpers resolve those locally with `go list`.
 The dashboard projects worker names, short IDs, status, per-worker result
 counts, accumulated duration, and each active lease. ETA capacity includes
 connected helpers' slots. Before final status publication, the leader gives
-helpers up to two seconds to receive completion and disconnect. Helpers exit
-on connection loss and can be restarted to join with a new session ID.
+helpers up to two seconds to receive completion and disconnect. A helper that
+loses its connection redials and rejoins with a new session ID and a fresh
+local state, retrying for two minutes; a rejection by the leader or the run's
+completion ends it.
+
+The leader runs cmd/go and test executables through `nice -n 10` where
+available. They can saturate the machine, and the leader process itself must
+keep serving helper exchanges and the status page, both over its userspace
+tailcat network stack.
 
 ## External Go build-cache broker
 
@@ -782,7 +802,7 @@ the runner state.
 | `gotst.go` | Entry modes, `Server`, phase pipeline, discovery, capture, listing, scheduler, retries, and argument normalization |
 | `distributed.go` | Fleet queue, leases, affinity, speculative execution, result acceptance, and worker status |
 | `remote.go`, `remote_run.sh` | `-remote` checkout snapshot, remote shell protocol, guest setup, and output relay |
-| `worker.go` | Tailcat work listener, helper protocol, lazy binary preparation, and helper execution loop |
+| `worker.go` | Tailcat work listener, helper protocol and rejoining, distributed and lazy binary preparation, and helper execution loop |
 | `profile.go` | Configuration discovery, strict YAML decoding, includes, and resolved profiles |
 | `invocation.go` | Positional package/profile/test interpretation and selection matching |
 | `cache.go` | Per-run directories and cleanup of abandoned runs |

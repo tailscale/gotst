@@ -145,6 +145,19 @@ func (f *fleet) shutdown() {
 	}
 }
 
+// helperRejoinWindow is how long a helper keeps trying to rejoin its
+// leader after losing its connection, for example to a timeout while the
+// leader's machine is overloaded, before giving up.
+const helperRejoinWindow = 2 * time.Minute
+
+// errLeaderConnection marks errors from a helper's leader connection, after
+// which the helper tries to rejoin, as opposed to the leader rejecting it or
+// the run ending.
+type errLeaderConnection struct{ err error }
+
+func (e errLeaderConnection) Error() string { return "leader connection: " + e.err.Error() }
+func (e errLeaderConnection) Unwrap() error { return e.err }
+
 func runHelper(addr, name string) error {
 	if _, err := tailcat.ParseAddr(tailcat.Addr(addr)); err != nil {
 		return fmt.Errorf("invalid leader address: %w", err)
@@ -158,27 +171,46 @@ func runHelper(addr, name string) error {
 	}
 	client := &tailcat.Client{Server: tailcat.Addr(addr), Logf: logf}
 	defer client.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	c, err := client.DialTCPPort(ctx, workerPort)
-	cancel()
-	if err != nil {
-		return fmt.Errorf("connecting to leader: %w", err)
+	joined := false
+	lastConnected := time.Now()
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		c, err := client.DialTCPPort(ctx, workerPort)
+		cancel()
+		if err != nil {
+			if time.Since(lastConnected) > helperRejoinWindow {
+				return fmt.Errorf("connecting to leader: %w", err)
+			}
+			log.Printf("connecting to leader: %v; retrying", err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		err = runWorkerConnection(c, name, joined)
+		c.Close()
+		var connErr errLeaderConnection
+		if !errors.As(err, &connErr) {
+			return err
+		}
+		joined = true
+		lastConnected = time.Now()
+		log.Printf("%v; rejoining", err)
 	}
-	defer c.Close()
-	return runWorkerConnection(c, name)
 }
 
-func runWorkerConnection(c net.Conn, name string) error {
+// runWorkerConnection serves the leader over c until the run ends. rejoin
+// says whether this helper was connected before; errors from c itself are
+// errLeaderConnection.
+func runWorkerConnection(c net.Conn, name string, rejoin bool) error {
 	dec, enc := json.NewDecoder(c), json.NewEncoder(c)
 	c.SetDeadline(time.Now().Add(workerTimeout))
 	if err := enc.Encode(workerHello{
 		Version: workerProtocolVersion, Name: name, Slots: *jobs, GOOS: runtime.GOOS, GOARCH: runtime.GOARCH,
 	}); err != nil {
-		return err
+		return errLeaderConnection{err}
 	}
 	var config workerConfig
 	if err := dec.Decode(&config); err != nil {
-		return err
+		return errLeaderConnection{err}
 	}
 	if config.Error != "" {
 		return errors.New(config.Error)
@@ -199,7 +231,11 @@ func runWorkerConnection(c net.Conn, name string) error {
 	s := NewServer(profile, testSelection{})
 	s.captureHistory = config.History
 	defer s.Cleanup()
-	log.Printf("joined leader as %s (%s), %d execution slots", config.ID, name, *jobs)
+	verb := "joined"
+	if rejoin {
+		verb = "rejoined"
+	}
+	log.Printf("%s leader as %s (%s), %d execution slots", verb, config.ID, name, *jobs)
 	return workerLoop(c, dec, enc, s)
 }
 
@@ -219,41 +255,74 @@ type helperBuilder struct {
 	bins map[string]capturedTestBinary
 }
 
+// buildScratch builds the test binaries of pkgs as base's machine would,
+// using a separate package map so discovery doesn't rebuild base's earlier
+// packages or race with execution reading their metadata. Captured
+// binaries are placed in base's run directory and recorded in the returned
+// Server.
+func buildScratch(base *Server, pkgs []string) (*Server, error) {
+	build := &Server{
+		ctx: base.ctx, cacheDir: base.cacheDir, profile: base.profile, scratch: true,
+		buildDepFresh: make(map[string]bool), buildDepCached: make(map[string]bool),
+		buildActionToPkg: make(map[string]string), buildActionMapDir: base.buildActionMapDir,
+	}
+	build.profile.Packages = pkgs
+	if err := build.learnPackagesWithTests(); err != nil {
+		return build, err
+	}
+	return build, build.buildAllTestBinaries()
+}
+
+// adopt records the binaries build captured as available to this helper.
+// It returns their hashes. b.mu must be held.
+func (b *helperBuilder) adoptLocked(build *Server) []string {
+	var hashes []string
+	for _, bin := range build.capturedTestBinaries() {
+		b.bins[bin.pkg] = bin
+		build.mu.Lock()
+		ps := build.pkgs[bin.pkg]
+		build.mu.Unlock()
+		b.s.mu.Lock()
+		if b.s.pkgs == nil {
+			b.s.pkgs = make(map[string]*packageStatus)
+		}
+		b.s.pkgs[bin.pkg] = ps
+		b.s.mu.Unlock()
+		hashes = append(hashes, binHash(bin.absBin))
+	}
+	return hashes
+}
+
+// prebuild builds pkgs for the leader's distributed build, keeping the
+// resulting binaries for later tests. It returns the hashes of the
+// binaries it captured; build failures are left for the leader to report.
+func (b *helperBuilder) prebuild(pkgs []string) []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	build, err := buildScratch(b.s, pkgs)
+	if err != nil && *verbose {
+		log.Printf("distributed build of %d packages: %v", len(pkgs), err)
+	}
+	return b.adoptLocked(build)
+}
+
 func (b *helperBuilder) binary(work workerWork) (capturedTestBinary, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if bin, ok := b.bins[work.Package]; ok {
-		return bin, nil
+	bin, ok := b.bins[work.Package]
+	if !ok {
+		build, err := buildScratch(b.s, []string{work.Package})
+		if err != nil {
+			return capturedTestBinary{}, err
+		}
+		b.adoptLocked(build)
+		if bin, ok = b.bins[work.Package]; !ok {
+			return capturedTestBinary{}, fmt.Errorf("package %q did not produce a test binary", work.Package)
+		}
 	}
-	// Use a separate package map so discovery doesn't rebuild earlier packages
-	// or race with execution reading their metadata.
-	build := &Server{
-		ctx: b.s.ctx, cacheDir: b.s.cacheDir, profile: b.s.profile,
-		buildDepFresh: make(map[string]bool), buildDepCached: make(map[string]bool),
-		buildActionToPkg: make(map[string]string), buildActionMapDir: b.s.buildActionMapDir,
-	}
-	build.profile.Packages = []string{work.Package}
-	if err := build.learnPackagesWithTests(); err != nil {
-		return capturedTestBinary{}, err
-	}
-	if err := build.buildAllTestBinaries(); err != nil {
-		return capturedTestBinary{}, err
-	}
-	bins := build.capturedTestBinaries()
-	if len(bins) != 1 || bins[0].pkg != work.Package {
-		return capturedTestBinary{}, fmt.Errorf("package %q did not produce a test binary", work.Package)
-	}
-	bin := bins[0]
 	if binHash(bin.absBin) != work.Binary {
 		return capturedTestBinary{}, fmt.Errorf("binary mismatch for %s; helper must have the same source, toolchain, and build environment as leader", work.Package)
 	}
-	b.s.mu.Lock()
-	if b.s.pkgs == nil {
-		b.s.pkgs = make(map[string]*packageStatus)
-	}
-	b.s.pkgs[work.Package] = build.pkgs[work.Package]
-	b.s.mu.Unlock()
-	b.bins[work.Package] = bin
 	return bin, nil
 }
 
@@ -277,6 +346,8 @@ func workerLoop(c net.Conn, dec *json.Decoder, enc *json.Encoder, s *Server) err
 		hash  string
 	}
 	ready := make(chan prepared, *jobs)
+	prebuilt := make(chan []string, 1) // binary hashes of a finished build chunk
+	var chunk []string                 // packages being built for the leader
 	running := 0
 	start := func() {
 		for running < *jobs && len(queue) != 0 {
@@ -346,23 +417,23 @@ func workerLoop(c net.Conn, dec *json.Decoder, enc *json.Encoder, s *Server) err
 		}
 	})
 	var pending []workerResult
-	var binaries []string
+	var binaries, built []string
 	dirty, inFlight := true, false
 	for {
 		if dirty && !inFlight {
-			req := workerRequest{Active: make(map[uint64]string), Results: pending, Binaries: binaries}
+			req := workerRequest{Active: make(map[uint64]string), Results: pending, Binaries: binaries, Built: built}
 			for id, e := range active {
 				req.Active[id] = e.state
 			}
 			requests <- req
-			pending, binaries = nil, nil
+			pending, binaries, built = nil, nil, nil
 			dirty, inFlight = false, true
 		}
 		select {
 		case exchange := <-responses:
 			inFlight = false
 			if exchange.err != nil {
-				return fmt.Errorf("leader connection: %w", exchange.err)
+				return errLeaderConnection{exchange.err}
 			}
 			res := exchange.response
 			if res.Error != "" {
@@ -379,6 +450,17 @@ func workerLoop(c net.Conn, dec *json.Decoder, enc *json.Encoder, s *Server) err
 					delete(active, id)
 				}
 			}
+			if len(res.Build) > 0 && chunk == nil {
+				chunk = res.Build
+				pkgs := chunk
+				wg.Go(func() {
+					hashes := builder.prebuild(pkgs)
+					select {
+					case prebuilt <- hashes:
+					case <-ctx.Done():
+					}
+				})
+			}
 			for _, work := range res.Work {
 				e := &helperExecution{work: work, state: "queued"}
 				active[work.Lease] = e
@@ -390,6 +472,10 @@ func workerLoop(c net.Conn, dec *json.Decoder, enc *json.Encoder, s *Server) err
 			if e := active[p.lease]; e != nil {
 				e.state = "running"
 			}
+			dirty = true
+		case hashes := <-prebuilt:
+			built, chunk = chunk, nil
+			binaries = append(binaries, hashes...)
 			dirty = true
 		case r := <-results:
 			running--

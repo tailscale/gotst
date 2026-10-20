@@ -214,6 +214,7 @@ type Server struct {
 	// Isolated executions collect history and output for the leader to commit.
 	captureHistory bool
 	quiet          bool
+	scratch        bool // a separate build of some packages, as by buildScratch
 	fleet          *fleet
 
 	execSem chan bool // buffered chan semaphore to limit subprocesses
@@ -382,6 +383,9 @@ func (s *Server) Run() (retErr error) {
 	}
 
 	s.setPhase(phaseBuilding)
+	if s.fleet != nil {
+		s.fleet.prebuild(s.packagesWithTests())
+	}
 	if err := s.buildAllTestBinaries(); err != nil {
 		return fmt.Errorf("buildAllTestBinaries: %w", err)
 	}
@@ -554,7 +558,7 @@ func (s *Server) resolveQualifiedTests() error {
 	for i := range s.tests.qualified {
 		q := &s.tests.qualified[i]
 		args := []string{"list", "-buildvcs=false", "--tags=" + strings.Join(s.profile.Tags, ","), "-f={{.ImportPath}}", q.packageSpec}
-		cmd := exec.CommandContext(s.ctx, goCmd(), args...)
+		cmd := lowPriorityCommand(s.ctx, goCmd(), args...)
 		cmd.Dir = s.profile.Root
 		out, err := cmd.CombinedOutput()
 		if err != nil {
@@ -587,7 +591,7 @@ func (s *Server) learnPackagesWithTests() error {
 	// status, which would invalidate cached tests that inspect the source tree.
 	args := []string{"list", "-buildvcs=false", "--tags=" + strings.Join(s.profile.Tags, ","), "--json"}
 	args = append(args, s.profile.Packages...)
-	cmd := exec.CommandContext(s.ctx, goCmd(), args...)
+	cmd := lowPriorityCommand(s.ctx, goCmd(), args...)
 	cmd.Dir = s.profile.Root
 	return processCmdOutput(cmd, func(r io.Reader) error {
 		jd := json.NewDecoder(r)
@@ -649,7 +653,7 @@ func (s *Server) resolveExcludedPackages() (map[string]bool, error) {
 	}
 	args := []string{"list", "-buildvcs=false", "--tags=" + strings.Join(s.profile.Tags, ","), "-f={{.ImportPath}}"}
 	args = append(args, s.profile.ExcludePackages...)
-	cmd := exec.CommandContext(s.ctx, goCmd(), args...)
+	cmd := lowPriorityCommand(s.ctx, goCmd(), args...)
 	cmd.Dir = s.profile.Root
 	var out bytes.Buffer
 	cmd.Stdout = &out
@@ -686,7 +690,7 @@ func (s *Server) learnBuildDependencyCount(pkgs []string) error {
 		"--tags=" + strings.Join(s.profile.Tags, ","), "-f={{.ImportPath}}",
 	}
 	args = append(args, pkgs...)
-	cmd := exec.CommandContext(s.ctx, goCmd(), args...)
+	cmd := lowPriorityCommand(s.ctx, goCmd(), args...)
 	cmd.Dir = s.profile.Root
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -882,7 +886,9 @@ func (s *Server) buildAllTestBinaries() error {
 		}
 		return nil
 	}
-	if err := s.learnBuildDependencyCount(pkgs); err != nil && *verbose {
+	if s.scratch {
+		// Only the main build reports build graph statistics.
+	} else if err := s.learnBuildDependencyCount(pkgs); err != nil && *verbose {
 		log.Printf("discovering build dependencies: %v", err)
 	}
 	args := []string{
@@ -899,7 +905,7 @@ func (s *Server) buildAllTestBinaries() error {
 		args = append(args, "--race")
 	}
 	args = append(args, pkgs...)
-	cmd := exec.CommandContext(s.ctx, goCmd(), args...)
+	cmd := lowPriorityCommand(s.ctx, goCmd(), args...)
 	cmd.Dir = s.profile.Root
 	cmd.Env = append(envWithout(os.Environ(), "GOTST_EXEC_DEST"), "GOTST_EXEC_DEST="+s.cacheDir)
 	var shim *cacheShim
@@ -1087,7 +1093,7 @@ func (s *Server) listTestsInBinary(pkg, absBin, workDir string) error {
 	defer s.releaseExecSem()
 
 	t0 := time.Now()
-	cmd := exec.CommandContext(s.ctx, absBin, "-test.list=.")
+	cmd := lowPriorityCommand(s.ctx, absBin, "-test.list=.")
 	cmd.Dir = workDir
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -1541,7 +1547,7 @@ func (s *Server) runTestAttempt(task testTask, key testCacheKey, baseArgs []stri
 		args = setTestArg(args, "-test.testlogfile", logPath)
 	}
 	t0 := time.Now()
-	cmd := exec.CommandContext(s.ctx, task.bin.absBin, args...)
+	cmd := lowPriorityCommand(s.ctx, task.bin.absBin, args...)
 	cmd.Dir = task.bin.workDir
 	var outputWriter io.Writer = &out
 	if *jsonSummary {

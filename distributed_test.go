@@ -300,7 +300,7 @@ func TestDistributedWorkerProcess(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	if err := runWorkerConnection(c, "fixture-vm"); err != nil {
+	if err := runWorkerConnection(c, "fixture-vm", false); err != nil {
 		t.Fatal(err)
 	}
 }

@@ -118,8 +118,13 @@ new tests use the median known test duration until they establish history.
 ## Distributed execution
 
 Start the leader with `-dist` to accept helper VMs over a separate ephemeral
-tailcat listener. The leader still builds and lists all selected packages
-before dispatching tests, and runs tests locally using its own `-j` slots:
+tailcat listener. The leader builds and lists all selected packages before
+dispatching tests, and runs tests locally using its own `-j` slots. If helpers
+are connected when it starts building, it first spreads the build among them:
+each machine, the leader included, builds chunks of the selected test
+packages, filling the shared `GOCACHEPROG` so the leader's own build then
+mostly restores binaries from it, and helpers keep what they built for the
+tests they are later given:
 
 ```sh
 gotst -dist -j=4 ./...
@@ -178,8 +183,9 @@ how long each phase took and a table of the same per-worker counts, when each
 worker joined, and how busy its slots were during the testing phase. Under
 GitHub Actions, it also appends that summary as Markdown to the job summary
 (`$GITHUB_STEP_SUMMARY`). Fail-fast and run completion cancel helpers'
-remaining work. A disconnected helper exits; it can be restarted to join again
-under a new ID. The leader can complete a run without any helpers joining.
+remaining work. A helper that loses its connection, for example to a timeout,
+rejoins under a new ID, retrying for up to two minutes; it can also be restarted
+to join again. The leader can complete a run without any helpers joining.
 
 Only share the helper address with trusted machines: joining helpers execute
 tests and supply results for the run. Address discovery and VM provisioning
