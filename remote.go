@@ -7,7 +7,9 @@ import (
 	"archive/tar"
 	"bufio"
 	"bytes"
+	"cmp"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	_ "embed"
 	"errors"
@@ -15,6 +17,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
+	"net/http"
+	"net/http/httputil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,6 +30,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/tailscale/tailcat"
+	"tailscale.com/types/logger"
 )
 
 // The -remote mode runs the whole gotst invocation on other machines: one
@@ -108,12 +116,19 @@ const remoteBundleRef = "refs/gotst-remote/snapshot"
 // helperAddrLine matches the leader's announcement of its helper address.
 var helperAddrLine = regexp.MustCompile(`^# gotst helpers: gotst -helper=(\S+)`)
 
+// statusAddrLine matches the leader's announcement of its status page.
+var statusAddrLine = regexp.MustCompile(`^# gotst status: tailcat browse (\S+)`)
+
 // remoteForwardArgs returns the leader's gotst arguments for this
 // invocation: every explicitly set flag except -remote's own and -j, then
 // the positional arguments. It returns the -j value separately (or "" if
-// unset), since it applies to every machine.
-func remoteForwardArgs(fs *flag.FlagSet) (args []string, jobs string, err error) {
-	listen := false
+// unset), since it applies to every machine. The leader serves its status
+// page over tailcat; unless -listen is "" or "tailcat", localListen is the
+// local address at which to proxy it.
+func remoteForwardArgs(fs *flag.FlagSet) (args []string, jobs, localListen string, err error) {
+	if f := fs.Lookup("listen"); f != nil {
+		localListen = f.DefValue
+	}
 	fs.Visit(func(f *flag.Flag) {
 		switch {
 		case remoteLocalFlags[f.Name]:
@@ -128,21 +143,29 @@ func remoteForwardArgs(fs *flag.FlagSet) (args []string, jobs string, err error)
 				err = fmt.Errorf("-remote cannot use an absolute -%s path", f.Name)
 			}
 		case f.Name == "listen":
-			listen = true
+			localListen = f.Value.String()
+			return
 		}
 		args = append(args, "-"+f.Name+"="+f.Value.String())
 	})
 	if err != nil {
-		return nil, "", err
+		return nil, "", "", err
 	}
-	if !listen {
-		// A loopback status server on the leader is unreachable from here.
+	switch localListen {
+	case "":
+		args = append(args, "-listen=")
+	default:
+		// Any other address is local; a loopback status server on
+		// the leader would be unreachable from here.
 		args = append(args, "-listen="+tailcatListenValue)
+		if localListen == tailcatListenValue {
+			localListen = ""
+		}
 	}
 	if fs.NArg() > 0 && strings.HasPrefix(fs.Arg(0), "-") {
 		args = append(args, "--")
 	}
-	return append(args, fs.Args()...), jobs, nil
+	return append(args, fs.Args()...), jobs, localListen, nil
 }
 
 // remoteSnapshot is the local checkout state to reproduce on each machine.
@@ -153,6 +176,39 @@ type remoteSnapshot struct {
 	snap   string   // commit whose tree is the working tree, including uncommitted files
 	bases  []string // commits remote machines fetch from the origin
 	bundle []byte   // git bundle of snap from bases, or nil if snap is pushed
+
+	commits int           // commits in bundle, including any working tree snapshot
+	skipped []skippedFile // large untracked files left out
+}
+
+// skippedFile is an untracked file left out of a remote snapshot.
+type skippedFile struct {
+	path string // relative to the checkout root
+	size int64
+}
+
+// maxUntrackedSize is the largest untracked file a remote snapshot
+// includes. Staging a file with "git add" includes it regardless.
+const maxUntrackedSize = 1 << 20
+
+// largeUntracked returns the untracked, unignored files in the checkout
+// at root larger than maxUntrackedSize, largest first.
+func largeUntracked(root string) ([]skippedFile, error) {
+	out, err := gitOutput(root, nil, "ls-files", "-z", "--others", "--exclude-standard")
+	if err != nil {
+		return nil, err
+	}
+	var big []skippedFile
+	for _, p := range strings.Split(out, "\x00") {
+		if p == "" {
+			continue
+		}
+		if fi, err := os.Lstat(filepath.Join(root, p)); err == nil && fi.Mode().IsRegular() && fi.Size() > maxUntrackedSize {
+			big = append(big, skippedFile{p, fi.Size()})
+		}
+	}
+	slices.SortFunc(big, func(a, b skippedFile) int { return cmp.Compare(b.size, a.size) })
+	return big, nil
 }
 
 func gitOutput(dir string, env []string, args ...string) (string, error) {
@@ -226,6 +282,21 @@ func takeRemoteSnapshot(dir string) (*remoteSnapshot, error) {
 	if _, err := gitOutput(root, env, "add", "-A", "--", "."); err != nil {
 		return nil, err
 	}
+	// Leave out large untracked files, which are more likely build
+	// outputs or downloads than test inputs, but would be uploaded to
+	// every machine.
+	if sn.skipped, err = largeUntracked(root); err != nil {
+		return nil, err
+	}
+	if len(sn.skipped) > 0 {
+		var paths []string
+		for _, f := range sn.skipped {
+			paths = append(paths, f.path)
+		}
+		if _, err := gitOutput(root, env, append([]string{"rm", "-q", "--cached", "--"}, paths...)...); err != nil {
+			return nil, err
+		}
+	}
 	tree, err := gitOutput(root, env, "write-tree")
 	if err != nil {
 		return nil, err
@@ -272,6 +343,8 @@ func takeRemoteSnapshot(dir string) (*remoteSnapshot, error) {
 	for _, line := range strings.Split(list, "\n") {
 		if c, ok := strings.CutPrefix(line, "-"); ok {
 			sn.bases = append(sn.bases, c)
+		} else {
+			sn.commits++
 		}
 	}
 	if len(sn.bases) == 0 {
@@ -510,24 +583,68 @@ func resolveRemoteSettings(defs *profileDefinitions, flagCmd, envCmd string, n i
 	return rs, nil
 }
 
-// prefixWriter writes complete lines to w, each prefixed.
-type prefixWriter struct {
-	mu     *sync.Mutex
-	w      io.Writer
+// machineOutput relays one machine's output lines to the local stderr.
+// Until the guest script starts (its first line has guestLinePrefix), the
+// lines are the remote shell command's own, such as VM provisioning
+// progress: they are held, and shown only if the machine fails before the
+// script starts, or with -vlog.
+type machineOutput struct {
+	outMu  *sync.Mutex // serializes all machines' output
 	prefix string
+
+	mu      sync.Mutex
+	started bool
+	held    []string
 }
 
-func (p prefixWriter) copyLines(r io.Reader, onLine func(string)) {
+// guestLinePrefix begins remote_run.sh's own messages.
+const guestLinePrefix = "gotst-remote["
+
+// maxHeldLines bounds machineOutput's held lines; older ones are dropped.
+const maxHeldLines = 200
+
+func (o *machineOutput) print(line string) {
+	o.outMu.Lock()
+	defer o.outMu.Unlock()
+	fmt.Fprintf(os.Stderr, "%s%s\n", o.prefix, line)
+}
+
+func (o *machineOutput) line(line string) {
+	o.mu.Lock()
+	if !o.started && strings.HasPrefix(line, guestLinePrefix) {
+		o.started = true
+		o.held = nil
+	}
+	if !o.started && !*verbose {
+		if len(o.held) == maxHeldLines {
+			o.held = o.held[1:]
+		}
+		o.held = append(o.held, line)
+		o.mu.Unlock()
+		return
+	}
+	o.mu.Unlock()
+	o.print(line)
+}
+
+// exited shows the held lines, if any: the machine ended before its guest
+// script started, so they likely say why.
+func (o *machineOutput) exited() {
+	o.mu.Lock()
+	held := o.held
+	o.held = nil
+	o.mu.Unlock()
+	for _, l := range held {
+		o.print(l)
+	}
+}
+
+// copyLines calls onLine for each line read from r.
+func copyLines(r io.Reader, onLine func(string)) {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(nil, 1<<20)
 	for sc.Scan() {
-		line := sc.Text()
-		if onLine != nil {
-			onLine(line)
-		}
-		p.mu.Lock()
-		fmt.Fprintf(p.w, "%s%s\n", p.prefix, line)
-		p.mu.Unlock()
+		onLine(sc.Text())
 	}
 	io.Copy(io.Discard, r)
 }
@@ -539,7 +656,7 @@ func runRemote(defs *profileDefinitions) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	args, jobs, err := remoteForwardArgs(flag.CommandLine)
+	args, jobs, localListen, err := remoteForwardArgs(flag.CommandLine)
 	if err != nil {
 		return 0, err
 	}
@@ -566,11 +683,24 @@ func runRemote(defs *profileDefinitions) (int, error) {
 	}
 	local := "pushed"
 	if sn.bundle != nil {
-		local = fmt.Sprintf("%d KiB bundle of local changes", (len(sn.bundle)+1023)/1024)
+		local = fmt.Sprintf("%d KiB bundle of %d local commits", (len(sn.bundle)+1023)/1024, sn.commits)
+	}
+	if n := len(sn.skipped); n > 0 {
+		fmt.Fprintf(os.Stderr, "# gotst -remote: not sending %d untracked files over %d KiB (git add them to send them):\n", n, maxUntrackedSize>>10)
+		for i, f := range sn.skipped {
+			if i == 5 {
+				fmt.Fprintf(os.Stderr, "#   ... and %d more\n", n-i)
+				break
+			}
+			fmt.Fprintf(os.Stderr, "#   %s (%.1f MiB)\n", f.path, float64(f.size)/(1<<20))
+		}
 	}
 	fmt.Fprintf(os.Stderr, "# gotst -remote: %.12s (%s, %v); starting %d machines with %s\n",
 		sn.snap, local, time.Since(t0).Round(time.Millisecond), rs.machines, strings.Join(rs.command, " "))
 
+	if n := len(sn.bundle); n >= 1<<20 {
+		fmt.Fprintf(os.Stderr, "# gotst -remote: sending %.1f MiB to each machine; this may take a while\n", float64(n)/(1<<20))
+	}
 	var outMu sync.Mutex
 	type machineProc struct {
 		cmd  *exec.Cmd
@@ -640,30 +770,46 @@ func runRemote(defs *profileDefinitions) (int, error) {
 		}()
 		var wg sync.WaitGroup
 		wg.Add(2)
+		mo := &machineOutput{outMu: &outMu, prefix: "[" + m.name + "] "}
 		if m.leader {
+			mo.prefix = ""
 			go func() {
 				defer wg.Done()
 				io.Copy(os.Stdout, stdout)
 			}()
 			go func() {
 				defer wg.Done()
-				prefixWriter{&outMu, os.Stderr, ""}.copyLines(stderr, func(line string) {
-					if m := helperAddrLine.FindStringSubmatch(line); m != nil {
+				copyLines(stderr, func(line string) {
+					if am := helperAddrLine.FindStringSubmatch(line); am != nil {
 						select {
-						case addrc <- m[1]:
+						case addrc <- am[1]:
 						default:
 						}
+						if !*verbose {
+							return
+						}
 					}
+					if sm := statusAddrLine.FindStringSubmatch(line); sm != nil && localListen != "" {
+						if url, err := startStatusProxy(localListen, sm[1]); err != nil {
+							mo.print(line)
+							mo.print(fmt.Sprintf("# gotst -remote: can't proxy the status page at %s: %v", localListen, err))
+						} else {
+							mo.print("# gotst status: " + url)
+						}
+						return
+					}
+					mo.line(line)
 				})
 			}()
 		} else {
-			pw := prefixWriter{&outMu, os.Stderr, "[" + m.name + "] "}
-			go func() { defer wg.Done(); pw.copyLines(stdout, nil) }()
-			go func() { defer wg.Done(); pw.copyLines(stderr, nil) }()
+			go func() { defer wg.Done(); copyLines(stdout, mo.line) }()
+			go func() { defer wg.Done(); copyLines(stderr, mo.line) }()
 		}
 		go func() {
 			wg.Wait()
-			p.done <- cmd.Wait()
+			err := cmd.Wait()
+			mo.exited()
+			p.done <- err
 		}()
 	}
 
@@ -721,4 +867,40 @@ func mainRemote() {
 		log.Fatalf("-remote: %v", err)
 	}
 	os.Exit(code)
+}
+
+// startStatusProxy serves the leader's tailcat status page at the local
+// address listen and returns its URL. It runs until the process exits.
+func startStatusProxy(listen string, leader string) (string, error) {
+	if _, err := tailcat.ParseAddr(tailcat.Addr(leader)); err != nil {
+		return "", fmt.Errorf("leader status address: %w", err)
+	}
+	ln, err := net.Listen("tcp", listen)
+	if err != nil {
+		return "", err
+	}
+	logf := logger.Discard
+	if *verbose {
+		logf = log.Printf
+	}
+	client := &tailcat.Client{Server: tailcat.Addr(leader), Logf: logf}
+	rp := &httputil.ReverseProxy{
+		Rewrite: func(r *httputil.ProxyRequest) {
+			r.Out.URL.Scheme = "http"
+			r.Out.URL.Host = "gotst-leader"
+			r.Out.Host = r.In.Host
+		},
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return client.DialTCPPort(ctx, 80)
+			},
+		},
+		ErrorLog: log.New(io.Discard, "", 0),
+	}
+	go http.Serve(ln, rp)
+	host, port, _ := net.SplitHostPort(ln.Addr().String())
+	if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
+		host = "localhost"
+	}
+	return "http://" + net.JoinHostPort(host, port) + "/", nil
 }

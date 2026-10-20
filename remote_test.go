@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -42,14 +43,17 @@ func TestRemoteForwardArgs(t *testing.T) {
 		return fs
 	}
 	tests := []struct {
-		args     []string
-		want     []string
-		wantJobs string
-		wantErr  bool
+		args       []string
+		want       []string
+		wantJobs   string
+		wantListen string
+		wantErr    bool
 	}{
-		{args: []string{"-remote=4", "./..."}, want: []string{"-listen=tailcat", "./..."}},
-		{args: []string{"-remote=4", "-j=16", "-race", "-listen=", "x", "TestFoo"}, want: []string{"-listen=", "-race=true", "x", "TestFoo"}, wantJobs: "16"},
-		{args: []string{"-remote=4", "--", "-weird"}, want: []string{"-listen=tailcat", "--", "-weird"}},
+		{args: []string{"-remote=4", "./..."}, want: []string{"-listen=tailcat", "./..."}, wantListen: "127.0.0.1:5525"},
+		{args: []string{"-remote=4", "-j=16", "-race", "-listen=", "x", "TestFoo"}, want: []string{"-race=true", "-listen=", "x", "TestFoo"}, wantJobs: "16"},
+		{args: []string{"-remote=4", "-listen=tailcat"}, want: []string{"-listen=tailcat"}},
+		{args: []string{"-remote=4", "-listen=:8080"}, want: []string{"-listen=tailcat"}, wantListen: ":8080"},
+		{args: []string{"-remote=4", "--", "-weird"}, want: []string{"-listen=tailcat", "--", "-weird"}, wantListen: "127.0.0.1:5525"},
 		{args: []string{"-remote=4", "-dist"}, wantErr: true},
 		{args: []string{"-remote=4", "-config=/abs/.gotst.yml"}, wantErr: true},
 	}
@@ -58,13 +62,13 @@ func TestRemoteForwardArgs(t *testing.T) {
 		if err := fs.Parse(tt.args); err != nil {
 			t.Fatal(err)
 		}
-		got, jobs, err := remoteForwardArgs(fs)
+		got, jobs, listen, err := remoteForwardArgs(fs)
 		if (err != nil) != tt.wantErr {
 			t.Errorf("%q: err = %v", tt.args, err)
 			continue
 		}
-		if err == nil && (!reflect.DeepEqual(got, tt.want) || jobs != tt.wantJobs) {
-			t.Errorf("%q: got %q, %q; want %q, %q", tt.args, got, jobs, tt.want, tt.wantJobs)
+		if err == nil && (!reflect.DeepEqual(got, tt.want) || jobs != tt.wantJobs || listen != tt.wantListen) {
+			t.Errorf("%q: got %q, %q, %q; want %q, %q, %q", tt.args, got, jobs, listen, tt.want, tt.wantJobs, tt.wantListen)
 		}
 	}
 }
@@ -169,6 +173,7 @@ func TestRemoteSnapshotRoundTrip(t *testing.T) {
 	write(laptop, "a.txt", "modified\n")
 	write(laptop, "sub/new.txt", "untracked\n")
 	write(laptop, "x.ignored", "ignored\n")
+	write(laptop, "huge.bin", strings.Repeat("x", maxUntrackedSize+1))
 	os.Remove(filepath.Join(laptop, "gone.txt"))
 	statusBefore := git(t, laptop, "status", "--porcelain")
 
@@ -176,7 +181,8 @@ func TestRemoteSnapshotRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sn.rel != "sub" || sn.bundle == nil || !reflect.DeepEqual(sn.bases, []string{head}) {
+	if sn.rel != "sub" || sn.bundle == nil || !reflect.DeepEqual(sn.bases, []string{head}) || sn.commits != 2 ||
+		len(sn.skipped) != 1 || sn.skipped[0].path != "huge.bin" {
 		t.Fatalf("dirty snapshot = %+v", sn)
 	}
 	if got := git(t, laptop, "status", "--porcelain"); got != statusBefore {
@@ -202,7 +208,7 @@ func TestRemoteSnapshotRoundTrip(t *testing.T) {
 			t.Errorf("guest %s = %q, %v; want %q", name, got, err, want)
 		}
 	}
-	for _, name := range []string{"gone.txt", "x.ignored"} {
+	for _, name := range []string{"gone.txt", "x.ignored", "huge.bin"} {
 		if _, err := os.Stat(filepath.Join(guest, name)); err == nil {
 			t.Errorf("guest has %s", name)
 		}
@@ -347,11 +353,12 @@ func TestRemoteEndToEnd(t *testing.T) {
 h="`+tmp+`/machine$GOTST_REMOTE_INDEX"
 mkdir -p "$h" && cd "$h" || exit 1
 echo "provider: machine $GOTST_REMOTE_INDEX of $GOTST_REMOTE_COUNT" >&2
+echo "provider: boot noise" >&2
 exec env HOME="$h" PATH="`+goroot+`/bin:$PATH" GOCACHE="`+gocache+`" GOTST_BIN="`+gotst+`" sh -c "$1"
 `)
 	os.Chmod(provider, 0755)
 
-	cmd := exec.Command(gotst, "-remote=2", "-remote-cmd="+provider, "-max-retries=0", "-history=off", "./...")
+	cmd := exec.Command(gotst, "-remote=2", "-remote-cmd="+provider, "-max-retries=0", "-history=off", "-listen=127.0.0.1:0", "./...")
 	cmd.Dir = filepath.Join(laptop, "a")
 	out, err := cmd.CombinedOutput()
 	t.Logf("output:\n%s", out)
@@ -359,10 +366,13 @@ exec env HOME="$h" PATH="`+goroot+`/bin:$PATH" GOCACHE="`+gocache+`" GOTST_BIN="
 	if !errors.As(err, &ee) || ee.ExitCode() != 1 {
 		t.Fatalf("err = %v; want exit status 1", err)
 	}
+	if strings.Contains(string(out), "boot noise") {
+		t.Errorf("output shows the remote shell command's output from before the guest script started")
+	}
 	for _, want := range []string{
-		"provider: machine 0 of 2",
-		"[m1] provider: machine 1 of 2",
+		"gotst-remote[leader]: started on",
 		"[m1] gotst-remote[m1]: joining leader",
+		"# gotst status: http://127.0.0.1:",
 		"FAILED: example.com/proj/a.TestUntracked",
 		"3/3 tests",
 	} {
@@ -377,4 +387,28 @@ func must[T any](v T, err error) T {
 		panic(err)
 	}
 	return v
+}
+
+func TestMachineOutputHoldsProvisioning(t *testing.T) {
+	var mu sync.Mutex
+	o := &machineOutput{outMu: &mu, prefix: "[m1] "}
+	o.line("Creating linux VM...")
+	o.line("Error: no VMs for you")
+	if len(o.held) != 2 || o.started {
+		t.Fatalf("held = %q", o.held)
+	}
+	o.line(guestLinePrefix + "m1]: started")
+	if len(o.held) != 0 || !o.started {
+		t.Fatalf("after start: held = %q", o.held)
+	}
+	for range maxHeldLines + 10 {
+		(&machineOutput{outMu: &mu}).line("x")
+	}
+	o2 := &machineOutput{outMu: &mu}
+	for range maxHeldLines + 10 {
+		o2.line("x")
+	}
+	if len(o2.held) != maxHeldLines {
+		t.Errorf("held %d lines; want %d", len(o2.held), maxHeldLines)
+	}
 }

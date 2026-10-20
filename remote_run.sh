@@ -22,6 +22,9 @@ dir=$(pwd)
 
 say() { echo "gotst-remote[$NAME]: $*"; }
 fail() { say "error: $*"; exit 1; }
+# The local gotst shows the remote shell command's earlier output only if
+# this script never starts, so always say something first.
+say "started on $(hostname) with $(nproc) CPUs"
 
 if [ -z "${GOCACHEPROG:-}" ]; then
 	say "warning: GOCACHEPROG is unset; machines will not share build outputs"

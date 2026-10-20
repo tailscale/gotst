@@ -200,22 +200,28 @@ gotst -remote=8 ./...
 The first machine runs the `-dist` leader and the others join it as helpers,
 each with `-j` defaulting to its CPU count. Other flags and arguments are
 passed to the leader, which prints its output and determines gotst's exit
-status. Helpers' output is prefixed with their names. The leader's status page
-uses `-listen=tailcat` unless `-listen` is given.
+status. Helpers' output is prefixed with their names. Output from the remote
+shell command before gotst's setup starts on a machine (such as VM provisioning
+progress) is shown only if that machine fails first, or with `-vlog`. The
+leader serves its status page over tailcat, and the local gotst proxies it at
+the `-listen` address as usual; `-listen=tailcat` prints the leader's tailcat
+address instead, and `-listen=` disables it.
 
 The local machine does not build anything. It records the working tree,
 including uncommitted and untracked (but not ignored) files, as a temporary
-commit, and sends each machine a git bundle of whatever is not on the `origin`
-remote's branches as known locally. Each machine shallow-fetches the rest from
-`origin` (anonymously over https for GitHub), checks out the same tree, and
-changes to the same subdirectory. Configure a shared `GOCACHEPROG` on the
-remote machines so they reuse each other's build outputs; build-cache traffic
-never passes through the local machine. Each machine installs the gotst
-version the local binary was built from with `go install`, using the
-checkout's `tool/go` if present. For an unpublished gotst, push it to a
-branch of github.com/tailscale/gotst and give `-remote-gotst=BRANCH` (or a
-tag or commit); each machine shallow-fetches that ref on every run and
-installs it.
+commit (leaving out, with a warning, untracked files over 1 MiB unless they are
+staged with `git add`), and sends each machine a git bundle of whatever is not
+on the `origin` remote's branches as known locally. If that is more than 20
+commits, it first fetches `origin`'s default branch and HEAD's upstream, in
+case those are just stale. Each machine shallow-fetches the rest from `origin`
+(anonymously over https for GitHub), checks out the same tree, and changes to
+the same subdirectory. Configure a shared `GOCACHEPROG` on the remote machines
+so they reuse each other's build outputs; build-cache traffic never passes
+through the local machine. Each machine installs the gotst version the local
+binary was built from with `go install`, using the checkout's `tool/go` if
+present. For an unpublished gotst, push it to a branch of
+github.com/tailscale/gotst and give `-remote-gotst=BRANCH` (or a tag or
+commit); each machine shallow-fetches that ref on every run and installs it.
 
 Gotst reaches machines through a remote shell command, configured with
 `-remote-cmd` (split on spaces), `$GOTST_REMOTE_CMD`, or `.gotst.yml`:
