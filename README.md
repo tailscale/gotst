@@ -125,9 +125,10 @@ tests using its own `-j` slots. Each machine takes batches of packages to build
 and their tests can start as soon as they are listed, preferably on the machine
 that built them. A build failure on any machine stops the run, but tests may
 already have run by then. By default the leader builds everything in one
-cmd/go invocation, which is fastest when the build cache is warm, while helpers
-build batches from the other end, which helps when it is cold;
-`-dist-build=batches` or `-dist-build=leader` change that for profiling. The run
+cmd/go invocation, which is fastest when the build cache is warm, and once that
+build is compiling rather than restoring packages from the cache, helpers build
+batches from the other end; `-dist-build=eager`, `-dist-build=batches`, or
+`-dist-build=leader` change that for profiling. The run
 summary shows, per machine, how long it spent preparing packages and how many
 build-cache requests it made at what average latency; a warm build waiting on a
 remote cache can use more cmd/go parallelism than CPUs with `-build-p`:
@@ -272,8 +273,8 @@ different cache root.
 When `GOCACHEPROG` is set, results are also stored in and looked up from it, so
 machines sharing a cache server share test results, as they do build outputs. Like `go test`'s own cache, gotst then also avoids obtaining test binaries
 whose results may all be cached: it records what each linked test binary
-contains, and later builds skip downloading and listing binaries it already
-knows, fetching one only if a test needs to run. `-link-skip=false` turns this
+contains, and later builds skip copying and listing binaries it already knows,
+fetching one only if a test needs to run. `-link-skip=false` turns this
 off, for comparison.
 This needs identical checkout paths, as on alike-provisioned CI or `-remote`
 machines.

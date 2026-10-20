@@ -308,11 +308,10 @@ func (s *cacheShim) noteLinkAction(outputHash string, actionID []byte) {
 	s.linkActions[outputHash] = hex.EncodeToString(actionID)
 }
 
-// linkStub answers get(actionID) with a placeholder if actionID is a link
-// action with a link record, or returns nil.
-func (s *cacheShim) linkStub(ctx context.Context, actionID []byte) *cacheProgResponse {
-	rec, err := lookupLinkRecord(ctx, s.downstream, actionID)
-	if err != nil || rec == nil {
+// linkStub answers get(actionID) with a placeholder for the executable
+// rec describes, or returns nil.
+func (s *cacheShim) linkStub(actionID []byte, rec *linkRecord) *cacheProgResponse {
+	if rec == nil {
 		return nil
 	}
 	data, err := linkStubContents(linkStub{LinkAction: hex.EncodeToString(actionID), linkRecord: *rec})
@@ -517,15 +516,6 @@ func (s *cacheShim) forward(ctx context.Context, req cacheProgRequest) (*cachePr
 			buildCacheStats.nanos.Add(int64(time.Since(t0)))
 		}()
 	}
-	if req.Command == cacheProgGet && s.linkSkip && s.downstream.can[cacheProgGet] {
-		// Any get may be for a test binary's link action; cmd/go doesn't say.
-		if res := s.linkStub(ctx, req.ActionID); res != nil {
-			if s.cacheLookup != nil {
-				s.cacheLookup(cacheLookupEvent{ActionID: append([]byte(nil), req.ActionID...), Hit: true})
-			}
-			return res, nil
-		}
-	}
 	var res *cacheProgResponse
 	if req.Command == cacheProgGet && !s.downstream.can[cacheProgGet] {
 		// Advertising get lets us observe cmd/go's exact link action ID even
@@ -541,6 +531,37 @@ func (s *cacheShim) forward(ctx context.Context, req cacheProgRequest) (*cachePr
 	if req.Command != cacheProgGet {
 		return res, nil
 	}
+	if s.linkSkip && !res.Miss && looksLikeExecutable(res.DiskPath) {
+		// A test executable: if its link record is known, answer with a
+		// placeholder, so it needn't be verified, copied, or listed. Only
+		// executables are looked up: cigocacher, for one, doesn't cache
+		// misses locally, so looking up every get would double the cache
+		// server's load on every build.
+		rec, err := lookupLinkRecord(ctx, s.downstream, req.ActionID)
+		if err == nil && rec != nil && rec.OutputID == hex.EncodeToString(responseOutputID(res)) {
+			if stub := s.linkStub(req.ActionID, rec); stub != nil {
+				if s.cacheLookup != nil {
+					s.cacheLookup(cacheLookupEvent{ActionID: append([]byte(nil), req.ActionID...), Hit: true})
+				}
+				return stub, nil
+			}
+		}
+	}
+	return s.finishGet(req, res), nil
+}
+
+// responseOutputID returns res's output ID, accepting older helpers' name.
+func responseOutputID(res *cacheProgResponse) []byte {
+	if len(res.OutputID) != 0 {
+		return res.OutputID
+	}
+	return res.ObjectID
+}
+
+// finishGet completes a get answered by the downstream helper: recording
+// misses for executable association and verifying and materializing
+// executables.
+func (s *cacheShim) finishGet(req cacheProgRequest, res *cacheProgResponse) *cacheProgResponse {
 	if len(res.OutputID) == 0 && len(res.ObjectID) != 0 {
 		res.OutputID = res.ObjectID
 	}
@@ -549,7 +570,7 @@ func (s *cacheShim) forward(ctx context.Context, req cacheProgRequest) (*cachePr
 		if s.cacheLookup != nil {
 			s.cacheLookup(cacheLookupEvent{ActionID: append([]byte(nil), req.ActionID...)})
 		}
-		return res, nil
+		return res
 	}
 	if s.cacheLookup != nil {
 		s.cacheLookup(cacheLookupEvent{ActionID: append([]byte(nil), req.ActionID...), Hit: true})
@@ -560,13 +581,13 @@ func (s *cacheShim) forward(ctx context.Context, req cacheProgRequest) (*cachePr
 			// Never execute an executable-looking cache object unless both its
 			// content hash and embedded action ID match the response.
 			s.recordMiss(req.ActionID)
-			return &cacheProgResponse{Miss: true}, nil
+			return &cacheProgResponse{Miss: true}
 		}
 		res.DiskPath = path
 		fi, err := os.Stat(path)
 		if err != nil || !fi.Mode().IsRegular() {
 			s.recordMiss(req.ActionID)
-			return &cacheProgResponse{Miss: true}, nil
+			return &cacheProgResponse{Miss: true}
 		}
 		outputHash := hex.EncodeToString(res.OutputID)
 		s.noteLinkAction(outputHash, req.ActionID)
@@ -578,7 +599,7 @@ func (s *cacheShim) forward(ctx context.Context, req cacheProgRequest) (*cachePr
 		s.mu.Unlock()
 		s.execHits.Add(1)
 	}
-	return res, nil
+	return res
 }
 
 func (s *cacheShim) executableWasCached(outputHash string) bool {

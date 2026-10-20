@@ -9,6 +9,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,7 +21,13 @@ import (
 	"github.com/tailscale/gotst/history"
 )
 
-var distBuild = flag.String("dist-build", "hybrid", "with -dist, how test packages are prepared (built and listed): hybrid (the leader builds them all in one cmd/go invocation while helpers take batches from the other end), batches (every machine, the leader included, takes batches), or leader (only the leader, in one invocation)")
+var distBuild = flag.String("dist-build", "hybrid", "with -dist, how test packages are prepared (built and listed): hybrid (the leader builds them all in one cmd/go invocation, and once that is compiling, rather than restoring everything from the build cache, helpers take batches from the other end), eager (hybrid, with helpers taking batches from the start), batches (every machine, the leader included, takes batches), or leader (only the leader, in one invocation)")
+
+// helperPrepareCompiles is how many packages the leader's build compiles,
+// rather than restoring from the build cache, before -dist-build=hybrid
+// lets helpers prepare packages too. Below it, helpers' builds would mostly
+// repeat the leader's cache lookups.
+const helperPrepareCompiles = 10
 
 const (
 	workerProtocolVersion = 3
@@ -57,6 +64,9 @@ type fleet struct {
 	// stopLeaderBuild stops the leader's own build, which is redundant
 	// once every package is prepared, wherever that happened.
 	stopLeaderBuild context.CancelFunc
+	// helpersPrepare, with -dist-build=hybrid, says the leader's build is
+	// compiling, so helpers may prepare packages too.
+	helpersPrepare bool
 }
 
 // prepItem is one test package to prepare.
@@ -306,7 +316,7 @@ func (f *fleet) nextPrepLocked(w *fleetWorker, now time.Time) []string {
 		return nil
 	}
 	mode := *distBuild
-	if mode == "leader" && w.ID != "leader" {
+	if w.ID != "leader" && (mode == "leader" || mode == "hybrid" && !f.helpersPrepare) {
 		return nil
 	}
 	var unassigned []*prepItem
@@ -315,7 +325,7 @@ func (f *fleet) nextPrepLocked(w *fleetWorker, now time.Time) []string {
 			unassigned = append(unassigned, it)
 		}
 	}
-	if mode == "hybrid" {
+	if mode == "hybrid" || mode == "eager" {
 		// The leader builds everything from the front, in cmd/go's order;
 		// helpers start from the back, to overlap with it last.
 		slices.Reverse(unassigned)
@@ -453,10 +463,10 @@ func (f *fleet) runDistributed(pkgs []string) error {
 	switch *distBuild {
 	case "batches":
 		wg.Go(func() { f.localPreparer(local) })
-	case "hybrid", "leader":
+	case "hybrid", "eager", "leader":
 		wg.Go(func() { f.leaderBuild(local, pkgs) })
 	default:
-		return fmt.Errorf("invalid -dist-build %q; want hybrid, batches, or leader", *distBuild)
+		return fmt.Errorf("invalid -dist-build %q; want hybrid, eager, batches, or leader", *distBuild)
 	}
 	err := f.run(local)
 	wg.Wait()
@@ -542,6 +552,33 @@ func (f *fleet) leaderBuild(w *fleetWorker, pkgs []string) {
 			})
 		}
 	})
+	if *distBuild == "hybrid" {
+		// Let helpers help once the build turns out not to be warm.
+		go func() {
+			ticker := time.NewTicker(250 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+				}
+				build.mu.Lock()
+				compiles := build.buildDepsFresh
+				build.mu.Unlock()
+				if compiles >= helperPrepareCompiles {
+					s.mu.Lock()
+					f.helpersPrepare = true
+					s.mu.Unlock()
+					if *verbose {
+						log.Printf("leader build compiled %d packages; helpers may now prepare packages too", compiles)
+					}
+					f.notify()
+					return
+				}
+			}
+		}()
+	}
 	err := build.buildAllTestBinaries()
 	close(captured)
 	lists.Wait()

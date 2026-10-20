@@ -651,12 +651,15 @@ queue is spread one package at a time. Every cmd/go invocation recomputes
 action IDs for its packages' dependency graph, which for large module graphs is
 most of a warm build's cost, so the default `-dist-build=hybrid` has the leader
 build every package in a single invocation, reusing its own discovery, and
-prepare each package as cmd/go reports it, while helpers take batches from the
-other end of the queue. When the build cache is warm the leader's invocation
-finishes about as fast as a stock `go test`; when it is cold, helpers'
-batches fill the shared cache ahead of it. `-dist-build=batches` makes the
-leader take batches like a helper, and `-dist-build=leader` leaves preparation
-to the leader alone; both exist for comparison and profiling. A fully cached build of a large module
+prepare each package as cmd/go reports it. Helpers take batches from the other
+end of the queue only once the leader's build has compiled ten packages rather
+than restoring them from the build cache: when the cache is warm, helper
+builds would mostly repeat the leader's cache requests, which against a shared
+cache server cost its throughput for no gain; when it is cold, helpers' batches
+fill the shared cache ahead of the leader. `-dist-build=eager` lets helpers
+start at once, `-dist-build=batches` makes the leader take batches like a
+helper, and `-dist-build=leader` leaves preparation to the leader alone; these
+exist for comparison and profiling. A fully cached build of a large module
 makes tens of thousands of build-cache requests (test variants of shared
 packages multiply the actions per test binary), so with a remote cache their
 latency, not CPU, bounds a warm build; the run summary reports each machine's
@@ -747,19 +750,23 @@ with `-test.list` before it could look up a single result. With an external
   which the broker learned from cmd/go's `get` (or, for a fresh link, from the
   executable's build ID). The record holds the binary's SHA-256, size, Go
   build ID, and listed tests.
-- During later builds the broker first looks up a link record for every
-  `get` (cmd/go does not say which are link actions; for others the extra
-  lookup is a small miss). On a hit it answers with a placeholder: a small
-  file holding the raw build ID, which cmd/go reads from cached link outputs,
-  followed by the record. The response carries the real output ID and the
-  placeholder's size, which cmd/go checks against the file.
+- During later builds, when a `get` returns a test executable, the broker looks
+  up its link record. (cmd/go does not say which gets are link actions, and
+  looking up a record before every get would double requests to the cache
+  server on every build, since helpers such as cigocacher cache hits locally
+  but not misses.) If the record matches the executable, the broker answers
+  with a placeholder instead: a small file holding the raw build ID, which
+  cmd/go reads from cached link outputs, followed by the record. The response
+  carries the real output ID and the placeholder's size, which cmd/go checks
+  against the file. The executable itself is then already on local disk for
+  the helper, but is not verified, copied, or listed.
 - The `-exec` capture wrapper recognizes the placeholder and reports the real
   hash and tests without capturing anything, so the package is not listed.
 - A test that misses the result cache fetches the real executable by its link
   action ID from `GOCACHEPROG` (outside cmd/go) and verifies its SHA-256.
 
-The record is a function of the link action, so it cannot describe a
-different binary; a fetched binary must still match its recorded hash.
+A record is used only when it matches the executable the cache returned, and a
+fetched binary must still match its recorded hash.
 `-link-skip=false` disables both writing and using records.
 
 ## External Go build-cache broker

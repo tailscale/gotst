@@ -96,9 +96,18 @@ func TestPrepAssignmentHybrid(t *testing.T) {
 	f.preparing = true
 	f.leaderWorkerLocked()
 	a := f.addWorker("a", 1, false)
-	*distBuild = "hybrid"
+	*distBuild = "eager"
 	if got := f.nextPrepLocked(a, time.Now()); fmt.Sprint(got) != "[p3]" {
-		t.Errorf("hybrid: helper got %q; want the last package", got)
+		t.Errorf("eager: helper got %q; want the last package", got)
+	}
+	f.releasePrepLocked(a)
+	*distBuild = "hybrid"
+	if got := f.nextPrepLocked(a, time.Now()); got != nil {
+		t.Errorf("hybrid: helper got %q before the leader's build compiled anything", got)
+	}
+	f.helpersPrepare = true
+	if got := f.nextPrepLocked(a, time.Now()); fmt.Sprint(got) != "[p3]" {
+		t.Errorf("hybrid, compiling: helper got %q; want the last package", got)
 	}
 	f.releasePrepLocked(a)
 	*distBuild = "leader"
@@ -197,7 +206,7 @@ func TestDistributedPrepare(t *testing.T) {
 	if testing.Short() {
 		t.Skip("builds a nested module in a helper process")
 	}
-	for _, mode := range []string{"batches", "hybrid", "leader"} {
+	for _, mode := range []string{"batches", "hybrid", "eager", "leader"} {
 		t.Run(mode, func(t *testing.T) {
 			old := *distBuild
 			*distBuild = mode

@@ -26,15 +26,16 @@ import (
 // After capturing and listing a binary built or restored for link action A,
 // gotst stores a small "link record" in GOCACHEPROG under an action ID
 // derived from A, giving the binary's SHA-256, size, Go build ID, and test
-// names. When cmd/go later asks the cache broker for A, the broker first
-// looks up A's link record; on a hit it answers with a small placeholder
-// file carrying the real build ID (which cmd/go reads from cached link
-// outputs) and the record, instead of fetching the executable. The -exec
+// names. When cmd/go later asks the cache broker for A and gets back an
+// executable, the broker looks up A's link record; if it matches, it
+// answers with a small placeholder file carrying the real build ID (which
+// cmd/go reads from cached link outputs) and the record, instead of the
+// executable, which then isn't verified, copied, or listed. The -exec
 // capture wrapper recognizes the placeholder and reports the real hash and
 // tests, so the package needs neither a download nor a -test.list run.
 // A test that misses the result cache then fetches the real executable
 // for A directly from GOCACHEPROG, verifying its hash.
-var linkSkip = flag.Bool("link-skip", true, "with an external GOCACHEPROG and result caching, don't fetch or list test binaries whose link records say what they contain until a test needs to run (for profiling, -link-skip=false always obtains every binary)")
+var linkSkip = flag.Bool("link-skip", true, "with an external GOCACHEPROG and result caching, don't copy or list test binaries whose link records say what they contain until a test needs to run (for profiling, -link-skip=false always obtains every binary)")
 
 const linkRecordVersion = 1
 
