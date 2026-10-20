@@ -247,10 +247,23 @@ func takeRemoteSnapshot(dir string) (*remoteSnapshot, error) {
 		}
 	}
 
-	// Find which commits the remote already has, per our remote-tracking refs.
+	// Find which commits the remote already has, per our remote-tracking
+	// refs. If many seem unpushed, the refs are probably just stale (as
+	// when HEAD came from elsewhere), so fetch and look again rather than
+	// bundling commits the remote machines could fetch themselves.
 	list, err := gitOutput(root, nil, "rev-list", "--boundary", sn.snap, "--not", "--remotes=origin")
 	if err != nil {
 		return nil, err
+	}
+	if n := strings.Count(list, "\n") + 1; list != "" && n > remoteFetchThreshold {
+		branches := originBranchesToFetch(root)
+		fmt.Fprintf(os.Stderr, "# gotst -remote: %d commits not on origin; fetching origin %s\n", n, strings.Join(branches, " "))
+		if _, err := gitOutput(root, nil, append([]string{"fetch", "-q", "origin"}, branches...)...); err != nil {
+			return nil, err
+		}
+		if list, err = gitOutput(root, nil, "rev-list", "--boundary", sn.snap, "--not", "--remotes=origin"); err != nil {
+			return nil, err
+		}
 	}
 	if list == "" {
 		sn.bases = []string{sn.snap}
@@ -294,6 +307,28 @@ func takeRemoteSnapshot(dir string) (*remoteSnapshot, error) {
 	}
 	sn.bundle = append(hdr, b[end+1:]...)
 	return sn, nil
+}
+
+// remoteFetchThreshold is how many apparently unpushed commits (plus
+// boundary commits) make takeRemoteSnapshot fetch origin first.
+const remoteFetchThreshold = 20
+
+// originBranchesToFetch returns origin's default branch and HEAD's
+// upstream branch on origin, if any.
+func originBranchesToFetch(root string) []string {
+	def := "main"
+	if ref, err := gitOutput(root, nil, "symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"); err == nil {
+		if b, ok := strings.CutPrefix(ref, "origin/"); ok {
+			def = b
+		}
+	}
+	branches := []string{def}
+	if up, err := gitOutput(root, nil, "rev-parse", "-q", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"); err == nil {
+		if b, ok := strings.CutPrefix(up, "origin/"); ok && b != def {
+			branches = append(branches, b)
+		}
+	}
+	return branches
 }
 
 func cmpOr(a, b string) string {

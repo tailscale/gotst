@@ -6,6 +6,7 @@ package main
 import (
 	"errors"
 	"flag"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -257,6 +258,32 @@ func TestResolveRemoteSettings(t *testing.T) {
 	}
 	if _, err := resolveRemoteSettings(&profileDefinitions{}, "", "", 0); err == nil {
 		t.Error("no command: no error")
+	}
+}
+
+// TestRemoteSnapshotStaleOrigin checks that a HEAD whose history is on
+// origin, but not in the local remote-tracking refs, is not bundled.
+func TestRemoteSnapshotStaleOrigin(t *testing.T) {
+	tmp := t.TempDir()
+	upstream := filepath.Join(tmp, "upstream")
+	laptop := filepath.Join(tmp, "laptop")
+	git(t, tmp, "init", "-q", "-b", "main", upstream)
+	git(t, upstream, "commit", "-q", "--allow-empty", "-m", "first")
+	first := git(t, upstream, "rev-parse", "HEAD")
+	for i := range remoteFetchThreshold + 5 {
+		git(t, upstream, "commit", "-q", "--allow-empty", "-m", fmt.Sprint(i))
+	}
+	head := git(t, upstream, "rev-parse", "HEAD")
+	git(t, tmp, "clone", "-q", upstream, laptop)
+	// Make origin/main stale, as if fetched long ago.
+	git(t, laptop, "update-ref", "refs/remotes/origin/main", first)
+
+	sn, err := takeRemoteSnapshot(laptop)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sn.bundle != nil || !reflect.DeepEqual(sn.bases, []string{head}) {
+		t.Errorf("snapshot = bases %q, %d-byte bundle; want bases [%s] and no bundle", sn.bases, len(sn.bundle), head)
 	}
 }
 
