@@ -51,8 +51,8 @@ func TestFleetSummary(t *testing.T) {
 	var md strings.Builder
 	sum.writeMarkdown(&md)
 	for _, want := range []string{
-		"| h1 | a\\|b | 4 | 20s | 0 | 0s | 30 | 0 | 0 | 3m20s | 50% |  |\n",
-		"| h3 | broken | 4 | 10s | 0 | 0s | 0 | 0 | 0 | 0s | - | binary mismatch |\n",
+		"| h1 | a\\|b | 4 | 20s | 0 | 0s | 0 | 30 | 0 | 0 | 3m20s | 50% |  |\n",
+		"| h3 | broken | 4 | 10s | 0 | 0s | 0 | 0 | 0 | 0 | 0s | - | binary mismatch |\n",
 	} {
 		if !strings.Contains(md.String(), want) {
 			t.Errorf("markdown missing %q; got:\n%s", want, md.String())

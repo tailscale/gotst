@@ -85,6 +85,10 @@ type fleetWorker struct {
 	prep      []*prepItem   // being prepared by this worker
 	Built     int           // packages this worker prepared
 	PrepTime  time.Duration // spent preparing packages
+	// CacheGets and CacheGetTime are the worker's build-cache gets from
+	// cmd/go and their total latency.
+	CacheGets    int64
+	CacheGetTime time.Duration
 }
 
 type fleetTask struct {
@@ -127,6 +131,7 @@ type workerConfig struct {
 	FailFast   bool
 	JSON       bool
 	LinkSkip   bool
+	BuildP     int
 }
 
 type workerRequest struct {
@@ -135,6 +140,10 @@ type workerRequest struct {
 	Results  []workerResult
 	Prepared []preparedPackage
 	PrepTime time.Duration // spent preparing since the previous request
+	// CacheGets and CacheGetTime are the helper's build-cache gets so far
+	// and their total latency.
+	CacheGets    int64
+	CacheGetTime time.Duration
 }
 
 // preparedPackage reports a test package a helper prepared.
@@ -769,11 +778,12 @@ func (f *fleet) exchange(w *fleetWorker, req workerRequest) workerResponse {
 	for _, pp := range req.Prepared {
 		f.applyPrepared(w, pp)
 	}
-	if req.PrepTime > 0 {
-		f.s.mu.Lock()
-		w.PrepTime += req.PrepTime
-		f.s.mu.Unlock()
+	f.s.mu.Lock()
+	w.PrepTime += req.PrepTime
+	if req.CacheGets > w.CacheGets {
+		w.CacheGets, w.CacheGetTime = req.CacheGets, req.CacheGetTime
 	}
+	f.s.mu.Unlock()
 	if len(req.Prepared) > 0 {
 		f.finishPreparingIfDone()
 	}

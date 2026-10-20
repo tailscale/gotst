@@ -609,7 +609,16 @@ func (o *machineOutput) print(line string) {
 	fmt.Fprintf(os.Stderr, "%s%s\n", o.prefix, line)
 }
 
+// toolchainMismatchLine matches the warning tailscale.com, which gotst
+// depends on, prints at startup in each gotst process when a remote shell
+// command builds gotst with a mismatched Tailscale Go toolchain and sets
+// TS_PERMIT_TOOLCHAIN_MISMATCH=1 (as corp's does), to avoid downloads.
+var toolchainMismatchLine = regexp.MustCompile(`^tailscale\.toolchain\.rev = .*; but ignoring due to TS_PERMIT_TOOLCHAIN_MISMATCH=1$`)
+
 func (o *machineOutput) line(line string) {
+	if toolchainMismatchLine.MatchString(line) && !*verbose {
+		return
+	}
 	o.mu.Lock()
 	if !o.started && strings.HasPrefix(line, guestLinePrefix) {
 		o.started = true

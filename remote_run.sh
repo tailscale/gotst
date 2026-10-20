@@ -13,6 +13,9 @@
 #   GOTST_BIN      an installed gotst to use instead of installing one
 #   GOTST_GOTST_SRC_URL  git URL to fetch -remote-gotst's ref from
 #                  (default: https://github.com/tailscale/gotst)
+#   GOTST_GOTST_TOOLCHAIN  "checkout" to build gotst with the checkout's Go
+#                  toolchain and module cache instead of its own go.mod's
+#                  Go version and a private module cache
 #   GOTST_REMOTE_DIR  directory for checkouts and gotst builds
 #                  (default: $HOME/.cache/gotst-remote)
 set -eu
@@ -67,16 +70,28 @@ fi
 # (tailscale_go) that can break it. Switching toolchains unpacks one into
 # the module cache, so use a private writable one, in case the default is
 # read-only (as with gomodfs).
-gotstenv() {
-	env GOMODCACHE="$base/gotst-modcache" GOFLAGS="${GOFLAGS:+$GOFLAGS }-modcacherw" "$@"
-}
-# modtoolchain GOMOD prints the GOTOOLCHAIN for the Go version that go.mod
-# file asks for.
-modtoolchain() {
-	t=$(sed -n 's/^toolchain \([^ ]*\).*/\1/p' "$1" | head -n 1)
-	[ -n "$t" ] || t="go$(sed -n 's/^go \([^ ]*\).*/\1/p' "$1" | head -n 1)"
-	echo "$t"
-}
+#
+# With GOTST_GOTST_TOOLCHAIN=checkout, gotst is instead built like the
+# checkout's own code, with its toolchain and module cache, avoiding any
+# downloads; the remote shell command must then make that work, as with
+# TS_PERMIT_TOOLCHAIN_MISMATCH=1 for a Tailscale toolchain.
+binsuffix=
+if [ "${GOTST_GOTST_TOOLCHAIN:-}" = checkout ]; then
+	binsuffix=-checkout
+	gotstenv() { env "$@"; }
+	modtoolchain() { echo local; }
+else
+	gotstenv() {
+		env GOMODCACHE="$base/gotst-modcache" GOFLAGS="${GOFLAGS:+$GOFLAGS }-modcacherw" "$@"
+	}
+	# modtoolchain GOMOD prints the GOTOOLCHAIN for the Go version that
+	# go.mod file asks for.
+	modtoolchain() {
+		t=$(sed -n 's/^toolchain \([^ ]*\).*/\1/p' "$1" | head -n 1)
+		[ -n "$t" ] || t="go$(sed -n 's/^go \([^ ]*\).*/\1/p' "$1" | head -n 1)"
+		echo "$t"
+	}
+fi
 if [ -n "${GOTST_BIN:-}" ]; then
 	gotst=$GOTST_BIN
 elif [ -n "$GOTST_REF" ]; then
@@ -88,18 +103,20 @@ elif [ -n "$GOTST_REF" ]; then
 	git -C "$gs" fetch -q --depth=1 "$gsurl" "$GOTST_REF" || fail "fetching gotst $GOTST_REF from $gsurl"
 	git -C "$gs" -c advice.detachedHead=false checkout -q --force --detach FETCH_HEAD
 	rev=$(git -C "$gs" rev-parse HEAD)
-	bin="$base/bin/$rev"
+	bin="$base/bin/$rev$binsuffix"
 	gotst="$bin/gotst"
 	if [ ! -x "$gotst" ]; then
 		say "installing gotst $GOTST_REF ($rev)"
+		t0=$(date +%s)
 		(cd "$gs" && gotstenv GOTOOLCHAIN="$(modtoolchain go.mod)" GOBIN="$bin" "$go" install .) >"$dir/gotst-install.log" 2>&1 ||
 			{ cat "$dir/gotst-install.log"; fail "installing gotst"; }
+		say "installed gotst in $(($(date +%s) - t0))s"
 	fi
 else
 	case "$GOTST_VERSION" in
 	unknown:*) fail "${GOTST_VERSION#unknown: }; push it to a branch of github.com/tailscale/gotst and use -remote-gotst=BRANCH" ;;
 	esac
-	bin="$base/bin/$GOTST_VERSION"
+	bin="$base/bin/$GOTST_VERSION$binsuffix"
 	gotst="$bin/gotst"
 	if [ ! -x "$gotst" ]; then
 		say "installing github.com/tailscale/gotst@$GOTST_VERSION"

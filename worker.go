@@ -70,7 +70,7 @@ func (f *fleet) config(id string) workerConfig {
 		Version: workerProtocolVersion, ID: id, Tags: f.s.profile.Tags, Race: f.s.profile.Race,
 		Count: *testCount, CountSet: testCountSet, MaxRetries: *maxRetries, MaxOutput: *maxOutput,
 		Cache: f.s.testCache != nil, History: f.s.history != nil, FailFast: *failFast, JSON: *jsonSummary,
-		LinkSkip: *linkSkip,
+		LinkSkip: *linkSkip, BuildP: *buildP,
 	}
 }
 
@@ -226,7 +226,7 @@ func runWorkerConnection(c net.Conn, name string, rejoin bool) error {
 	*testCount, testCountSet, *maxRetries = config.Count, config.CountSet, config.MaxRetries
 	*maxOutput, *useCache = config.MaxOutput, config.Cache
 	*failFast, *jsonSummary, *historyConfig = config.FailFast, config.JSON, "off"
-	*linkSkip = config.LinkSkip
+	*linkSkip, *buildP = config.LinkSkip, config.BuildP
 	defs, err := loadProfileDefinitions(*configFile)
 	if err != nil {
 		return err
@@ -505,7 +505,10 @@ func workerLoop(c net.Conn, dec *json.Decoder, enc *json.Encoder, s *Server) err
 			binaries = append(binaries, newBins...)
 			newBins = nil
 			newBinsMu.Unlock()
-			req := workerRequest{Active: make(map[uint64]string), Results: pending, Binaries: binaries, Prepared: prepared, PrepTime: prepTime}
+			req := workerRequest{
+				Active: make(map[uint64]string), Results: pending, Binaries: binaries, Prepared: prepared, PrepTime: prepTime,
+				CacheGets: buildCacheStats.gets.Load(), CacheGetTime: time.Duration(buildCacheStats.nanos.Load()),
+			}
 			prepTime = 0
 			for id, e := range active {
 				req.Active[id] = e.state

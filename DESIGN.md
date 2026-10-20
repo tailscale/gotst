@@ -656,7 +656,12 @@ other end of the queue. When the build cache is warm the leader's invocation
 finishes about as fast as a stock `go test`; when it is cold, helpers'
 batches fill the shared cache ahead of it. `-dist-build=batches` makes the
 leader take batches like a helper, and `-dist-build=leader` leaves preparation
-to the leader alone; both exist for comparison and profiling. A
+to the leader alone; both exist for comparison and profiling. A fully cached build of a large module
+makes tens of thousands of build-cache requests (test variants of shared
+packages multiply the actions per test binary), so with a remote cache their
+latency, not CPU, bounds a warm build; the run summary reports each machine's
+request count and average latency, and `-build-p` raises cmd/go's parallelism
+independently of `-j`. A
 helper reports each package's binary SHA-256, size, captured arguments, listed
 tests, or build failure; a disconnected helper's batch returns to the queue,
 and a second report for a package is ignored. The machine that prepares a

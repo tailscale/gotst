@@ -8,6 +8,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -56,6 +57,7 @@ var (
 	distKey       = flag.String("dist-key", "", "with -dist, path to a *.private.json from \"tailcat genkey --fixed-region\" to use for the helper listener instead of an ephemeral key, so helpers can be given its address before the leader starts")
 	helperAddr    = flag.String("helper", "", "join the leader at this tailcat address and execute assigned tests")
 	helperName    = flag.String("helper-name", "", "helper display name (default: hostname)")
+	buildP        = flag.Int("build-p", 0, "cmd/go build parallelism (-p) (default: -j); a warm build waiting on a remote GOCACHEPROG can benefit from more than the CPU count, but a cold one needs memory for each compile; with -dist it applies to helpers too")
 	testCountSet  bool
 )
 
@@ -925,7 +927,7 @@ func (s *Server) buildAllTestBinaries() error {
 	args := []string{
 		"test",
 		"-count=1", // disable cmd/go test-result caching; gotst owns this layer
-		"-p=" + fmt.Sprint(*jobs),
+		"-p=" + fmt.Sprint(cmp.Or(*buildP, *jobs)),
 		"--trimpath",
 		"--tags=" + strings.Join(s.profile.Tags, ","),
 		"--json",

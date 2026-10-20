@@ -127,7 +127,10 @@ that built them. A build failure on any machine stops the run, but tests may
 already have run by then. By default the leader builds everything in one
 cmd/go invocation, which is fastest when the build cache is warm, while helpers
 build batches from the other end, which helps when it is cold;
-`-dist-build=batches` or `-dist-build=leader` change that for profiling:
+`-dist-build=batches` or `-dist-build=leader` change that for profiling. The run
+summary shows, per machine, how long it spent preparing packages and how many
+build-cache requests it made at what average latency; a warm build waiting on a
+remote cache can use more cmd/go parallelism than CPUs with `-build-p`:
 
 ```sh
 gotst -dist -j=4 ./...

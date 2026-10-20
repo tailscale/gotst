@@ -502,7 +502,21 @@ func (s *cacheShim) serveCmdGo(r io.Reader, w io.Writer) error {
 	}
 }
 
+// buildCacheStats counts this process's build-cache gets from cmd/go,
+// including link-record lookups, and their total latency.
+var buildCacheStats struct {
+	gets  atomic.Int64
+	nanos atomic.Int64
+}
+
 func (s *cacheShim) forward(ctx context.Context, req cacheProgRequest) (*cacheProgResponse, error) {
+	if req.Command == cacheProgGet {
+		t0 := time.Now()
+		defer func() {
+			buildCacheStats.gets.Add(1)
+			buildCacheStats.nanos.Add(int64(time.Since(t0)))
+		}()
+	}
 	if req.Command == cacheProgGet && s.linkSkip && s.downstream.can[cacheProgGet] {
 		// Any get may be for a test binary's link action; cmd/go doesn't say.
 		if res := s.linkStub(ctx, req.ActionID); res != nil {

@@ -29,6 +29,8 @@ type workerSummary struct {
 	Slots, Completed, Cached, Failed int
 	Built                            int           // test packages it prepared (built and listed)
 	PrepTime                         time.Duration // time it spent preparing packages
+	CacheGets                        int64         // build-cache gets from cmd/go
+	CacheGetAvg                      time.Duration // their average latency
 	Joined                           time.Duration // since the run started
 	TestTime                         time.Duration
 
@@ -65,8 +67,16 @@ func (s *Server) fleetSummaryLocked(end time.Time) fleetSummary {
 	for _, w := range s.fleet.workers {
 		ws := workerSummary{
 			ID: w.ID, Name: w.Name, Error: w.Error, Slots: w.Slots,
-			Completed: w.Completed, Cached: w.Cached, Failed: w.Failed, Built: w.Built, PrepTime: w.PrepTime,
+			Completed: w.Completed, Cached: w.Cached, Failed: w.Failed, Built: w.Built, PrepTime: w.PrepTime, CacheGets: w.CacheGets,
 			Joined: w.Joined.Sub(s.start), TestTime: w.Duration, Busy: -1,
+		}
+		gets, getTime := w.CacheGets, w.CacheGetTime
+		if w.ID == "leader" {
+			gets, getTime = buildCacheStats.gets.Load(), time.Duration(buildCacheStats.nanos.Load())
+		}
+		ws.CacheGets = gets
+		if gets > 0 {
+			ws.CacheGetAvg = getTime / time.Duration(gets)
 		}
 		from, to := w.Joined, testEnd
 		if from.Before(testStart) {
@@ -121,10 +131,10 @@ func (sum fleetSummary) phasesString() string {
 func (sum fleetSummary) writeText(w io.Writer) {
 	fmt.Fprintf(w, "  phases: %s\n", sum.phasesString())
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintf(tw, "  WORKER\tNAME\tSLOTS\tJOINED\tBUILT\tPREP\tTESTS\tCACHED\tFAILED\tTEST TIME\tBUSY\tERROR\n")
+	fmt.Fprintf(tw, "  WORKER\tNAME\tSLOTS\tJOINED\tBUILT\tPREP\tCACHE GETS\tTESTS\tCACHED\tFAILED\tTEST TIME\tBUSY\tERROR\n")
 	for _, ws := range sum.Workers {
-		fmt.Fprintf(tw, "  %s\t%s\t%d\t%v\t%d\t%v\t%d\t%d\t%d\t%v\t%s\t%s\n",
-			ws.ID, ws.Name, ws.Slots, roundDuration(ws.Joined), ws.Built, roundDuration(ws.PrepTime), ws.Completed, ws.Cached, ws.Failed,
+		fmt.Fprintf(tw, "  %s\t%s\t%d\t%v\t%d\t%v\t%s\t%d\t%d\t%d\t%v\t%s\t%s\n",
+			ws.ID, ws.Name, ws.Slots, roundDuration(ws.Joined), ws.Built, roundDuration(ws.PrepTime), ws.cacheGetsString(), ws.Completed, ws.Cached, ws.Failed,
 			roundDuration(ws.TestTime), ws.busyString(), ws.Error)
 	}
 	tw.Flush()
@@ -133,11 +143,11 @@ func (sum fleetSummary) writeText(w io.Writer) {
 func (sum fleetSummary) writeMarkdown(w io.Writer) {
 	fmt.Fprintf(w, "### gotst distributed run\n\n")
 	fmt.Fprintf(w, "Phases: %s\n\n", sum.phasesString())
-	fmt.Fprintf(w, "| Worker | Name | Slots | Joined | Built | Prep | Tests | Cached | Failed | Test time | Busy | Error |\n")
-	fmt.Fprintf(w, "|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|---|\n")
+	fmt.Fprintf(w, "| Worker | Name | Slots | Joined | Built | Prep | Cache gets | Tests | Cached | Failed | Test time | Busy | Error |\n")
+	fmt.Fprintf(w, "|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|---|\n")
 	for _, ws := range sum.Workers {
-		fmt.Fprintf(w, "| %s | %s | %d | %v | %d | %v | %d | %d | %d | %v | %s | %s |\n",
-			ws.ID, markdownCell(ws.Name), ws.Slots, roundDuration(ws.Joined), ws.Built, roundDuration(ws.PrepTime), ws.Completed, ws.Cached, ws.Failed,
+		fmt.Fprintf(w, "| %s | %s | %d | %v | %d | %v | %s | %d | %d | %d | %v | %s | %s |\n",
+			ws.ID, markdownCell(ws.Name), ws.Slots, roundDuration(ws.Joined), ws.Built, roundDuration(ws.PrepTime), ws.cacheGetsString(), ws.Completed, ws.Cached, ws.Failed,
 			roundDuration(ws.TestTime), ws.busyString(), markdownCell(ws.Error))
 	}
 	fmt.Fprintln(w)
@@ -165,4 +175,17 @@ func markdownCell(s string) string {
 	}
 	s = strings.ReplaceAll(s, "|", `\|`)
 	return strings.Join(strings.Fields(s), " ")
+}
+
+// cacheGetsString formats the worker's build-cache gets and their average
+// latency, e.g. "2104 @ 12ms".
+func (ws workerSummary) cacheGetsString() string {
+	if ws.CacheGets == 0 {
+		return "0"
+	}
+	avg := ws.CacheGetAvg.Round(100 * time.Microsecond)
+	if avg >= 10*time.Millisecond {
+		avg = ws.CacheGetAvg.Round(time.Millisecond)
+	}
+	return fmt.Sprintf("%d @ %v", ws.CacheGets, avg)
 }
