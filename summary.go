@@ -53,6 +53,14 @@ func (s *Server) fleetSummaryLocked(end time.Time) fleetSummary {
 			testStart, testEnd = ps.at, next
 		}
 	}
+	if t := s.fleet.firstTask; !t.IsZero() && (testStart.IsZero() || t.Before(testStart)) {
+		// Distributed runs test packages as soon as they are prepared,
+		// during the building phase.
+		testStart = t
+		if testEnd.IsZero() {
+			testEnd = end
+		}
+	}
 	for _, w := range s.fleet.workers {
 		ws := workerSummary{
 			ID: w.ID, Name: w.Name, Error: w.Error, Slots: w.Slots,

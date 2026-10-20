@@ -50,6 +50,7 @@ type fleet struct {
 	prepared  int            // finished prep items
 	buildErrs []string       // build failures reported by preparation
 	local     *helperBuilder // the leader's own binaries
+	firstTask time.Time      // when the first test became work
 }
 
 // prepItem is one test package to prepare.
@@ -375,6 +376,9 @@ func (f *fleet) applyPrepared(w *fleetWorker, pp preparedPackage) {
 // slowest first by estimate.
 func (f *fleet) addTasksLocked(tasks []testTask) {
 	s := f.s
+	if f.firstTask.IsZero() {
+		f.firstTask = time.Now()
+	}
 	for _, task := range tasks {
 		id := task.bin.pkg + "\x00" + task.test
 		est := s.estimateLocked(task)
