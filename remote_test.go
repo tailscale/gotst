@@ -217,6 +217,7 @@ func TestRemoteFlag(t *testing.T) {
 		{[]string{"-remote"}, remoteFlag{on: true}},
 		{[]string{"-remote=8"}, remoteFlag{on: true, n: 8}},
 		{[]string{"-remote=0"}, remoteFlag{}},
+		{[]string{"-remote=1"}, remoteFlag{on: true, n: 1}},
 		{[]string{"-remote=false"}, remoteFlag{}},
 	} {
 		var f remoteFlag
@@ -319,11 +320,11 @@ func TestRemoteEndToEnd(t *testing.T) {
 h="`+tmp+`/machine$GOTST_REMOTE_INDEX"
 mkdir -p "$h" && cd "$h" || exit 1
 echo "provider: machine $GOTST_REMOTE_INDEX of $GOTST_REMOTE_COUNT" >&2
-exec env HOME="$h" PATH="`+goroot+`/bin:$PATH" GOCACHE="`+gocache+`" sh -c "$1"
+exec env HOME="$h" PATH="`+goroot+`/bin:$PATH" GOCACHE="`+gocache+`" GOTST_BIN="`+gotst+`" sh -c "$1"
 `)
 	os.Chmod(provider, 0755)
 
-	cmd := exec.Command(gotst, "-remote=2", "-remote-cmd="+provider, "-remote-gotst="+gotst, "-max-retries=0", "-history=off", "./...")
+	cmd := exec.Command(gotst, "-remote=2", "-remote-cmd="+provider, "-max-retries=0", "-history=off", "./...")
 	cmd.Dir = filepath.Join(laptop, "a")
 	out, err := cmd.CombinedOutput()
 	t.Logf("output:\n%s", out)

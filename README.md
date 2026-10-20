@@ -212,8 +212,10 @@ changes to the same subdirectory. Configure a shared `GOCACHEPROG` on the
 remote machines so they reuse each other's build outputs; build-cache traffic
 never passes through the local machine. Each machine installs the gotst
 version the local binary was built from with `go install`, using the
-checkout's `tool/go` if present. A gotst built from a modified checkout must
-instead give `-remote-gotst=FILE`, a linux/amd64 gotst to upload.
+checkout's `tool/go` if present. For an unpublished gotst, push it to a
+branch of github.com/tailscale/gotst and give `-remote-gotst=BRANCH` (or a
+tag or commit); each machine shallow-fetches that ref on every run and
+installs it.
 
 Gotst reaches machines through a remote shell command, configured with
 `-remote-cmd` (split on spaces), `$GOTST_REMOTE_CMD`, or `.gotst.yml`:
@@ -232,6 +234,7 @@ machine with standard input, output, and error connected, and exit with its
 status, as `ssh HOST` does; `-remote-cmd='ssh -T buildhost'` works for a single
 host. It may prefix the shell command with environment settings: `GOTST_SRC_URL`
 to fetch commits from elsewhere, `GOTST_BIN` to use an installed gotst,
+`GOTST_GOTST_SRC_URL` to fetch `-remote-gotst` from elsewhere,
 `GOTST_REMOTE_DIR` for the checkout and cache directory (default
 `~/.cache/gotst-remote`), and anything the build needs, such as `GOCACHEPROG`.
 Its environment has `GOTST_REMOTE_PROTOCOL=1`, `GOTST_REMOTE_INDEX` (0 is the

@@ -49,7 +49,7 @@ import (
 var (
 	remoteRun   remoteFlag
 	remoteCmd   = flag.String("remote-cmd", "", "with -remote, the remote shell command, split on spaces (default $GOTST_REMOTE_CMD, then remote.command in .gotst.yml)")
-	remoteGotst = flag.String("remote-gotst", "", "with -remote, path to a linux/amd64 gotst to upload instead of installing this binary's version on each machine")
+	remoteGotst = flag.String("remote-gotst", "", "with -remote, a branch, tag, or commit of github.com/tailscale/gotst for each machine to shallow-fetch and install, instead of installing this binary's version")
 )
 
 func init() {
@@ -80,15 +80,18 @@ func (f *remoteFlag) String() string {
 }
 
 func (f *remoteFlag) Set(s string) error {
-	if b, err := strconv.ParseBool(s); err == nil {
-		*f = remoteFlag{on: b}
+	if n, err := strconv.Atoi(s); err == nil {
+		if n < 0 || n > 64 {
+			return errors.New("want a machine count from 0 to 64")
+		}
+		*f = remoteFlag{on: n > 0, n: n}
 		return nil
 	}
-	n, err := strconv.Atoi(s)
-	if err != nil || n < 0 || n > 64 {
+	b, err := strconv.ParseBool(s)
+	if err != nil {
 		return errors.New("want a boolean or a machine count from 0 to 64")
 	}
-	*f = remoteFlag{on: n > 0, n: n}
+	*f = remoteFlag{on: b}
 	return nil
 }
 
@@ -363,7 +366,7 @@ func (sn *remoteSnapshot) checkoutName() string {
 }
 
 // remoteMeta returns the guest script's meta.env for m.
-func remoteMeta(m remoteMachine, sn *remoteSnapshot, gotstVersion, jobs string, args []string) string {
+func remoteMeta(m remoteMachine, sn *remoteSnapshot, gotstVersion, gotstRef, jobs string, args []string) string {
 	var b strings.Builder
 	role := "helper"
 	if m.leader {
@@ -379,6 +382,7 @@ func remoteMeta(m remoteMachine, sn *remoteSnapshot, gotstVersion, jobs string, 
 		{"BASES", strings.Join(sn.bases, " ")},
 		{"BUNDLE_REF", remoteBundleRef},
 		{"GOTST_VERSION", gotstVersion},
+		{"GOTST_REF", gotstRef},
 		{"JOBS", jobs},
 	} {
 		fmt.Fprintf(&b, "%s=%s\n", kv[0], shellQuote(kv[1]))
@@ -392,7 +396,7 @@ func remoteMeta(m remoteMachine, sn *remoteSnapshot, gotstVersion, jobs string, 
 }
 
 // remotePayload returns the gzipped tar archive sent to a machine's standard input.
-func remotePayload(meta string, sn *remoteSnapshot, gotstBin []byte) ([]byte, error) {
+func remotePayload(meta string, sn *remoteSnapshot) ([]byte, error) {
 	var buf bytes.Buffer
 	zw := gzip.NewWriter(&buf)
 	tw := tar.NewWriter(zw)
@@ -411,11 +415,6 @@ func remotePayload(meta string, sn *remoteSnapshot, gotstBin []byte) ([]byte, er
 	}
 	if sn.bundle != nil {
 		if err := add("src.bundle", 0644, sn.bundle); err != nil {
-			return nil, err
-		}
-	}
-	if gotstBin != nil {
-		if err := add("gotst", 0755, gotstBin); err != nil {
 			return nil, err
 		}
 	}
@@ -510,16 +509,14 @@ func runRemote(defs *profileDefinitions) (int, error) {
 		return 0, err
 	}
 
-	var gotstBin []byte
+	// Without -remote-gotst, machines install this binary's version,
+	// unless the remote shell command provides GOTST_BIN. If the
+	// version is unknown, tell the guest why, in place of a version.
 	version := ""
-	if *remoteGotst != "" {
-		if gotstBin, err = os.ReadFile(*remoteGotst); err != nil {
-			return 0, err
-		}
-	} else {
+	if *remoteGotst == "" {
 		bi, _ := debug.ReadBuildInfo()
 		if version, err = gotstVersion(bi); err != nil {
-			return 0, fmt.Errorf("can't determine which gotst version remote machines should install (%v); use -remote-gotst=FILE with a linux/amd64 gotst", err)
+			version = "unknown: can't determine the local gotst's version (" + err.Error() + ")"
 		}
 	}
 
@@ -555,7 +552,7 @@ func runRemote(defs *profileDefinitions) (int, error) {
 		if m.leader {
 			m.name = "leader"
 		}
-		payload, err := remotePayload(remoteMeta(m, sn, version, jobs, args), sn, gotstBin)
+		payload, err := remotePayload(remoteMeta(m, sn, version, *remoteGotst, jobs, args), sn)
 		if err != nil {
 			return 0, err
 		}

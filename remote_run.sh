@@ -1,7 +1,7 @@
 # gotst -remote guest script; see remote.go.
 #
 # The local gotst sends a tar of this script, meta.env, and optionally
-# src.bundle and a gotst binary, then (for helpers) one line with the
+# src.bundle, then (for helpers) one line with the
 # leader's tailcat address. This script syncs a checkout to the local
 # snapshot commit, obtains gotst, and runs it as the leader or a helper.
 # Its own output goes to stderr; only gotst's stdout goes to stdout.
@@ -10,8 +10,9 @@
 #
 #   GOTST_SRC_URL  git URL to fetch the repository's commits from
 #                  (default: the local origin remote, as https for GitHub)
-#   GOTST_BIN      an installed gotst to use instead of one uploaded or
-#                  installed with "go install"
+#   GOTST_BIN      an installed gotst to use instead of installing one
+#   GOTST_GOTST_SRC_URL  git URL to fetch -remote-gotst's ref from
+#                  (default: https://github.com/tailscale/gotst)
 #   GOTST_REMOTE_DIR  directory for checkouts and gotst builds
 #                  (default: $HOME/.cache/gotst-remote)
 set -eu
@@ -60,16 +61,32 @@ if [ -x "$src/tool/go" ]; then
 fi
 if [ -n "${GOTST_BIN:-}" ]; then
 	gotst=$GOTST_BIN
-elif [ -f "$dir/gotst" ]; then
-	gotst="$dir/gotst"
-	chmod +x "$gotst"
+elif [ -n "$GOTST_REF" ]; then
+	# Shallow-fetch the ref on every run, so a pushed branch's latest
+	# commit is used, but install each commit only once.
+	gs="$base/gotst-src"
+	[ -d "$gs/.git" ] || git init -q "$gs"
+	gsurl=${GOTST_GOTST_SRC_URL:-https://github.com/tailscale/gotst}
+	git -C "$gs" fetch -q --depth=1 "$gsurl" "$GOTST_REF" || fail "fetching gotst $GOTST_REF from $gsurl"
+	git -C "$gs" -c advice.detachedHead=false checkout -q --force --detach FETCH_HEAD
+	rev=$(git -C "$gs" rev-parse HEAD)
+	bin="$base/bin/$rev"
+	gotst="$bin/gotst"
+	if [ ! -x "$gotst" ]; then
+		say "installing gotst $GOTST_REF ($rev)"
+		(cd "$gs" && GOBIN="$bin" "$go" install .) >"$dir/gotst-install.log" 2>&1 ||
+			{ cat "$dir/gotst-install.log"; fail "installing gotst"; }
+	fi
 else
+	case "$GOTST_VERSION" in
+	unknown:*) fail "${GOTST_VERSION#unknown: }; push it to a branch of github.com/tailscale/gotst and use -remote-gotst=BRANCH" ;;
+	esac
 	bin="$base/bin/$GOTST_VERSION"
 	gotst="$bin/gotst"
 	if [ ! -x "$gotst" ]; then
 		say "installing github.com/tailscale/gotst@$GOTST_VERSION"
 		(cd "$base" && GOBIN="$bin" "$go" install "github.com/tailscale/gotst@$GOTST_VERSION") >"$dir/gotst-install.log" 2>&1 ||
-			{ cat "$dir/gotst-install.log"; fail "installing gotst; for unpublished builds use -remote-gotst=FILE"; }
+			{ cat "$dir/gotst-install.log"; fail "installing gotst; for an unpublished build, push it to a branch and use -remote-gotst=BRANCH"; }
 	fi
 fi
 
